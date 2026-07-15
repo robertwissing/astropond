@@ -29,6 +29,9 @@ import h5py
 
 import readtipsy as tip
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sph_interp.export import MU0_CODE_TO_GAUSS
+
 # Gasoline .log column header (same as the SPH-EXA converter) so the analysis
 # framework's log reader is happy; we only fill the BOX PARAMETERS line + header
 # (no per-step energy series -> analyses fall back to per-snapshot sums).
@@ -77,30 +80,43 @@ def _energy_txt_rows(energy_txt):
         yield out
 
 
-def write_log(output_log, periods, energy_txt=None):
+def write_log(output_log, periods, energy_txt=None, tu_fac=None, rows=None):
     """Write a gasoline-style .log: the periodic-box header (so the framework reads
-    dxPeriod/dyPeriod/dzPeriod) + the energy column header, followed by one DENSE
-    per-timestep row parsed from AREPO's energy.txt when available (far denser than
-    the snapshot dumps -- the preferred source for energy-vs-time diagnostics). If
-    no energy.txt is found the .log is header-only and analyses fall back to
-    per-snapshot sums. Other AREPO *.txt (cpu/balance/domain/timebins/memory/info)
-    are runtime diagnostics with no physics time-series, so they are not used."""
+    dxPeriod/dyPeriod/dzPeriod) + the energy column header, followed by DENSE
+    per-timestep rows (far denser than the snapshot dumps -- the preferred source
+    for energy-vs-time diagnostics). The rows come from `rows` (a pre-built list of
+    ENERGY_HEADER-ordered value lists, e.g. Phantom's .ev mapped in the caller) when
+    given, else from AREPO's energy.txt when available. With neither, the .log is
+    header-only and analyses fall back to per-snapshot sums. Other AREPO *.txt
+    (cpu/balance/domain/timebins/memory/info) are runtime diagnostics with no
+    physics time-series, so they are not used.
+
+    `tu_fac` (dTuFac, u = dTuFac*T) is stamped into the header as a `# dTuFac:`
+    line so the analysis's read_tufac() recovers it: the snapshot temperature
+    column is stored as T = u/dTuFac, and without this line read_tufac falls back
+    to 1.0 and undercounts E_therm (and hence E_tot) by a factor of dTuFac."""
     px, py, pz = (float(p) for p in periods)
+    if rows is None and energy_txt and os.path.exists(energy_txt):
+        rows = list(_energy_txt_rows(energy_txt))
     with open(output_log, "w") as f:
         f.write(f"# BOX PARAMETERS:  bPeriodic: 1 dPeriod: {px:.8g} "
                 f"dxPeriod: {px:.8g} dyPeriod: {py:.8g} dzPeriod: {pz:.8g}\n")
+        if tu_fac is not None:
+            f.write(f"# dTuFac: {float(tu_fac):.8g}\n")
         f.write(ENERGY_HEADER + "\n")
-        if energy_txt and os.path.exists(energy_txt):
-            n = 0
-            for out in _energy_txt_rows(energy_txt):
+        if rows:
+            for out in rows:
                 f.write(" ".join(f"{x:.8e}" for x in out) + "\n")
-                n += 1
-            print(f"  wrote {n} dense energy rows from {energy_txt}")
+            print(f"  wrote {len(rows)} dense energy rows")
         else:
             print("  (.log header only -> analyses use per-snapshot sums)")
 
 
-def convert_snapshot(path, output, out_idx, tu_fac, periods=None):
+def convert_snapshot(path, output, out_idx, tu_fac, periods=None, b_scale=1.0):
+    """`b_scale` multiplies the snapshot MagneticField on read. The Gadget-family
+    codes (AREPO/GIZMO/OpenGadget3) output B in GAUSS; pass b_scale=1/sqrt(4pi) to
+    bring it back to the gasoline mu0=1 code units the analysis expects (so
+    E_mag = 1/2 B^2 V matches the dynamical field). Default 1.0 = no rescale."""
     import IC_smoothlength as smth
     with h5py.File(path, "r") as f:
         hdr = f["Header"].attrs
@@ -143,13 +159,17 @@ def convert_snapshot(path, output, out_idx, tu_fac, periods=None):
     with h5py.File(path, "r") as f:
         g = f["PartType0"]
         if "MagneticField" in g:
-            B = np.asarray(g["MagneticField"][:], float)
+            B = np.asarray(g["MagneticField"][:], float) * float(b_scale)
             tip.writetipsyaux(np.ascontiguousarray(B[:, 0]), "BFieldx", outname)
             tip.writetipsyaux(np.ascontiguousarray(B[:, 1]), "BFieldy", outname)
             tip.writetipsyaux(np.ascontiguousarray(B[:, 2]), "BFieldz", outname)
-        if "MagneticFieldDivergence" in g:
-            tip.writetipsyaux(np.asarray(g["MagneticFieldDivergence"][:], float),
-                              "DivB", outname)
+        # div(B) for the cleaning metric. AREPO names it "MagneticFieldDivergence";
+        # GIZMO (with OUTPUT_BFIELD_DIVCLEAN_INFO) names it
+        # "DivergenceOfMagneticField" -- both are physical div(B), so accept either.
+        divb_key = next((k for k in ("MagneticFieldDivergence",
+                                     "DivergenceOfMagneticField") if k in g), None)
+        if divb_key is not None:
+            tip.writetipsyaux(np.asarray(g[divb_key][:], float), "DivB", outname)
     print(f"Wrote {outname} from {os.path.basename(path)}")
 
 
@@ -192,7 +212,18 @@ def convertfile(entry, output, idx_interval=1, paramfile=None):
         sys.exit(1)
     print(f"Found {len(snaps)} AREPO snapshot(s)")
 
-    tu_fac = _get_tufac(output)
+    # Resolve dTuFac (T = u/dTuFac) from the gasoline .param units -- the same
+    # source the forward converter used -- since the .log we write carries no
+    # dTuFac/dGasConst and _get_tufac's .log path would otherwise fall back to 1.0
+    # and break the temperature round-trip by a factor of dTuFac. .log is fallback.
+    tu_fac = None
+    if paramfile:
+        from sph_interp.particles import read_param_tufac
+        stem = paramfile[:-6] if paramfile.endswith(".param") else paramfile
+        tu_fac = read_param_tufac(stem)
+    if tu_fac is None:
+        tu_fac = _get_tufac(output)
+    print(f"  dTuFac (u = dTuFac*T) = {tu_fac:g}")
     periods = _periods_from_param(paramfile)
     if periods is None:
         with h5py.File(snaps[0], "r") as f:
@@ -225,13 +256,16 @@ def convertfile(entry, output, idx_interval=1, paramfile=None):
         energy_txt = next((p for p in (os.path.join(snapdir, "energy.txt"),
                                        os.path.join(entry, "energy.txt"))
                            if os.path.exists(p)), None)
-    write_log(os.path.join(output, output + ".log"), periods, energy_txt)
+    write_log(os.path.join(output, output + ".log"), periods, energy_txt,
+              tu_fac=tu_fac)
 
     # only pass periods for centring when they came from the .param (else let
     # convert_snapshot use the per-axis data centroid).
     cen = periods if paramfile and _periods_from_param(paramfile) else None
+    # AREPO outputs B in Gauss -> divide by sqrt(4pi) back to gasoline mu0=1 units.
     for idx, snap in enumerate(snaps):
-        convert_snapshot(snap, output, idx * idx_interval, tu_fac, periods=cen)
+        convert_snapshot(snap, output, idx * idx_interval, tu_fac, periods=cen,
+                         b_scale=1.0 / MU0_CODE_TO_GAUSS)
 
 
 if __name__ == "__main__":

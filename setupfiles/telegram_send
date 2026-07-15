@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# telegram_send — send figures/videos/pdfs/messages to Telegram from anywhere.
+#
+#   telegram_send fig.png                     # single figure
+#   telegram_send a.png b.png -c "sedov N=64" # several, shared caption
+#   telegram_send *.png --album -c "panels"   # grouped album (10 max/group)
+#   telegram_send movie.mp4 report.pdf        # type inferred from extension
+#   telegram_send -m "run finished"           # text only
+#
+# Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment.
+exec python "$(dirname "$(readlink -f "$0")")/telegram_notify.py" "$@"

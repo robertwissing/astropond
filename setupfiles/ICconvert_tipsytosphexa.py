@@ -124,7 +124,7 @@ def convertfile(entry,output):
 
     bPeriodic = int(params.get("bPeriodic", 0))
     if bPeriodic == 1:
-        file_exa["/Step#0"].attrs["boundaryType"] = np.array([1, 1, 1], dtype=np.int8)
+        file_exa["/Step#0"].attrs["boundaryType"] = np.array([1, 1, 1], dtype=np.uint8)
         dxP = float(params.get("dxPeriod", 1.0))
         dyP = float(params.get("dyPeriod", 1.0))
         dzP = float(params.get("dzPeriod", 1.0))
@@ -132,7 +132,7 @@ def convertfile(entry,output):
         ymin, ymax = -dyP*0.5, dyP*0.5
         zmin, zmax = -dzP*0.5, dzP*0.5
     else:
-        file_exa["/Step#0"].attrs["boundaryType"] = np.array([0, 0, 0], dtype=np.int8)
+        file_exa["/Step#0"].attrs["boundaryType"] = np.array([0, 0, 0], dtype=np.uint8)
 
         xmin = np.min(positions[:, 0])
         xmax = np.max(positions[:, 0])

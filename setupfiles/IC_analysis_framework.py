@@ -30,7 +30,8 @@ import os
 import re
 import sys
 from collections import namedtuple
-
+from telegram_notify import TelegramNotifier
+tg = TelegramNotifier()
 import numpy as np
 
 from IC_analysis_general import (
@@ -478,6 +479,9 @@ def plot_compare(results, ref_table, analytic, params, metrics, save=None):
             out = f"{save}_{met.key}.png"
             fig.savefig(out, bbox_inches="tight", bbox_extra_artists=extra)
             print(f"saved figure -> {out}")
+            print("hello")
+            tg.send_message("Trolol")
+            tg.send_photo(out, "{out}")
             plt.close(fig)
         else:
             plt.show()
@@ -680,6 +684,8 @@ def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
         out = f"{save}_cut.png"
         fig.savefig(out, bbox_inches="tight", bbox_extra_artists=extra)
         print(f"saved cut -> {out}")
+        tg.send_message("Trolol")
+        tg.send_photo(out, "{out}")
         plt.close(fig)
     else:
         plt.show()

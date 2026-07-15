@@ -226,6 +226,68 @@ def _ball_scatter(orig, nt, chunk, tbuf, tcap, loc_start, indptr, indices):
 
 
 @njit(cache=True, parallel=True)
+def _ball_floor(pos, box, indptr, indices, h_in, nsmoothmin, hout, fail, ws):
+    """Post-gather nsmoothmin floor (the fast build path, 2026-07-11): count
+    each row's members within 2*h_in; where short, floor h to half the
+    nsmoothmin-th smallest distance WITHIN THE PADDED ROW - exact whenever
+    the row holds >= nsmoothmin members (everything closer than that
+    distance is inside the gather radius, so the row's k-th IS the true
+    k-th), sharper than the old 1.6-step retry overshoot. Rows whose padded
+    ball itself holds < nsmoothmin members are flagged (fail) - the caller
+    falls back to the robust expand-retry build. ws: per-thread
+    (nsmoothmin,) workspace. Positions in particle-id order, min-image."""
+    n = indptr.shape[0] - 1
+    for i in prange(n):
+        a = indptr[i]
+        b = indptr[i + 1]
+        cut2 = 4.0 * h_in[i] * h_in[i]
+        c = 0
+        for e in range(a, b):
+            j = indices[e]
+            dx = pos[i, 0] - pos[j, 0]
+            dy = pos[i, 1] - pos[j, 1]
+            dz = pos[i, 2] - pos[j, 2]
+            dx -= box[0] * np.rint(dx / box[0])
+            dy -= box[1] * np.rint(dy / box[1])
+            dz -= box[2] * np.rint(dz / box[2])
+            if dx * dx + dy * dy + dz * dz < cut2:
+                c += 1
+        if c >= nsmoothmin:
+            hout[i] = h_in[i]
+        elif b - a < nsmoothmin:
+            fail[i] = 1
+            hout[i] = h_in[i]
+        else:
+            t = get_thread_id()
+            w = ws[t]
+            m = 0
+            for e in range(a, b):
+                j = indices[e]
+                dx = pos[i, 0] - pos[j, 0]
+                dy = pos[i, 1] - pos[j, 1]
+                dz = pos[i, 2] - pos[j, 2]
+                dx -= box[0] * np.rint(dx / box[0])
+                dy -= box[1] * np.rint(dy / box[1])
+                dz -= box[2] * np.rint(dz / box[2])
+                d2 = dx * dx + dy * dy + dz * dz
+                if m < nsmoothmin:
+                    w[m] = d2
+                    m += 1
+                else:
+                    mx = 0
+                    for u in range(1, nsmoothmin):
+                        if w[u] > w[mx]:
+                            mx = u
+                    if d2 < w[mx]:
+                        w[mx] = d2
+            mx = 0
+            for u in range(1, nsmoothmin):
+                if w[u] > w[mx]:
+                    mx = u
+            hout[i] = 0.5 * np.sqrt(w[mx])
+
+
+@njit(cache=True, parallel=True)
 def _ball_esrc(indptr, esrc):
     # per-edge source row: esrc[e] = i for e in indptr[i]:indptr[i+1].
     # Each row owns a disjoint contiguous range -> race-free over rows.
@@ -319,6 +381,7 @@ class BallNeighborList:
         self.hout = None          # current (possibly reused) kernel h
         self.hfloor = None        # per-particle floor level from last build
         self.rcached = None       # per-particle gather radius from last build
+        self._prev_cnt = None     # padded row sizes seeding the fast build
         self._disp = 0.0          # max accumulated displacement since build
         self.pdisp = None
 
@@ -372,20 +435,19 @@ class BallNeighborList:
             self.hout = np.maximum(h_in, self.hfloor)
         return self.indptr, self.indices, self.hout, self.tip, self.tii
 
-    def _fused_gather(self, posg, orig, box, ncell, cellptr, rfull, cnt_unpad,
+    def _fused_gather(self, posg, orig, box, ncell, cellptr, rfull, est_slot,
                       indptr):
         """Single-walk padded gather: store neighbour ids into per-thread
         buffers, prefix-sum the counts into indptr, then scatter into a tight
         CSR. Returns the indices array, or None if a thread overflowed its
-        a-priori cap (caller falls back to the 2-pass build). cnt_unpad holds
-        the phase-1 unpadded counts (orig order); the padded ball is bounded
-        by the volume ratio (1+skin)^3 with headroom."""
+        a-priori cap (caller falls back to the 2-pass build). est_slot =
+        per-slot (orig order) row-size estimate: the phase-1 unpadded count
+        scaled by the padded volume ratio on the full build, the previous
+        build's padded counts on the fast path."""
         n = orig.shape[0]
         nt = min(get_num_threads(), 64)
         chunk = (n + nt - 1) // nt
-        # per-slot padded estimate from the unpadded count; size each thread's
-        # cap to its chunk's estimated edges with generous headroom
-        est_slot = cnt_unpad[orig] * ((1.0 + self.skin) ** 3) * 1.5 + 32.0
+        # size each thread's cap to its chunk's estimated edges with headroom
         thread_est = np.zeros(nt, dtype=np.int64)
         for t in range(nt):
             lo = t * chunk
@@ -423,8 +485,74 @@ class BallNeighborList:
         _fill_cells(cid, cellptr, orig)
         posg = np.empty_like(pos)
         _gather3(pos, orig, posg)
-
         rcap = 0.5 * float(np.sqrt((box * box).sum()))
+
+        built = None
+        if self._prev_cnt is not None and len(self._prev_cnt) == n:
+            built = self._fast_build(pos, posg, orig, box, ncell, cellptr,
+                                     h_in, rcap)
+        if built is None:
+            built = self._full_build(posg, orig, box, ncell, cellptr, h_in,
+                                     rcap)
+        indptr, indices, hout, rfull = built
+
+        if self.build_transpose:
+            tip, tii = _transpose_csr(indptr, indices, n)
+        else:
+            tip = np.zeros(n + 1, dtype=np.int64)
+            tii = np.empty(0, dtype=np.int32)
+        self.indptr, self.indices, self.tip, self.tii = indptr, indices, \
+            tip, tii
+        self.hout = hout
+        # floor level: where the build floored h above the density value
+        self.hfloor = np.where(hout > h_in * 1.001, hout, 0.0)
+        # cached gather radius per particle (orig order): rfull/2 in h-units
+        rc = np.empty(n)
+        rc[orig] = rfull
+        self.rcached = rc
+        # padded row sizes seed the next fast build's buffer estimate (a
+        # relax reorder permutes particle ids between builds - the estimate
+        # is then per-particle misaligned but statistically right; a bad
+        # miss overflows and falls back to the full build)
+        self._prev_cnt = np.diff(indptr).astype(np.float64)
+        self._disp = 0.0
+        if self.pdisp is not None:
+            self.pdisp[:] = 0.0
+        self.nbuilds += 1
+
+    def _fast_build(self, pos, posg, orig, box, ncell, cellptr, h_in, rcap):
+        """One-walk build (2026-07-11; phase 1 was ~45% of the rebuild and
+        the anneal rebuilds every iteration): size the gather buffers from
+        the PREVIOUS build's padded row counts instead of a counting
+        pre-scan, gather the padded ball at 2*h_in*(1+skin) directly, and
+        recover the nsmoothmin floor in an O(edges) post-pass (_ball_floor -
+        exact k-th distance, sharper than the old 1.6-step retry overshoot).
+        Returns (indptr, indices, hout, rfull), or None to fall back to the
+        robust two-phase build (buffer overflow after a violent kick, or a
+        row whose padded ball holds < nsmoothmin members - vacuum strays
+        needing the expand-retry)."""
+        n = len(pos)
+        rfull = np.minimum(2.0 * h_in[orig] * (1.0 + self.skin), rcap)
+        est_slot = self._prev_cnt[orig] * 1.5 + 32.0
+        indptr = np.zeros(n + 1, dtype=np.int64)
+        indices = self._fused_gather(posg, orig, box, ncell, cellptr, rfull,
+                                     est_slot, indptr)
+        if indices is None:
+            return None
+        hout = np.empty(n)
+        fail = np.zeros(n, dtype=np.uint8)
+        ws = np.empty((get_num_threads(), self.nsmoothmin))
+        _ball_floor(pos, box, indptr, indices, h_in, self.nsmoothmin,
+                    hout, fail, ws)
+        if fail.any():
+            return None
+        return indptr, indices, hout, rfull
+
+    def _full_build(self, posg, orig, box, ncell, cellptr, h_in, rcap):
+        """The robust two-phase build: counting scan with nsmoothmin
+        expand-retry (phase 1), then the padded gather (phase 2, fused with
+        a 2-pass fallback on overflow). First build and fallback path."""
+        n = len(orig)
         # phase 1: find the floored kernel h - gather within 2*h, expanding
         # where < nsmoothmin members (rsearch indexed by cell-order slot p)
         rsearch = np.minimum(2.0 * h_in[orig], rcap)
@@ -448,9 +576,10 @@ class BallNeighborList:
         # density/force mask back to 2*h_out via the kernel cutoff. Fused
         # store+scatter (one cell-walk) with a 2-pass fallback on overflow.
         rfull = np.minimum(rsearch * (1.0 + self.skin), rcap)
+        est_slot = cnt[orig] * ((1.0 + self.skin) ** 3) * 1.5 + 32.0
         indptr = np.zeros(n + 1, dtype=np.int64)
         indices = self._fused_gather(posg, orig, box, ncell, cellptr,
-                                     rfull, cnt, indptr)
+                                     rfull, est_slot, indptr)
         if indices is None:                # overflow -> robust 2-pass build
             cntf = np.zeros(n, dtype=np.int64)
             _ball_scan(posg, orig, box, ncell, cellptr,
@@ -462,22 +591,4 @@ class BallNeighborList:
             _ball_scan(posg, orig, box, ncell, cellptr,
                        np.arange(n, dtype=np.int64), rfull, 0, False, indptr,
                        cntf, np.empty(n), np.zeros(n, dtype=np.uint8), indices)
-
-        if self.build_transpose:
-            tip, tii = _transpose_csr(indptr, indices, n)
-        else:
-            tip = np.zeros(n + 1, dtype=np.int64)
-            tii = np.empty(0, dtype=np.int32)
-        self.indptr, self.indices, self.tip, self.tii = indptr, indices, \
-            tip, tii
-        self.hout = hout
-        # floor level: where the retry expanded h above the density value
-        self.hfloor = np.where(hout > h_in * 1.001, hout, 0.0)
-        # cached gather radius per particle (orig order): rfull/2 in h-units
-        rc = np.empty(n)
-        rc[orig] = rfull
-        self.rcached = rc
-        self._disp = 0.0
-        if self.pdisp is not None:
-            self.pdisp[:] = 0.0
-        self.nbuilds += 1
+        return indptr, indices, hout, rfull

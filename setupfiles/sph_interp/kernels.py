@@ -63,6 +63,30 @@ def gcum3D(q):
                       - q3 * q3 / 6.0))
 
 
+@njit(cache=True)
+def gcum3D_anti(u):
+    """Continuous antiderivative Gc(u) of gcum3D(u)/u^2 (piecewise polynomial).
+
+    Used by the exact (Petkova) cone integral: the radial part of the cone
+    integrand over a plane at distance r0 integrates in closed form,
+        int_0^P g(T)/pi * r0/T^3 rho drho = (r0/(pi h)) [Gc(T/h) - Gc(r0/h)],
+    with T = sqrt(r0^2 + P^2). The continuity constants (-0.05 at u=1, 0.35
+    for u>2) make Gc continuous at the kernel breaks, and Gc(inf)=0.35 gives
+    the closed-form single-plane split: mass beyond a plane at distance r0 is
+    1/2 - 2 (r0/h) (0.35 - Gc(r0/h)) for r0 < 2h.
+    """
+    if u <= 0.0:
+        return 0.0
+    if u <= 1.0:
+        u2 = u * u
+        return u2 / 6.0 - 0.075 * u2 * u2 + 0.025 * u2 * u2 * u
+    if u <= 2.0:
+        u2 = u * u
+        return (1.0 / (60.0 * u) + u2 / 3.0 - 0.25 * u2 * u + 0.075 * u2 * u2
+                - u2 * u2 * u / 120.0 - 0.05)
+    return 0.35 - 0.25 / u
+
+
 # --------------------------------------------------------------------------- #
 #  Column-integrated kernel (for 2D projections)
 # --------------------------------------------------------------------------- #

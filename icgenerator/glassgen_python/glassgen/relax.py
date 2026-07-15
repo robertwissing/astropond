@@ -64,6 +64,12 @@ class RelaxResult:
     h_prepolish: np.ndarray = None
     rho_prepolish: np.ndarray = None
     polish_iter0: int = -1
+    # envelope (open-box / free-surface) build audit, set by relax_progressive
+    # when envelope!=None: n_full/n_survivor/n_culled/gas_mass/mf. None otherwise.
+    envelope_audit: dict = None
+    # per-survivor gathered fields (reconstruct: vel/u/eps/...), set by
+    # relax_progressive's filler_field_hook after the cull. None otherwise.
+    aux: dict = None
 
 
 def relax(pos, mass, density, box=None, nsmooth=64,
@@ -152,6 +158,12 @@ def relax(pos, mass, density, box=None, nsmooth=64,
     if not isinstance(density, DensityField):
         fn = density
         density = type('_Wrap', (DensityField,), {'rho0': lambda self, p: np.asarray(fn(p), dtype=np.float64)})()
+    # kernel-matched target readout (task M4): fields flagged smooth_readout
+    # get rho0 evaluated as the KERNEL AVERAGE at each particle's own h
+    # (rho0_h) wherever the pseudo-pressure is formed - SPH rho is a kernel
+    # average at that same h, so the ratio compares like with like and a
+    # target sharper than the kernel cannot manufacture fake overpressure.
+    smooth = bool(getattr(density, 'smooth_readout', False))
     boxarr = None if box is None else np.asarray(box, dtype=np.float64)
     periodic = boxarr is not None
     if periodic:
@@ -309,7 +321,12 @@ def relax(pos, mass, density, box=None, nsmooth=64,
             tprof['dens'] += pc() - t
             t = pc()
             if hmode != 'target':
-                rho0 = density.rho0(pos)
+                rho0 = density.rho0_h(pos, hforce) if smooth \
+                    else density.rho0(pos)
+            elif smooth:
+                # kernel-matched pP target at the force h; the h_in seed above
+                # keeps the cheap point read (it only sizes the ball)
+                rho0 = density.rho0_h(pos, hforce)
             dens_err = pseudo_pressure(rho, rho0, rhopow, pP)
             tprof['pP'] += pc() - t
             t = pc()
@@ -337,7 +354,7 @@ def relax(pos, mass, density, box=None, nsmooth=64,
             density_loop(pos, mass, h, idx, dummybox, periodic, rho, w0self)
             tprof['dens'] += pc() - t
             t = pc()
-            rho0 = density.rho0(pos)
+            rho0 = density.rho0_h(pos, h) if smooth else density.rho0(pos)
             dens_err = pseudo_pressure(rho, rho0, rhopow, pP)
             # the kNN-gather path is taken only for hmode='knn' (measured/target
             # use the ball path above), so the force kernel uses the same kNN h

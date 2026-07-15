@@ -10,7 +10,9 @@ TARGET geometry with a chosen METHOD, and serialize the result.
 Run with NO positional arguments to be prompted interactively for everything.
 
 TARGETS (--grid):   uniform | amr | voronoi | projection
-METHODS (--method): petkova (exact, mass-conserving; default) | sph (fast, approximate)
+METHODS (--method): petkova (exact, mass-conserving; default) |
+                    sph-scatter (AREPO-style conservative kernel scatter) |
+                    sph-gather (fast kernel estimate at cell centres, NOT conserving)
 OUTPUT (--output-format): npz | hdf5 | ramses | cell-table | native
 
 Examples
@@ -70,7 +72,7 @@ def interactive(args):
     args.grid = _ask("Grid / target geometry", default="uniform",
                      choices=["uniform", "amr", "voronoi", "projection"])
     args.method = _ask("Interpolation method", default="petkova",
-                       choices=["sph", "petkova"])
+                       choices=["sph-gather", "sph-scatter", "petkova"])
     args.fields = _ask("Fields to interpolate (comma list)", default="rho")
 
     if args.grid == "uniform":
@@ -79,7 +81,7 @@ def interactive(args):
         args.base_npx = int(_ask("Base grid cells per axis", default="16"))
         args.npx = int(_ask("Finest resolution / cells per axis (npx)",
                             default="128"))
-        args.refine = _ask("Refinement criterion", default="smoothing",
+        args.refine = _ask("Refinement criterion", default="mass",
                            choices=["smoothing", "mass", "count"])
     elif args.grid == "voronoi":
         args.voronoi_source = _ask(
@@ -137,13 +139,30 @@ def build_target(args, p):
         return UniformGrid.centered(box, args.npx)
 
     if args.grid == "amr":
+        # Quasi-Lagrangian default, matching RAMSES poisson_refine
+        # (amr/flag_utils.f90): RAMSES refines a cell when
+        #     rho_cell >= m_refine(level) * mass_sph / vol_cell
+        # i.e. cell_mass >= m_refine * mass_sph, where mass_sph is the gas mass of a
+        # single resolution element and m_refine a per-level factor (the example
+        # namelists use 1 for hydro). We take mass_sph = the mean PARTICLE mass and
+        # default m_refine = 1, so a cell refines while it holds more than ~one
+        # particle's worth of mass -> leaves hold ~1 particle (n_leaves ~ N_part, so
+        # the mesh tracks the SPH resolution) and each leaf's deposited mass ~
+        # m_particle (near-uniform). The threshold is identical at every level, so
+        # refinement stops at ~1 particle per cell (constant mass per cell). The
+        # near-uniform masses + quasi-Lagrangian generators also keep the AREPO
+        # Voronoi density consistent (mass/V_voronoi recovers rho without the octree-
+        # vs-Voronoi volume mismatch a few-particles-per-cell mesh would suffer).
+        # Override the absolute threshold with --refine-value (e.g. 2*m_particle for
+        # ~2 particles/cell = coarser, like RAMSES m_refine=2).
+        mass_sph = float(p.mass.sum()) / max(p.n, 1)
         crit = {"smoothing": refine_smoothing_length(),
                 "mass": refine_mass(args.refine_value
                                     if args.refine_value is not None
-                                    else float(p.mass.sum()) / 1e4),
+                                    else mass_sph),
                 "count": refine_count(int(args.refine_value)
                                       if args.refine_value is not None
-                                      else 8)}[args.refine]
+                                      else 1)}[args.refine]
         max_level = amr_max_level(args)
         fine = args.base_npx * (2 ** max_level)
         print(f"  target: AMRGrid base {args.base_npx}^3, max_level "
@@ -311,9 +330,11 @@ def report_mass(res, p):
         gm = float((res.data["rho"] * grid.volumes()).sum())
     else:
         return
-    tag = ("" if "_mass" in res.data
-           else "  [approx: SPH density estimate, not mass-conserving; "
-                "edge/padding cells inflate sum(rho*vol)]")
+    # sph-scatter and petkova are mass-conserving; only the sph-gather estimate
+    # (kernel density AT the cell centre) is approximate.
+    tag = ("  [approx: sph-gather density estimate, not mass-conserving; "
+           "edge/padding cells inflate sum(rho*vol)]"
+           if res.method == "sph-gather" else "")
     print(f"  mass check: grid {gm:.6g} vs particles {pm:.6g}  "
           f"({100*(gm/pm - 1):+.3f}%){tag}")
 
@@ -333,7 +354,9 @@ def build_parser():
 
     pa.add_argument("--grid", choices=["uniform", "amr", "voronoi", "projection"],
                     default="uniform", help="target geometry")
-    pa.add_argument("--method", choices=["sph", "petkova"], default="petkova",
+    pa.add_argument("--method",
+                    choices=["sph-gather", "sph-scatter", "petkova", "sph"],
+                    default="petkova",
                     help="petkova=exact/mass-conserving (default), sph=fast/approx")
     pa.add_argument("--fields", default="rho",
                     help="comma list of fields to interpolate (rho,Bmag,vx,...)")
@@ -372,7 +395,9 @@ def build_parser():
                     help="AMR max level (default: derived from --npx and "
                          "--base-npx). Set to override the npx-derived depth.")
     pa.add_argument("--refine", choices=["smoothing", "mass", "count"],
-                    default="smoothing", help="AMR refinement criterion")
+                    default="mass", help="AMR refinement criterion (default: "
+                    "mass = quasi-Lagrangian, like RAMSES: refine a cell whose "
+                    "gas mass exceeds --refine-value, default mean base-cell mass)")
     pa.add_argument("--refine-value", type=float, default=None,
                     help="threshold for --refine mass/count")
     # voronoi

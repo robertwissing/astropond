@@ -30,7 +30,7 @@ import numpy as np
 # it here only clobbered an interactive backend (GTK3Agg/Qt5Agg/...) chosen by an
 # analysis script for an X session, silently losing figures at plt.show().
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, Normalize
+from matplotlib.colors import LogNorm, Normalize, to_rgba
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +345,7 @@ def draw_cells_3d(ax, res, field, subbox=None, norm=None, cmap="inferno",
     colors[:, 3] = fa
     # fade the edges with the cell too, else void cells draw a solid black
     # wireframe that swamps the structure.
-    ergba = np.array(matplotlib.colors.to_rgba(edgecolor))
+    ergba = np.array(to_rgba(edgecolor))
     ecolors = np.tile(ergba, (fa.size, 1))
     ecolors[:, 3] = np.clip(fa * 1.1, 0.0, 1.0)
     pc = Poly3DCollection(faces, facecolors=colors, edgecolors=ecolors,

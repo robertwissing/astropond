@@ -352,6 +352,37 @@ class TestMHDRotor(AnalysisSmokeBase):
         return save_prefix + "_energy.png"
 
 
+class TestABCflow(AnalysisSmokeBase):
+    test = "abcflow"
+
+    def build_run(self, parent, diverge=False):
+        snaps = mhd_snaps((0.0, 0.5, 1.0))
+        # a growing dynamo: E_mag amplifies exponentially (faster if diverge)
+        emag = [1.0, 10.0, 100.0] if not diverge else [1.0, 30.0, 900.0]
+        series = dict(dTime=[0.0, 0.5, 1.0], Emag=emag, Ekin=[1.0, 1.0, 1.0],
+                      Eth=[1.0, 1.0, 1.0])
+        return sd.make_run(parent, "abcflow32_N64latticeGASOLINE", snaps,
+                           start=0, step=25, log_series=series)
+
+    def expected_plots(self, save_prefix):
+        return save_prefix + "_energy.png"
+
+
+class TestPonomarenko(AnalysisSmokeBase):
+    test = "ponomarenko"
+
+    def build_run(self, parent, diverge=False):
+        snaps = mhd_snaps((0.0, 5.0, 10.0))
+        emag = [1.0, 5.0, 25.0] if not diverge else [1.0, 20.0, 400.0]
+        series = dict(dTime=[0.0, 5.0, 10.0], Emag=emag, Ekin=[1.0, 0.9, 0.8],
+                      Eth=[1.0, 1.0, 1.0])
+        return sd.make_run(parent, "ponomarenko32_N64latticeGASOLINE", snaps,
+                           start=0, step=25, log_series=series)
+
+    def expected_plots(self, save_prefix):
+        return save_prefix + "_energy.png"
+
+
 class TestMHDDivtest(AnalysisSmokeBase):
     test = "mhddivtest"
 

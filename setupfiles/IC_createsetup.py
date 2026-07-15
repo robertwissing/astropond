@@ -48,6 +48,8 @@ from IC_writeascii import convertfromcodeunits, calculatecosmoMsol
 # Every name maps to IC_setup_<name>.setup_<name>, imported lazily on use.
 SETUPS = [
     'orzag',
+    'abcflow',
+    'ponomarenko',
     'evrard',
     'polytrope',
     'planet',

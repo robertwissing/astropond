@@ -22,9 +22,41 @@ centres) feeding six extra hydro variables. The hydro-variable list is
 order-driven and extensible, so adding those is additive — no restructuring.
 """
 
+import math
+
 import numpy as np
 
 from .targets import AMRGrid, UniformGrid, VoronoiGrid
+
+#: mu_0 in Gaussian cgs (the MU0CGS in IC_writeascii.py / gasoline's Bfac).
+MU0CGS = 4.0 * math.pi
+#: Magnetic-field unit conversion: gasoline/tipsy code units (mu_0 = 1,
+#: E_mag = 1/2 B^2 V -- "Heaviside-Lorentz") -> the GAUSS units the Gadget-family
+#: codes (GIZMO, AREPO, OpenGadget3) expect for the IC MagneticField. All three
+#: INTERPRET the IC B as Gauss and internally reduce the magnetic PRESSURE by 4pi
+#: (GIZMO/AREPO divide the field by sqrt(4pi); OpenGadget3 keeps the field but uses
+#: mu0_inv = 1/4pi), so a mu0=1 field fed 1:1 is 4pi too weak dynamically. The
+#: suite generates each code's parameterfile with code units = 1 (UnitMass_in_g =
+#: UnitLength_in_cm = UnitVelocity = 1, UnitMagneticField_in_gauss = 1), for which
+#: the conversion is exactly sqrt(4pi) (= the codes' own UNIT_B_IN_GAUSS =
+#: sqrt(4pi * UnitPressure_cgs)). Multiply the code B by this on WRITE; divide the
+#: snapshot B by it on READ. (This is gasoline's CodetoGauss specialised to code
+#: units = 1; the full physical CodetoGauss is only needed if a code's param uses
+#: gasoline's kpc/Msol units instead.)
+MU0_CODE_TO_GAUSS = math.sqrt(MU0CGS)
+
+
+def scale_hdf5_bfield(path, factor):
+    """Multiply PartType0/MagneticField in a GADGET-type-0 HDF5 IC by `factor`,
+    in place. No-op returning False if the file carries no MagneticField (hydro
+    IC); returns True after scaling an MHD IC."""
+    import h5py
+    with h5py.File(path, "r+") as f:
+        g = f.get("PartType0")
+        if g is None or "MagneticField" not in g:
+            return False
+        g["MagneticField"][...] = np.asarray(g["MagneticField"][:]) * float(factor)
+    return True
 
 
 def to_cell_table(result, fields=None):
@@ -381,7 +413,7 @@ def _write_arepo_hdf5(path, coords, mass, vel, u, bfield, boxsize, ids=None,
 
 def to_arepo(result, path, density="rho", velocity=AREPO_VELOCITY,
              temperature=AREPO_TEMPERATURE, tu_fac=1.0, magnetic=AREPO_MAGNETIC,
-             box=None, periodic=False, time=0.0):
+             box=None, periodic=False, time=0.0, preframed_boxsize=None):
     """Export an interpolation `GridResult` as an AREPO moving-mesh IC (HDF5).
 
     Works for UniformGrid / AMRGrid / VoronoiGrid results: the cell centres
@@ -401,6 +433,11 @@ def to_arepo(result, path, density="rho", velocity=AREPO_VELOCITY,
     box           : periodic period (3,) for the AREPO BoxSize/frame (from the
                     `.param`); None -> use the generator extent.
     periodic      : wrap generators into [0, period) when `box` is given.
+    preframed_boxsize : when set, the generators are ALREADY in AREPO's [0, L]
+                    frame and `_frame_coords` is skipped; L = this value.  Used by
+                    the `arepo-grid` decoupled re-deposit, whose generators come
+                    from an ADDBACKGROUNDGRID pass already in [0, boxout] (box and
+                    periodic are ignored).
     """
     grid = result.target
     if not isinstance(grid, (UniformGrid, AMRGrid, VoronoiGrid)):
@@ -435,7 +472,10 @@ def to_arepo(result, path, density="rho", velocity=AREPO_VELOCITY,
     if all(get(c) is not None for c in magnetic):
         bfield = np.stack([get(c) for c in magnetic], axis=1)
 
-    coords, L = _frame_coords(coords, box=box, periodic=periodic)
+    if preframed_boxsize is not None:
+        L = float(preframed_boxsize)          # coords already framed into [0, L]
+    else:
+        coords, L = _frame_coords(coords, box=box, periodic=periodic)
     path, L = _write_arepo_hdf5(path, coords, mass, vel, u, bfield, L,
                                 time=time)
     print(f"  AREPO IC: {coords.shape[0]} generators ({type(grid).__name__}), "
@@ -484,7 +524,13 @@ def particles_to_arepo(particles, path, velocity=AREPO_VELOCITY,
         box = particles.box
     if periodic is None:
         periodic = bool(np.any(np.atleast_1d(particles.periodic)))
-    coords, L = _frame_coords(particles.pos, box=box, periodic=periodic)
+    # Non-periodic (isolated) IC: there is no period. Frame to a single cubic
+    # BoxSize = max particle extent (box=None path) rather than the per-axis span,
+    # so no axis can exceed BoxSize and get clipped, and no spurious LONG_Y/Z is
+    # reported. Periodic ICs keep the .param period.
+    coords, L = _frame_coords(particles.pos,
+                              box=(box if periodic else None),
+                              periodic=periodic)
     path, L = _write_arepo_hdf5(path, coords, mass, vel, u, bfield, L,
                                 time=time)
     print(f"  AREPO IC (copy): {n} particles -> generators, BoxSize={L:.6g}, "

@@ -67,19 +67,39 @@ def write_denserr_plot(out, pos, mass, h, rho, density, box, nsmooth,
           f'{err.max():.4g})', flush=True)
 
 
+def _print_stages(res):
+    for l in res.levels:
+        print(f'  stage {l["name"]:<6} N={l["n"]:<8} niter={l["niter"]:<5} '
+              f'{l["wall"]:.0f}s  denserr(mn/p95/mx)='
+              f'{l["denserr_mean"]:.4f}/{l["denserr_p95"]:.4f}/'
+              f'{l["denserr_max"]:.4f}  force(mn/p95/mx)='
+              f'{l["force_mean"]:.2e}/{l["force_p95"]:.2e}/'
+              f'{l["force_max"]:.2e}')
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description='glassgen: glass-relaxation IC generator')
     ap.add_argument('-o', dest='out', required=True,
                     help='output prefix (writes ${out}_IC)')
-    ap.add_argument('-I', dest='infile', required=True,
-                    help='input tipsy pre-IC')
+    ap.add_argument('-I', dest='infile', default=None,
+                    help='input tipsy pre-IC (omit it and pass --table + '
+                         '--count to sample the initial particles from the '
+                         'table itself)')
+    ap.add_argument('--count', type=int, default=None, metavar='N',
+                    help='build from the table alone: sample N initial '
+                         'particles from --table (no -I) and relax toward it '
+                         '- THE glassgen table builder (glassresample '
+                         '--op reconstruct drives the same path)')
     ap.add_argument('-s', dest='nsmooth', type=int, default=64)
     ap.add_argument('-n', dest='max_iter', type=int, default=4800)
     ap.add_argument('-oi', dest='oi', type=int, default=0,
                     help='snapshot output interval (0 = none)')
     ap.add_argument('--table', default=None,
-                    help='densitytable_xdr file (default: uniform density)')
+                    help='target density table: a densitytable_xdr file (1D/2D/'
+                         '3D, indexed by --direction) OR a 3D AMR table .npz '
+                         '(glasstable/glassresample --save-table) targeted '
+                         'directly. Default: uniform density')
     ap.add_argument('--direction', default='r_sph', choices=MAPPINGS,
                     help='coordinate a 1D table is indexed by')
     ap.add_argument('--flavour', default='gdforce')
@@ -117,8 +137,9 @@ def main(argv=None):
                          'The merge factor is floor_pow2(N_full/target); '
                          'factor 1 => no merge / direct relax (default auto)')
     ap.add_argument('--alpha', type=float, default=4.0,
-                    help='resolution tolerance for the auto coarse count '
-                         '(default 4.0)')
+                    help='resolvability tolerance: the auto coarse count '
+                         'bound AND (with --scaffold cubic) the vacuum-'
+                         'scaffold reach (default 4.0)')
     ap.add_argument('--nx-full', dest='nx_full', type=int, default=0,
                     help='full target resolution (default: round(N**(1/3)) '
                          'from the input)')
@@ -138,24 +159,74 @@ def main(argv=None):
     ap.add_argument('--no-self-bias', dest='self_bias', action='store_false',
                     help='disable the Wendland C2 self-density bias correction '
                          '(Wzero10); density then uses the bare W0 self term')
+    ap.add_argument('--envelope', choices=('auto', 'on', 'off'), default='auto',
+                    help='free-surface / open-box vacuum padding (see '
+                         'RECONSTRUCT_PLAN.md): pad the vacuum side of the '
+                         'gas with a mass-consistent background so edge kernels '
+                         'fill, relax the union, then cull the background. '
+                         '"auto" (default) = on for an --open box, off for a '
+                         'filled periodic box (byte-identical to no envelope); '
+                         '"on"/"off" force it.')
+    ap.add_argument('--bg-c', dest='bg_c', type=int, default=0,
+                    help='envelope: particles per resolved kernel setting '
+                         'rho_edge (the cumulative faint-tail cut); 0 = use '
+                         '--nsmooth (-s). Larger c -> higher rho_edge -> more '
+                         'of the faint edge treated as background.')
+    ap.add_argument('--bg-k', dest='bg_k', type=float, default=2.0,
+                    help='envelope: background coarseness vs the gas edge; '
+                         'rho_floor = rho_edge/k**3, background spacing '
+                         'Delta_bg = k*(m/rho_edge)**(1/3) (default 2.0)')
+    ap.add_argument('--scaffold', default='exp', choices=('exp', 'cubic'),
+                    help="envelope vacuum scaffold: 'exp' (default, taper + "
+                         "background lattice) or 'cubic' (resolvability "
+                         "profile at --alpha, lattice retired for mass-"
+                         "weighted sampling; --bg-k does not apply)")
+    ap.add_argument('--open-pad', dest='open_pad', type=float, default=0.1,
+                    help='envelope: vacuum margin (fraction of the gas bbox per '
+                         'side) of the synthesised periodic frame for an --open '
+                         'IC (default 0.1)')
     ap.add_argument('--plot', action='store_true',
                     help='after relaxation, write ${out}_denserr.png: the '
                          'density-error |1-rho/rho0| and residual-force |icvel| '
                          'distributions of the final glass (mean/p95/max)')
+    ap.add_argument('--history-plot', dest='history_plot', action='store_true',
+                    help='after relaxation, write ${out}_history.png: the '
+                         'convergence history (RMS residual force, density '
+                         'error, step icr0 vs iteration). For the progressive '
+                         'path this is the FINAL stage; add --no-progressive '
+                         'for the whole single-relax trajectory.')
     grp = ap.add_mutually_exclusive_group(required=True)
     grp.add_argument('--param', help='gasoline .param file to take the box from')
     grp.add_argument('--box', nargs=3, type=float, metavar=('LX', 'LY', 'LZ'))
     grp.add_argument('--open', action='store_true', help='no periodic box')
     args = ap.parse_args(argv)
 
+    if args.count is not None:
+        if not args.table:
+            ap.error('--count builds from a table: pass --table FILE.npz')
+        if args.infile:
+            ap.error('--count samples the initial particles from the table '
+                     'itself; drop -I (or drop --count to relax the pre-IC)')
+    elif not args.infile:
+        ap.error('-I is required (or pass --table + --count to build from '
+                 'the table alone)')
+
     import readtipsy as tip
 
-    gas, dark, star, header, time = tip.readtipsy(args.infile)
-    if len(gas) == 0:
-        sys.exit('no gas particles in input')
-    print(f'read {args.infile}: {len(gas)} gas particles', flush=True)
-    pos = gas[:, 1:4].astype(np.float64)
-    mass = gas[:, 0].astype(np.float64)
+    if args.infile:
+        gas, dark, star, header, time = tip.readtipsy(args.infile)
+        if len(gas) == 0:
+            sys.exit('no gas particles in input')
+        print(f'read {args.infile}: {len(gas)} gas particles', flush=True)
+        pos = gas[:, 1:4].astype(np.float64)
+        mass = gas[:, 0].astype(np.float64)
+    else:                                # --table + --count: no input particles
+        gas = np.zeros((0, 12), dtype=np.float32)
+        dark = np.zeros((0, 9), dtype=np.float32)
+        star = np.zeros((0, 11), dtype=np.float32)
+        header = np.array([0, 3, 0, 0, 0, 0], dtype=np.int32)
+        time = np.zeros(1, dtype=np.float64)
+        pos = mass = None
 
     param_dict = read_param(args.param) if args.param else None
     if args.open:
@@ -166,7 +237,15 @@ def main(argv=None):
         box = box_from_param(param_dict)
 
     if args.table:
-        density = TableDensity.from_xdr(args.table, mapping=args.direction)
+        if args.table.endswith('.npz'):
+            # a 3D AMR density table (glasstable/glassresample --save-table):
+            # target the captured field directly (reconstruct-in-place).
+            from .amrtable import AMRTable
+            density = AMRTable.load(args.table)
+            print(f'loaded AMR density table {args.table} '
+                  f'({density.ncell} leaves)', flush=True)
+        else:
+            density = TableDensity.from_xdr(args.table, mapping=args.direction)
     elif param_dict is not None:
         # read the density profile straight from the .param (profiles 1/2/3),
         # exactly as the C gdicgen does - no density table needed for these.
@@ -178,6 +257,63 @@ def main(argv=None):
         rho_mean = mass.sum() / np.prod(box)
         density = CallableDensity(lambda p, r=rho_mean: np.full(len(p), r))
 
+    if args.count is not None:
+        # ---- THE table builder (no input particles): sample --count from the
+        # table, N-aware envelope, progressive relax, cull + renorm - the same
+        # path glassresample --op reconstruct drives. -------------------------
+        from .progressive import build_from_table
+        ct = args.coarse_target
+        ct = ct if ct == 'auto' else int(ct)
+        print(f'table build: sampling {args.count} particles from the table '
+              f'(envelope {args.envelope}, cascade '
+              f'{"on" if args.progressive else "off"})', flush=True)
+        res = build_from_table(
+            density, args.count, box=box, nsmooth=args.nsmooth,
+            bg_c=args.bg_c, bg_k=args.bg_k, envelope=args.envelope,
+            scaffold=args.scaffold,
+            cascade=args.progressive, open_pad=args.open_pad, verbose=True,
+            coarse_target=ct, alpha=args.alpha, inter_iter=args.inter_iter,
+            max_iter=args.max_iter, momentum=args.momentum,
+            icr0_stop=args.icr0_stop, polish_iter=args.polish_iter,
+            cap=2.0, start_icr0=2.0,
+            flavour=args.flavour, rhopow=args.rhopow, icr0rate=args.icr0rate,
+            margin=args.margin, one_sided=args.one_sided, hmode=args.hmode,
+            nsmoothmin=args.nsmoothmin, self_bias=args.self_bias)
+        a = res.envelope_audit
+        nf, mf = len(res.pos), a['mf']
+        tb = res.table_build
+        if 'rho_edge' in tb:
+            print(f'envelope: m={tb["m"]:.3e} rho_edge={tb["rho_edge"]:.3e} '
+                  f'rho_frame={tb["rho_frame"]:.3e} '
+                  f'delta_bg={tb["delta_bg"]:.3e}; cull {a["n_full"]} -> {nf} '
+                  f'(culled {a["n_culled"]}, bg {a["n_background"]})',
+                  flush=True)
+        g = np.zeros((nf, 12), dtype=np.float32)
+        g[:, 0] = mf
+        g[:, 1:4] = res.pos
+        g[:, 7] = res.rho
+        g[:, 9] = res.h
+        hdr = header.copy()
+        hdr[0] = nf
+        hdr[2] = nf
+        tip.writetipsy(g, dark, star, f'{args.out}_IC', hdr, time)
+        err = np.abs(1.0 - res.rho / density.rho0(res.pos))
+        print(f'done (table build, count={args.count}): final N={nf}, '
+              f'per-particle mass {mf:.3e}, mean|1-rho/rho0|={err.mean():.3e},'
+              f' wrote {args.out}_IC')
+        _print_stages(res)
+        if args.plot:
+            write_denserr_plot(args.out, res.pos, mf, res.h, res.rho, density,
+                               box, args.nsmooth, flavour=args.flavour,
+                               rhopow=args.rhopow, nsmoothmin=args.nsmoothmin)
+        if args.history_plot:
+            from .diagnostics import plot_history
+            plot_history(res.history, f'{args.out}_history.png',
+                         title=f'{os.path.basename(args.out)} (final stage)',
+                         stop_reason=res.stop_reason)
+            print(f'  wrote {args.out}_history.png', flush=True)
+        return
+
     def write_snapshot(path, pos_now, rho_now, h_now):
         g = gas.copy()
         g[:, 1:4] = pos_now
@@ -186,9 +322,40 @@ def main(argv=None):
         g[:, 9] = h_now
         tip.writetipsy(g.astype(gas.dtype), dark, star, path, header, time)
 
-    if args.progressive:
-        if box is None:
-            sys.exit('--progressive needs a periodic box (--param or --box)')
+    # --- envelope (free-surface / open-box padding) ---------------------------
+    #   auto: on for an open box, off for a filled periodic box (-> byte-identical
+    #   to no envelope). An open box ALWAYS routes through relax_progressive (a
+    #   plain open relax cannot contain the free surface); --no-progressive there
+    #   means cascade off = a single full-res relax of the placed ensemble.
+    envelope_on = args.envelope == 'on' or (args.envelope == 'auto' and box is None)
+    env = None
+    if envelope_on:
+        from .amrtable import AMRTable
+        from .envelope import build_table_envelope, build_uniform_envelope
+        bg_c = args.bg_c or args.nsmooth
+        if isinstance(density, AMRTable):
+            # table-native: rho_edge/shell/background straight off the leaf set
+            env = build_table_envelope(density, float(mass.sum()), len(pos),
+                                       box=box, c=bg_c, k=args.bg_k,
+                                       scaffold=args.scaffold,
+                                       alpha=args.alpha)
+        else:
+            env = build_uniform_envelope(density, pos, float(mass.sum()),
+                                         len(pos), c=bg_c, k=args.bg_k,
+                                         scaffold=args.scaffold,
+                                         alpha=args.alpha)
+        print(f'envelope: m={env["m"]:.3e} rho_edge={env["rho_edge"]:.3e} '
+              f'rho_frame={env["rho_frame"]:.3e} delta_bg={env["delta_bg"]:.3e} '
+              f'background N={len(env["bg_pos"])}', flush=True)
+        if len(env['bg_pos']) == 0 and args.envelope == 'auto':
+            print('envelope: no sub-rho_edge cells -> filled box, disabling',
+                  flush=True)
+            env = None
+
+    if args.progressive or env is not None:
+        if box is None and env is None:
+            sys.exit('--progressive needs a periodic box (--param or --box), or '
+                     'use --open with the envelope (default for --open)')
         from .progressive import relax_progressive
         nx_full = args.nx_full or int(round(len(gas) ** (1.0 / 3.0)))
         # merge the input down to the density-chosen coarse count (auto
@@ -205,9 +372,18 @@ def main(argv=None):
             polish_iter=args.polish_iter, cap=2.0, start_icr0=2.0,
             flavour=args.flavour, rhopow=args.rhopow, icr0rate=args.icr0rate,
             margin=args.margin, one_sided=args.one_sided, hmode=args.hmode,
-            nsmoothmin=args.nsmoothmin, self_bias=args.self_bias, verbose=True)
-        nf = len(res.pos)
-        mf = mass.sum() / nf  # equal-mass glass
+            nsmoothmin=args.nsmoothmin, self_bias=args.self_bias,
+            envelope=env, open_pad=args.open_pad, cascade=args.progressive,
+            verbose=True)
+        if env is not None and res.envelope_audit is not None:
+            a = res.envelope_audit           # background culled, survivors renormed
+            nf, mf = a['n_survivor'], a['mf']
+            print(f'envelope cull: {a["n_full"]} -> {nf} '
+                  f'(culled {a["n_culled"]}), gas mass {a["gas_mass"]:.3e}, '
+                  f'per-particle mass {mf:.3e}', flush=True)
+        else:
+            nf = len(res.pos)
+            mf = mass.sum() / nf  # equal-mass glass
         g = np.zeros((nf, 12), dtype=gas.dtype)
         g[:, 0] = mf
         g[:, 1:4] = res.pos
@@ -220,17 +396,17 @@ def main(argv=None):
         err = np.abs(1.0 - res.rho / density.rho0(res.pos))
         print(f'done (progressive -> nx_full={nx_full}): final N={nf}, '
               f'mean|1-rho/rho0|={err.mean():.3e}, wrote {args.out}_IC')
-        for l in res.levels:
-            print(f'  stage {l["name"]:<6} N={l["n"]:<8} niter={l["niter"]:<5} '
-                  f'{l["wall"]:.0f}s  denserr(mn/p95/mx)='
-                  f'{l["denserr_mean"]:.4f}/{l["denserr_p95"]:.4f}/'
-                  f'{l["denserr_max"]:.4f}  force(mn/p95/mx)='
-                  f'{l["force_mean"]:.2e}/{l["force_p95"]:.2e}/'
-                  f'{l["force_max"]:.2e}')
+        _print_stages(res)
         if args.plot:
             write_denserr_plot(args.out, res.pos, mf, res.h, res.rho, density,
                                box, args.nsmooth, flavour=args.flavour,
                                rhopow=args.rhopow, nsmoothmin=args.nsmoothmin)
+        if args.history_plot:
+            from .diagnostics import plot_history
+            plot_history(res.history, f'{args.out}_history.png',
+                         title=f'{os.path.basename(args.out)} (final stage)',
+                         stop_reason=res.stop_reason)
+            print(f'  wrote {args.out}_history.png', flush=True)
         return
 
     callback = None
@@ -257,6 +433,12 @@ def main(argv=None):
         write_denserr_plot(args.out, res.pos, mass, res.h, res.rho, density,
                            box, args.nsmooth, flavour=args.flavour,
                            rhopow=args.rhopow, nsmoothmin=args.nsmoothmin)
+    if args.history_plot:
+        from .diagnostics import plot_history
+        plot_history(res.history, f'{args.out}_history.png',
+                     title=os.path.basename(args.out),
+                     stop_reason=res.stop_reason)
+        print(f'  wrote {args.out}_history.png', flush=True)
 
 
 if __name__ == '__main__':

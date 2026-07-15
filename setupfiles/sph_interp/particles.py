@@ -122,6 +122,14 @@ def from_tipsy(snap, fields=("rho",), nsmooth=64, periodic=True, box=None):
         hi = pos.max(axis=0)
         box = hi - lo
 
+    # The gasoline .param bPeriodic is authoritative for periodicity (as the box
+    # above is for the period): an isolated IC (bPeriodic=0, e.g. evrard) must NOT
+    # be treated as periodic. Falls back to the `periodic` arg only when the .param
+    # has no bPeriodic line.
+    pp = read_param_periodic(snap)
+    if pp is not None:
+        periodic = pp
+
     col = {"rho": 7, "t": 8, "temp": 8, "vx": 4, "vy": 5, "vz": 6,
            "metals": 10, "phi": 11}
     bcomp = {"bx": 0, "by": 1, "bz": 2}
@@ -191,6 +199,19 @@ def _read_param_box(snap):
     if px and py and pz:
         return np.array([px, py, pz], dtype=np.float64)
     return None
+
+
+def read_param_periodic(snap):
+    """The gasoline `bPeriodic` flag from the sibling `.param` (1 -> periodic box,
+    0 -> isolated/vacuum). Returns True/False, or None if the .param is absent or
+    has no bPeriodic line."""
+    vals = _param_dict(snap)
+    if vals is None:
+        return None
+    try:
+        return bool(int(float(vals["bPeriodic"])))
+    except (KeyError, ValueError):
+        return None
 
 
 def read_param_tufac(snap):

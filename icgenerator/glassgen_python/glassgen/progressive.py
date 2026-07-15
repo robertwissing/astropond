@@ -18,6 +18,8 @@ import numpy as np
 
 from .density import DensityField
 from .diagnostics import residual_force
+from . import envelope as _envelope
+from .envelope import _pad_periodic_box
 from .relax import relax
 from . import resample
 
@@ -43,6 +45,34 @@ def _level_diag(pos, mass, h, rho, density, box, nsmooth, flavour, rhopow,
                 force_mean=float(force.mean()),
                 force_p95=float(np.percentile(force, 95)),
                 force_max=float(force.max()))
+
+
+class _ShiftedField(DensityField):
+    """Evaluate an open-coordinate density/occupancy field at centred-frame
+    positions: ``rho0(p) = field(p + shift)``. Used when relax_progressive frames
+    an open IC in a padded periodic box (positions shifted by ``-shift``), so the
+    envelope fields - built by the caller in OPEN/world coordinates - are read at
+    the right place during the (centred-frame) relax and cull. Handles both a
+    DensityField and a plain callable via ``envelope._eval``."""
+
+    def __init__(self, field, shift):
+        self.field = field
+        self.shift = np.asarray(shift, dtype=np.float64)
+
+    def rho0(self, pos):
+        return _envelope._eval(self.field, np.asarray(pos) + self.shift)
+
+    def rho0_h(self, pos, h):
+        # forward the kernel-matched readout (task M4) into the open frame
+        if hasattr(self.field, 'rho0_h'):
+            return self.field.rho0_h(np.asarray(pos) + self.shift, h)
+        return self.rho0(pos)
+
+    @property
+    def smooth_readout(self):
+        return bool(getattr(self.field, 'smooth_readout', False))
+
+    __call__ = rho0
 
 
 def _measure(pos, mass, density, box, nsmooth, relax_kw):
@@ -278,8 +308,20 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                       split_margin=8, split_dist=0.4,
                       momentum=0.0, icr0_stop=3e-3, polish_iter=0,
                       cap=None, start_icr0=1.0, cap_mode='h',
-                      verbose=False, **relax_kw):
+                      envelope=None, open_pad=0.1, cascade=True,
+                      filler_field_hook=None, verbose=False, **relax_kw):
     """Progressive coarse->split->fine glass relaxation.
+
+    envelope : optional free-surface padding (RECONSTRUCT_PLAN.md). A dict
+        with keys `density` (the PaddedDensity target, used instead of the
+        `density` arg), `occupancy` (a field/callable ->~0/1 for the final
+        spatial vacuum cull), `bg_pos`/`bg_mass` (background particles seeded
+        into the ensemble so the mass contract holds at every cascade stage;
+        they split down with the reals and are culled at the end), and
+        `gas_mass` (the real gas mass the survivors are renormalised to). If
+        `box is None` the whole pipeline is framed in a padded periodic box
+        (`_pad_periodic_box`, margin `open_pad`) and the output is shifted back
+        to the open coordinates. `None` = no padding (today's behaviour).
 
     pos, mass : the FULL-resolution pre-IC (N = nx_full**3). In the default
         two-level path these positions are NOT relaxed directly - the coarse
@@ -306,9 +348,43 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
         momentum=...) instead - this arg is then ignored.
 
     Returns the final full-resolution RelaxResult."""
-    box = np.asarray(box, dtype=np.float64)
     pos = np.asarray(pos, dtype=np.float64)
     mass = np.asarray(mass, dtype=np.float64)
+    # --- envelope framing: pad open boxes, seed the background, use the
+    #     PaddedDensity target (see RECONSTRUCT_PLAN.md) --------------
+    env_shift = None
+    env_gas_mass = None
+    env_occupancy = None
+    if envelope is not None:
+        env_gas_mass = float(envelope.get('gas_mass', mass.sum()))
+        bg_pos = envelope.get('bg_pos')
+        bg_pos = None if bg_pos is None or len(bg_pos) == 0 \
+            else np.asarray(bg_pos, dtype=np.float64)
+        density = envelope['density']         # padded target (OPEN coords)
+        env_occupancy = envelope['occupancy']
+        if box is None:                       # open IC -> padded periodic frame
+            if envelope.get('frame_box') is not None:
+                # M2 rule: the envelope sized the frame itself (per-axis
+                # margins + the kernel-fits-the-box cap from Delta_bg)
+                box = np.asarray(envelope['frame_box'], dtype=np.float64)
+                env_shift = np.asarray(envelope['frame_centre'],
+                                       dtype=np.float64)
+            else:
+                allp = pos if bg_pos is None \
+                    else np.concatenate([pos, bg_pos], 0)
+                box, env_shift = _pad_periodic_box(allp, pad_frac=open_pad)
+            pos = pos - env_shift
+            if bg_pos is not None:
+                bg_pos = bg_pos - env_shift
+            # the envelope fields are in OPEN coords but the relax/cull run in the
+            # centred frame - evaluate them shifted so they read the right place
+            density = _ShiftedField(density, env_shift)
+            env_occupancy = _ShiftedField(env_occupancy, env_shift)
+        if bg_pos is not None:                # seed the ensemble (mass-consistent)
+            pos = np.concatenate([pos, bg_pos], axis=0)
+            mass = np.concatenate(
+                [mass, np.asarray(envelope['bg_mass'], dtype=np.float64)], 0)
+    box = np.asarray(box, dtype=np.float64)
     total_mass = float(mass.sum())
     if not isinstance(density, DensityField):
         fn = density
@@ -335,7 +411,11 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                              coarse_floor)
             else:
                 target = float(coarse_target)   # explicit count bypasses floor
-            factor = max(1, _floor_pow2(n_full / max(target, 1.0)))
+            # cascade=False (e.g. --no-progressive): force a single full-res
+            # level - relax the placed gas+background ensemble directly against
+            # the fixed padded target (the envelope single-relax fallback).
+            factor = 1 if not cascade \
+                else max(1, _floor_pow2(n_full / max(target, 1.0)))
             levels = cascade_levels(
                 factor=factor, inter_iter=inter_iter, momentum=momentum,
                 icr0_stop=icr0_stop, polish_iter=polish_iter,
@@ -365,11 +445,11 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
             total_factor *= int(lv.get('split_factor', 1))
         cur_pos, cur_mass, aux = resample.coarsen(
             pos, mass, box=box, factor=total_factor, margin=split_margin)
-        # coarsen's mutual-nearest merge absorbs a VARYING number of originals
-        # per particle (mass std/mean ~0.5), so the merged masses are unequal.
-        # The glass must be EQUAL-mass (the coarse positions, denser where the
-        # input was denser, already encode the target density), so reset to a
-        # uniform coarse mass; the splits then keep it equal down to full res.
+        # The glass must be EQUAL-mass even for a non-uniform input mass
+        # distribution (which coarsen's renormalisation would preserve): the
+        # coarse positions, denser where the input was denser, already encode
+        # the target density. Reset to a uniform coarse mass; the splits then
+        # keep it equal down to full res.
         cur_mass = np.full(len(cur_pos), total_mass / len(cur_pos))
     else:
         n_coarse = nx_coarse ** 3
@@ -461,4 +541,187 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                 f"progressive: final per-particle mass {got:.3e} differs from "
                 f"the nx_full target {expect:.3e} (final N={len(cur_pos)} vs "
                 f"nx_full**3={nx_full**3}); check nx_coarse / split factor.")
+    # --- envelope: spatial vacuum cull (remove background + strays), renorm,
+    #     unframe. Equal-mass glass -> survivors carry env_gas_mass/n each. ----
+    if envelope is not None:
+        keep = _envelope._eval(env_occupancy, result.pos) >= 0.5
+        n_surv = int(keep.sum())
+        bgp = envelope.get('bg_pos')
+        n_bg = 0 if bgp is None else len(bgp)
+        # pre-cull diagnostic stash (caller's coordinates, like the output):
+        # the full relaxed ensemble + the cull verdict, for with/without-cull
+        # audits - it exists nowhere else once the cull runs.
+        precull_pos = (result.pos + env_shift if env_shift is not None
+                       else result.pos.copy())
+        result.pos = np.ascontiguousarray(result.pos[keep])
+        result.rho = np.ascontiguousarray(result.rho[keep])
+        result.h = np.ascontiguousarray(result.h[keep])
+        if env_shift is not None:                 # back to open coordinates
+            result.pos = result.pos + env_shift
+        mf = env_gas_mass / max(n_surv, 1)
+        result.envelope_audit = dict(
+            n_full=int(len(keep)), n_survivor=n_surv,
+            n_culled=int((~keep).sum()), n_background=int(n_bg),
+            gas_mass=env_gas_mass, mf=mf,
+            precull_pos=precull_pos, precull_keep=keep)
+        if envelope.get('m'):
+            # renorm health gate: f = realised survivor mass / the contract
+            # mass m. f-1 measures the NET mass imbalance inside the
+            # occupancy contour at stop time (leaked reals vs meshed-in
+            # background). On a polished run the equilibrium pins it to a
+            # surface term (~one skin layer): f ~ 1.00 +- O(0.1%). A large
+            # f means the run was culled in a scattered state (e.g. stopped
+            # mid-re-anneal-kick) and the renorm uniformly biases rho/rho0
+            # of every survivor - don't trust the output.
+            f = mf / float(envelope['m'])
+            result.envelope_audit['renorm'] = f
+            if abs(f - 1.0) > 0.01:
+                import warnings
+                warnings.warn(
+                    f"envelope renorm f={f:.4f} (survivor mass / contract "
+                    f"mass) is >1% from 1: {int((~keep).sum())} of "
+                    f"{len(keep)} particles were culled outside the "
+                    "resolved gas - the run likely stopped in an unsettled "
+                    "state (mid-anneal kick?); the uniform mass renorm "
+                    "biases rho/rho0 of every survivor by this factor.")
+        # gather per-survivor fields from the source at the FINAL positions (in
+        # the caller's coordinate frame - post-unframe here) - reconstruct's
+        # velocity/temperature/etc. The reconstructed glass has no history to
+        # inherit; the fields are read fresh from the input at each final point.
+        if filler_field_hook is not None:
+            result.aux = filler_field_hook(result.pos)
+        if verbose:
+            a = result.envelope_audit
+            print(f"[progressive] envelope cull: {a['n_full']} -> "
+                  f"{a['n_survivor']} (culled {a['n_culled']}, "
+                  f"bg {a['n_background']}), mf={a['mf']:.3e}", flush=True)
     return result
+
+
+def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
+                     bg_c=None, bg_k=2.0, bg_tail=False, envelope='auto',
+                     cascade=True, seed=0, open_pad=0.1, kernel_match=True,
+                     filler_field_hook=None, shell_start='local',
+                     decay_cells=2.0, scaffold='exp', alpha=None,
+                     decay_spacing=None, decay_local=False,
+                     bg_mode='lattice', km_hmode='particle', km_hscale=1.0,
+                     flat_floor=False, tail_reach=6.0,
+                     verbose=False, **relax_kw):
+    """THE glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10).
+
+    Given a density table (AMRTable / 3D TableDensity) and a target count,
+    sample the initial ``count`` positions from the table itself
+    (:func:`envelope.sample_table`), derive the N-aware envelope from
+    ``m = gas_mass/count`` (:func:`envelope.build_table_envelope`), run the
+    progressive relax against the padded target, and cull/renorm.
+    ``./glassgen --table --count`` and ``glassresample --op reconstruct``
+    both drive this one function.
+
+    envelope : 'auto' (build it; drop it when the table places no background
+        AND the box is periodic - a filled box), 'on', or 'off'. 'off' with
+        ``box=None`` is an error: an open relax cannot contain a free surface.
+    kernel_match : evaluate the relax target as each particle's own KERNEL
+        AVERAGE of the table (:class:`density.KernelMatchedDensity`, plan
+        task M4 - default ON, approved 2026-07-10): where the table is
+        sharper than the N-particle kernel (thin-disk z profiles) the
+        pseudo-pressure ratio -> 1 instead of blowing the feature open.
+        Resolved regions are unaffected to second order. False = the point
+        read (pre-M4 behaviour).
+    shell_start, decay_cells : vacuum-taper shape, forwarded to
+        :func:`envelope.build_table_envelope` - 'local' (default since
+        2026-07-13: start at the nearest occupied cell's own value - the
+        explicit exterior pressure-support scaffold) vs 'edge' (start
+        capped at the global rho_edge, the pre-M12 scheme); decay length =
+        ``decay_cells`` x the gas-edge cell size.
+    scaffold, alpha : 'exp' (default, the M12 taper + lattice) or 'cubic'
+        (the 2026-07-13 resolvability scaffold - one marginal profile,
+        lattice retired for mass-weighted sampling; see
+        :func:`envelope.build_table_envelope`). ``alpha`` defaults to
+        envelope.ALPHA_DEFAULT (= auto_coarse_count's cascade constant).
+    gas_mass : the mass contract. Defaults to the table integral sum(rho*V);
+        pass the input snapshot's exact gas mass when reconstructing.
+    relax_kw : forwarded to :func:`relax_progressive` - its named cascade
+        knobs (max_iter, icr0_stop, momentum, ...) bind there; the rest reach
+        every relax() call (callback, flavour, hmode, ...).
+
+    Returns the final RelaxResult: ``res.envelope_audit`` (always set; mf =
+    the survivors' per-particle mass) + ``res.table_build`` (rho_edge/
+    rho_floor/delta_bg/m when the envelope ran), ``res.aux`` = the
+    ``filler_field_hook`` gather at the final positions (if given)."""
+    from .envelope import (ALPHA_DEFAULT, build_table_envelope, sample_table,
+                           table_mass)
+    if envelope is True:
+        envelope = 'on'
+    elif envelope is False:
+        envelope = 'off'
+    if gas_mass is None:
+        gas_mass = table_mass(table)
+    if alpha is None:
+        alpha = ALPHA_DEFAULT
+    env = None
+    if envelope in ('auto', 'on'):
+        env = build_table_envelope(table, gas_mass, count, box=box,
+                                   c=(bg_c or nsmooth), k=bg_k, seed=seed,
+                                   nsmooth=nsmooth, pad_frac=open_pad,
+                                   bg_tail=bg_tail, shell_start=shell_start,
+                                   decay_cells=decay_cells,
+                                   scaffold=scaffold, alpha=alpha,
+                                   decay_spacing=decay_spacing,
+                                   decay_local=decay_local,
+                                   bg_mode=bg_mode,
+                                   flat_floor=flat_floor,
+                                   tail_reach=tail_reach)
+        if envelope == 'auto' and len(env['bg_pos']) == 0 and box is not None:
+            env = None                       # filled periodic box: no vacuum
+    if env is None and box is None:
+        raise ValueError("an open-box table build needs the envelope "
+                         "(envelope='off' requires a periodic box)")
+    target = env['density'] if env is not None else table
+    if kernel_match:
+        from .density import KernelMatchedDensity
+        # km_hmode='target' (2026-07-13): equilibrium-h readout - the
+        # averaging scale from the target's own density instead of each
+        # particle's state (breaks the drained-region h-growth feedback)
+        target = KernelMatchedDensity(target, hmode=km_hmode,
+                                      m=float(gas_mass) / int(count),
+                                      nsmooth=nsmooth,
+                                      rho_edge=(env['rho_edge']
+                                                if env is not None else None),
+                                      h_scale=km_hscale)
+        if env is not None:
+            env['density'] = target       # relax_progressive rereads the dict
+    pos = sample_table(table, count, seed=seed)
+    mass = np.full(int(count), float(gas_mass) / int(count))
+    rkw = dict(relax_kw)
+    rkw.pop('reanneal', None)                # the cascade sets these per stage
+    rkw.pop('confine', None)
+    # ONE resolvability constant: the same alpha drives the cubic scaffold
+    # (above) and the cascade's auto_coarse_count bound (relax_progressive) -
+    # callers that used to pass alpha through relax_kw keep working
+    rkw.setdefault('alpha', alpha)
+    res = relax_progressive(pos, mass, target,
+                            box, coarse_seed='merge', nsmooth=nsmooth,
+                            envelope=env, filler_field_hook=filler_field_hook,
+                            cascade=cascade, open_pad=open_pad,
+                            verbose=verbose, **rkw)
+    if getattr(res, 'envelope_audit', None) is None:   # envelope-off build
+        res.envelope_audit = dict(
+            n_full=int(len(res.pos)), n_survivor=int(len(res.pos)),
+            n_culled=0, n_background=0, gas_mass=float(gas_mass),
+            mf=float(gas_mass) / max(len(res.pos), 1))
+        if filler_field_hook is not None:
+            res.aux = filler_field_hook(res.pos)
+    info = dict(gas_mass=float(gas_mass), count=int(count))
+    if env is not None:
+        info.update(rho_edge=env['rho_edge'],
+                    rho_frame=env.get('rho_frame'),
+                    delta_bg=env['delta_bg'], m=env['m'],
+                    scaffold=env.get('scaffold', 'exp'),
+                    alpha=env.get('alpha'),
+                    bg_mode=env.get('bg_mode', 'lattice'),
+                    decay_spacing=env.get('decay_spacing'),
+                    decay_local=env.get('decay_local', False))
+        if 'n_bg_tail' in env:
+            info['n_bg_tail'] = env['n_bg_tail']
+    res.table_build = info
+    return res

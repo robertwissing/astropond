@@ -17,7 +17,8 @@ import re
 import sys
 from collections import namedtuple
 from functools import lru_cache
-
+from telegram_notify import TelegramNotifier
+tg = TelegramNotifier()
 import numpy as np
 
 import readtipsy as tip
@@ -1262,6 +1263,8 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
                    else f"{save}_residual.png")
             fig.savefig(out, bbox_inches="tight")
             print(f"saved render -> {out}")
+            tg.send_message("Trololol")
+            tg.send_photo(out, "{out}")
         else:
             plt.show()
         return
@@ -1325,6 +1328,8 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
                 out = f"{save}_render_t{tv:g}.png"
                 fig.savefig(out, bbox_inches="tight")
                 print(f"saved render -> {out}")
+                tg.send_message("Trololol")
+                tg.send_photo(out, "{out}")
             else:
                 plt.show()
         return
@@ -1377,6 +1382,8 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
     if save:
         out = f"{save}_render.png"
         fig.savefig(out, bbox_inches="tight")
+        tg.send_message("Trololol")
+        tg.send_photo(out, "{out}")
         print(f"saved render -> {out}")
     else:
         plt.show()

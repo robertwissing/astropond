@@ -9,7 +9,8 @@ from typing import List, Tuple
 import numpy as np
 import readtipsy as tip
 import IC_smoothlength as smth
-
+from telegram_notify import TelegramNotifier
+tg = TelegramNotifier()
 
 # ----------------------- aux-file readers ------------------------------
 
@@ -334,6 +335,9 @@ def finish_figure(fig, save=None, dpi=150):
     if save:
         fig.savefig(save, bbox_inches='tight', dpi=dpi)
         print(f"saved {save}")
+        print("Trololol")
+        tg.send_message("Trololol")
+        tg.send_photo(save, "{save}")
     else:
         plt.show()
 
@@ -387,6 +391,8 @@ def finish_figure_with_legend(fig, ax, save=None, dpi=150, footnote=None):
     # bbox_extra_artists + tight bbox so the below-figure legend/footnote aren't clipped.
     fig.savefig(save, bbox_inches="tight", bbox_extra_artists=tuple(extra), dpi=dpi)
     print(f"saved {save}")
+    print("Trololol")
+    tg.send_photo(save, "{save}")
     plt.close(fig)
 
 def loaddata(entry: str):
@@ -592,6 +598,9 @@ def render_particles(axis1, axis2, render, box_size=None, res=512, outname=None,
 
     if outname:
         plt.savefig(outname, dpi=150, bbox_inches="tight")
+        print("Trololol")
+        tg.send_message("Trololol")
+        tg.send_photo(outname, "{save}")
         plt.close()
     else:
         plt.show()

@@ -1,0 +1,63 @@
+#!/bin/bash
+# glasstable: density-TABLE GENERATOR. On a snapshot it captures the RAW
+# gas density table and writes BOTH the table and a tipsy render of it
+# (${out}_raw.npz + ${out}_raw.00000), then applies the N-aware envelope
+# fill - the same rho_edge/rho_floor logic the glassgen builder relaxes
+# against - at --count N (default: the snapshot's gas count) and writes the
+# filled pair (${out}_n${count}.npz + .00000), so the interpolated density
+# target at that count can be rendered/inspected before building.
+# Render: one gas particle per cell, pos = centre, mass = rho*V, rho column
+# = table density, temp column = AMR level.
+#
+# usage: glasstable <tipsy.NNNNN | table.npz> [options...]
+#
+#   # capture from a snapshot's gas (raw + envelope pair at the gas count):
+#   glasstable ic.00000
+#   # re-run the envelope fill of a saved raw table at another count:
+#   glasstable ic_table_raw.npz --count 2000000
+#
+# When given a snapshot (not a .npz), the box is taken from
+# <input minus .NNNNN>.param if present (like glassresample); pass --param,
+# --box LX LY LZ or --open to override. Everything else (--grid,
+# --grid-npx, --capture-method, --bg-c, --bg-k, -s, ...) is passed to
+# glassgen.reconstruct; run with --help to list.
+set -euo pipefail
+
+pkgroot=$(cd "$(dirname "$0")" && pwd)
+
+if [[ $# -lt 1 || $1 == -h || $1 == --help ]]; then
+    echo "usage: $(basename "$0") <tipsy file | table.npz> [options]"
+    echo
+    PYTHONPATH=$pkgroot python -m glassgen.reconstruct --help
+    exit 0
+fi
+
+infile=$1; shift
+[[ -f $infile ]] || { echo "glasstable: no such file: $infile" >&2; exit 1; }
+
+if [[ $infile == *.npz ]]; then
+    exec env PYTHONPATH=$pkgroot${PYTHONPATH:+:$PYTHONPATH} \
+        python -m glassgen.reconstruct --table "$infile" "$@"
+fi
+
+base=$infile
+[[ $infile =~ ^(.*)\.[0-9]+$ ]] && base=${BASH_REMATCH[1]}
+
+args=("$@")
+have_box=0
+for a in "${args[@]}"; do
+    case $a in
+        --param|--param=*|--box|--open) have_box=1 ;;
+    esac
+done
+if ((!have_box)); then
+    if [[ -f $base.param ]]; then
+        args+=(--param "$base.param")
+    else
+        echo "glasstable: no $base.param found - pass --param, --box LX LY LZ, or --open" >&2
+        exit 1
+    fi
+fi
+
+exec env PYTHONPATH=$pkgroot${PYTHONPATH:+:$PYTHONPATH} \
+    python -m glassgen.reconstruct -I "$infile" "${args[@]}"

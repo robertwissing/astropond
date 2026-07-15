@@ -18,7 +18,8 @@ analog of `from_tipsy`.
 
 from .particles import Particles, from_tipsy
 from .targets import (UniformGrid, AMRGrid, VoronoiGrid, Projection2D,
-                      refine_smoothing_length, refine_mass, refine_count)
+                      refine_smoothing_length, refine_mass, refine_count,
+                      refine_band, refine_any, grade_2to1)
 from .interpolate import interpolate, GridResult
 from .export import (to_cell_table, to_structured_array, to_ramses,
                      to_arepo, particles_to_arepo,
@@ -32,6 +33,7 @@ __all__ = [
     "Particles", "from_tipsy",
     "UniformGrid", "AMRGrid", "VoronoiGrid", "Projection2D",
     "refine_smoothing_length", "refine_mass", "refine_count",
+    "refine_band", "refine_any", "grade_2to1",
     "interpolate", "GridResult",
     "to_cell_table", "to_structured_array", "to_ramses",
     "to_arepo", "particles_to_arepo",

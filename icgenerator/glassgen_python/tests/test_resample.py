@@ -56,6 +56,36 @@ def test_split_children_local_and_in_box():
     assert np.all(np.linalg.norm(sep, axis=1) < box.min() / 2)
 
 
+def test_split_orient_sweep_variants():
+    # jrN: iterative azimuth relaxation (randomized Jacobi). Same dumbbell
+    # invariants as any orient (pair centroid = parent, in box); jr0 = the
+    # bare k1jitter initializer. The sweeps target the global min pair
+    # spacing; on this fixed seed the improvement is deterministic, so it
+    # doubles as a regression guard.
+    pos, mass, aux, box = _setup()
+    from scipy.spatial import cKDTree
+
+    def dmin(p):
+        w = np.mod(p + 0.5 * box, box)
+        d, _ = cKDTree(w, boxsize=box).query(w, k=2)
+        return d[:, 1].min()
+
+    base = None
+    for orient in ('jr0', 'jr8'):
+        p2, m2, _ = resample.split(pos, mass, aux, box=box, factor=2,
+                                   dist=0.3, orient=orient, scale='vol')
+        assert np.isfinite(p2).all()
+        assert np.all(np.abs(p2) <= box / 2 + 1e-9)
+        # pair centroid = parent (min-image: wrapping shifts a child by box)
+        drift = p2[0::2] + p2[1::2] - 2 * pos
+        drift -= box * np.rint(drift / box)
+        assert np.allclose(drift, 0.0, atol=1e-12)
+        if orient == 'jr0':
+            base = dmin(p2)
+        else:
+            assert dmin(p2) >= base - 1e-12
+
+
 def test_split_custom_halve_fields():
     pos, mass, aux, box = _setup()
     aux2 = {'Bx': aux['B'][:, 0].copy()}
@@ -69,7 +99,10 @@ def test_split_custom_halve_fields():
 
 def test_merge_conserves_mass_and_momentum():
     pos, mass, aux, box = _setup(n=600)
-    pm, mm, am = resample.merge(pos, mass, aux, box=box, target_factor=2)
+    # exact momentum conservation holds for the raw pairwise merge (masses
+    # summed, vel mass-weighted); mass renormalisation disabled
+    pm, mm, am = resample.merge(pos, mass, aux, box=box, target_factor=2,
+                                keep_mass_distribution=False)
     assert len(pm) < len(pos)                       # some pairs merged
     assert np.isclose(mm.sum(), mass.sum())         # mass conserved
     p0 = (mass[:, None] * aux['vel']).sum(0)
@@ -77,6 +110,30 @@ def test_merge_conserves_mass_and_momentum():
     assert np.allclose(p0, p1)                       # momentum conserved
     # extensive fields summed back
     assert np.isclose(am['u'].sum(), aux['u'].sum())
+
+
+def test_merge_keeps_uniform_mass_uniform():
+    # default: a uniform-mass input must come out uniform-mass (renormalised),
+    # not a 1x/2x/3x mix from unpaired / re-merged particles
+    pos, mass, aux, box = _setup(n=600)
+    pm, mm, _ = resample.merge(pos, mass, aux, box=box, target_factor=2)
+    assert np.isclose(mm.sum(), mass.sum())          # total mass conserved
+    assert np.allclose(mm, mm[0])                    # single unique mass
+    assert np.isclose(mm[0], mass[0] * len(pos) / len(pm))
+
+
+def test_coarsen_preserves_mass_distribution_shape():
+    # a two-mass input keeps its two-mass shape (scaled by the count ratio)
+    pos, mass, aux, box = _setup(n=512)
+    mass = mass.copy()
+    mass[256:] *= 2.0                                # half m, half 2m
+    cp, cm, _ = resample.coarsen(pos, mass, aux, box=box, factor=2)
+    assert len(cp) == 256
+    assert np.isclose(cm.sum(), mass.sum())
+    uniq = np.unique(np.round(cm / cm.min(), 6))
+    assert len(uniq) == 2                            # still exactly two masses
+    assert np.isclose(uniq[1] / uniq[0], 2.0)        # same 1:2 ratio
+    assert np.isclose(cm.min(), mass.min() * 2.0)    # each scaled by n_in/n_out
 
 
 def test_open_domain_split():

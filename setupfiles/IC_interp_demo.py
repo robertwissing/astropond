@@ -13,7 +13,7 @@ differences obvious — the AMR octree refines on the collapsing core and the
 Voronoi cells shrink where the particles crowd, both tracking the structure the
 uniform grid resolves bluntly.
 
-  interp_demo.sh [SNAPSHOT] [--method sph|petkova] [--field rho] [--npx N] ...
+  interp_demo.sh [SNAPSHOT] [--method sph|sph-scatter|petkova] [--field rho] ...
 
 Each geometry's panel shares a colour scale (the 3D volume grids show a
 mid-plane slab slice; Projection2D shows its column map with its own scale).
@@ -33,8 +33,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SNAP = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "test_cases/mhdcollapse/"
-    "mhdcollapse32_N64latticemu10rd360Erat0.045facQ1GASOLINE/"
-    "mhdcollapse32_N64latticemu10rd360Erat0.045facQ1GASOLINE.00100")
+    "datafiles/"
+    "mhdcollapse32_latticemu10rd360Erat0.04.00000")
+
+# The coarse meshes are interpolated with EVERY method so the radial profile can
+# contrast them; cheap at coarse resolution (the full-res showcase stays on the
+# single --method the user chose). ("sph" is an alias of "sph-gather".)
+COARSE_METHODS = ("sph-gather", "sph-scatter", "petkova")
 
 
 def show_figure(path, enabled):
@@ -70,9 +75,11 @@ def geom_cells(res, fld):
     return None                                      # Projection2D: no 3D density
 
 
-def report_budget(results, coarse, p, fld):
+def report_budget(results, coarse_by_method, p, fld):
     """Print total mass (Sum rho_cell*V_cell) and total volume (Sum V_cell) for
-    every grid, against the SPH particles (mass Sum m_i, volume Sum m_i/rho_i)."""
+    every grid, against the SPH particles (mass Sum m_i, volume Sum m_i/rho_i).
+    `coarse_by_method` is {method: {geometry: result}} (or None) so the coarse
+    budget is broken out per interpolation method."""
     sph_m = float(np.sum(p.mass))
     sph_v = float(np.sum(p.mass / np.maximum(p.rho, 1e-30)))
     box_v = float(np.prod(p.box)) if p.box is not None else float("nan")
@@ -81,9 +88,8 @@ def report_budget(results, coarse, p, fld):
     print(f"  SPH particles : mass = {sph_m:.6g}   "
           f"volume = {sph_v:.6g}  (Sum m_i/rho_i)")
     print(f"  domain (box)  : volume = {box_v:.6g}")
-    for label, meshes in (("full-resolution", results), ("coarse", coarse)):
-        if not meshes:
-            continue
+
+    def _report(label, meshes):
         print(f"  {label} meshes:")
         for name in ("UniformGrid", "AMRGrid", "VoronoiGrid"):
             gc = geom_cells(meshes[name], fld)
@@ -93,6 +99,11 @@ def report_budget(results, coarse, p, fld):
             m = float(np.sum(dens * vol)); v = float(np.sum(vol))
             print(f"    {name:<12s} mass = {m:.6g} ({100*(m/sph_m-1):+6.2f}%)   "
                   f"volume = {v:.6g} ({100*(v/sph_v-1):+6.2f}%)")
+
+    _report("full-resolution", results)
+    if coarse_by_method:
+        for method, meshes in coarse_by_method.items():
+            _report(f"coarse [{method}]", meshes)
     print("=" * 70)
 
 
@@ -176,7 +187,11 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     pa.add_argument("snapshot", nargs="?", default=DEFAULT_SNAP,
                     help="tipsy snapshot (default: an mhdcollapse snapshot)")
-    pa.add_argument("--method", choices=["sph", "petkova"], default="sph")
+    pa.add_argument("--method",
+                    choices=["sph", "sph-gather", "sph-scatter", "petkova"],
+                    default="sph",
+                    help="deposit method: sph(-gather) kernel estimate, "
+                         "sph-scatter mass-conserving, or petkova exact")
     pa.add_argument("--field", default="rho", help="field to interpolate/show")
     pa.add_argument("--npx", type=int, default=128,
                     help="resolution: uniform/projection cells per axis; AMR "
@@ -192,6 +207,12 @@ def build_parser():
     pa.add_argument("--base-npx", type=int, default=16, help="AMR base grid/axis")
     pa.add_argument("--voronoi-ncells", type=int, default=40000,
                     help="Voronoi generators (subsampled particles); 0 = use all")
+    pa.add_argument("--voronoi-backend", default="auto",
+                    choices=["auto", "pyvoro", "multivoro", "arepo"],
+                    help="Voronoi mesher (default auto = arepo if built else "
+                         "multivoro/pyvoro). The arepo backend now meshes non-cubic "
+                         "PERIODIC boxes NATIVELY (per-axis LONG_Y/LONG_Z), so thin "
+                         "slab domains like kh conserve exactly.")
     pa.add_argument("--project", default="column",
                     choices=["column", "average", "rhocolumn", "slice"],
                     help="Projection2D mode")
@@ -256,40 +277,93 @@ def main(argv=None):
                   f"generators; using 3.")
             setattr(args, attr, 3)
 
+    show = args.show if args.show is not None else bool(os.environ.get("DISPLAY"))
+
     import matplotlib
-    matplotlib.use("Agg")
+    # When showing, prefer an interactive backend so plt.show() draws the figures
+    # directly in a window (GTK3Agg as requested), instead of writing PNGs and
+    # shelling out to an external viewer. Fall back to headless Agg if none load.
+    interactive = False
+    if show:
+        for bk in ("GTK3Agg", "GTK4Agg", "QtAgg", "TkAgg"):
+            try:
+                matplotlib.use(bk, force=True)
+                interactive = True
+                break
+            except Exception:
+                continue
+    if not interactive:
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm, Normalize
     from sph_interp import (from_tipsy, interpolate, UniformGrid, AMRGrid,
                             VoronoiGrid, Projection2D, refine_smoothing_length,
                             refine_count, field_image, visualise, draw_cells,
                             draw_cells_3d)
+    from sph_interp.targets import _resolve_backend
+
+    eff_backend = _resolve_backend(args.voronoi_backend)
+    backend_note = (f"{eff_backend} (auto)" if args.voronoi_backend == "auto"
+                    else eff_backend)
 
     a1, a2 = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}[args.axes]
     fld = args.field
-    show = args.show if args.show is not None else bool(os.environ.get("DISPLAY"))
+
+    def interp(pp, tgt):
+        """interpolate() with the demo's chosen method/field. sph-scatter is now
+        implemented for every geometry (Projection2D's `slice` mode delegates to
+        gather internally, since a plane sample is not an extensive projection)."""
+        return interpolate(pp, tgt, method=args.method, values=[fld])
 
     print(f"reading {args.snapshot}  field={fld}")
     p = from_tipsy(args.snapshot, fields=(fld,), nsmooth=args.nsmooth)
     print(f"  {p.n} gas particles, box {np.round(p.box, 4)}")
     box = p.box
 
+    # --- timing: separate mesh GENERATION from INTERPOLATION for each stage --
+    import time
+    timings = []                             # (stage, label, seconds)
+
+    def timed(stage, label, fn, *a, **kw):
+        """Run fn(*a, **kw), record its wall time under (stage, label), return
+        (result, seconds)."""
+        t0 = time.perf_counter()
+        out = fn(*a, **kw)
+        dt = time.perf_counter() - t0
+        timings.append((stage, label, dt))
+        return out, dt
+
     # --- build + interpolate each target geometry --------------------------
     results = {}
 
+    def _t_line(tb, ti):
+        """The per-stage timing line: total = mesh generation + interpolation."""
+        print(f"    t_tot = {tb + ti:.3f}s   t_mesh = {tb:.3f}s   "
+              f"t_inter = {ti:.3f}s")
+
     print("  UniformGrid ...")
-    g = UniformGrid.centered(box, args.npx)
-    results["UniformGrid"] = interpolate(p, g, method=args.method, values=[fld])
+    g, tb = timed("build", "UniformGrid", UniformGrid.centered, box, args.npx)
+    print(f"    {args.npx}^3 = {args.npx ** 3} cells")
+    results["UniformGrid"], ti = timed("interp", f"UniformGrid/{args.method}",
+                                       interp, p, g)
+    _t_line(tb, ti)
 
     print("  AMRGrid (octree) ...")
     import math
+    amr_count = 8                            # refine while a cell holds > this many particles
     max_level = max(0, math.ceil(math.log2(max(args.npx, 1) / args.base_npx)))
-    g = AMRGrid.build(p, base_npx=args.base_npx, max_level=max_level,
-                      criterion=refine_smoothing_length())
-    print(f"    {g.ncell} leaf cells (base {args.base_npx}^3, max_level {max_level})")
-    results["AMRGrid"] = interpolate(p, g, method=args.method, values=[fld])
+    fine = args.base_npx * (2 ** max_level)
+    g, tb = timed("build", "AMRGrid", AMRGrid.build, p, base_npx=args.base_npx,
+                  max_level=max_level, criterion=refine_count(amr_count))
+    print(f"    {g.ncell} leaf cells")
+    print(f"    refine: particle-count, n_target={amr_count} "
+          f"(split while cell holds > {amr_count} particles)")
+    print(f"    base {args.base_npx}^3 -> finest {fine}^3 "
+          f"(max_level {max_level}; effective range {args.base_npx}..{fine} per axis)")
+    results["AMRGrid"], ti = timed("interp", f"AMRGrid/{args.method}", interp, p, g)
+    _t_line(tb, ti)
 
-    print("  VoronoiGrid ...")
+    print(f"  VoronoiGrid ... [backend: {backend_note}]")
     half = 0.5 * np.asarray(box)
     # Periodic box -> bounds ARE the period (ghost images handle the boundary, so
     # Sum cell volume = box volume exactly). Non-periodic -> a small pad.
@@ -308,12 +382,18 @@ def main(argv=None):
     else:
         pts = p.pos
         print(f"    {p.n} generators (all particles)")
-    g = VoronoiGrid.from_points(pts, bounds=bounds, periodic=vper)
-    results["VoronoiGrid"] = interpolate(p, g, method=args.method, values=[fld])
+    g, tb = timed("build", "VoronoiGrid", VoronoiGrid.from_points, pts,
+                  bounds=bounds, periodic=vper, backend=args.voronoi_backend)
+    results["VoronoiGrid"], ti = timed("interp", f"VoronoiGrid/{args.method}",
+                                       interp, p, g)
+    _t_line(tb, ti)
 
     print(f"  Projection2D [{args.project}] ...")
-    g = Projection2D.centered(box, a1, a2, npx=args.npx, mode=args.project)
-    results["Projection2D"] = interpolate(p, g, method=args.method, values=[fld])
+    g, tb = timed("build", "Projection2D", Projection2D.centered, box, a1, a2,
+                  npx=args.npx, mode=args.project)
+    results["Projection2D"], ti = timed("interp", f"Projection2D/{args.method}",
+                                        interp, p, g)
+    _t_line(tb, ti)
 
     # --- assemble images; share a colour scale across the 3D volume grids ---
     order = ["UniformGrid", "AMRGrid", "VoronoiGrid", "Projection2D"]
@@ -455,7 +535,7 @@ def main(argv=None):
 
     fig.savefig(args.out, dpi=130, bbox_inches="tight")
     print(f"wrote showcase -> {args.out}")
-    show_figure(args.out, show)
+    show_figure(args.out, show and not interactive)
 
     # --- coarse dedicated meshes (used by BOTH the 3D figure and the profile) -
     #     The interpolation meshes are far too fine for a 3D cell picture (a
@@ -463,7 +543,7 @@ def main(argv=None):
     #     COMPLETE mesh per geometry — few, large cells, like the original
     #     interpolate_petkova.py polyhedra figures.
     cc = p.pos[np.argmax(cval)]                      # densest cell: core centre
-    coarse = None
+    coarse_by_method = None
     if args.mesh3d or args.profile:
         print("  building coarse dedicated meshes ...")
         ncu = args.mesh3d_coarse
@@ -480,27 +560,46 @@ def main(argv=None):
         mlc = max(0 if user_amr else 3,
                   math.ceil(math.log2(max(ncu, 1) / nab)))
         ncrit = max(32, int(p.n / (nab ** 3 * 8)))   # ~ a few-per-base-cell target
-        coarse = {}
-        gu = UniformGrid.centered(box, ncu)
-        coarse["UniformGrid"] = interpolate(p, gu, method=args.method, values=[fld])
-        ga = AMRGrid.build(p, base_npx=nab, max_level=mlc,
-                           criterion=refine_count(ncrit))
-        coarse["AMRGrid"] = interpolate(p, ga, method=args.method, values=[fld])
+        gu, tbu = timed("build", "coarse UniformGrid", UniformGrid.centered,
+                        box, ncu)
+        ga, tba = timed("build", "coarse AMRGrid", AMRGrid.build, p,
+                        base_npx=nab, max_level=mlc,
+                        criterion=refine_count(ncrit))
         nvg = min(args.mesh3d_voronoi, p.n)
         iv = np.random.default_rng(1).choice(p.n, nvg, replace=False)
-        gv = VoronoiGrid.from_points(p.pos[iv], bounds=bounds, periodic=vper)
-        coarse["VoronoiGrid"] = interpolate(p, gv, method=args.method, values=[fld])
+        gv, tbv = timed("build", "coarse VoronoiGrid", VoronoiGrid.from_points,
+                        p.pos[iv], bounds=bounds, periodic=vper,
+                        backend=args.voronoi_backend)
+        coarse_grids = {"UniformGrid": gu, "AMRGrid": ga, "VoronoiGrid": gv}
         print(f"    coarse meshes: uniform {ncu}^3, AMR base{nab}/level{mlc} "
-              f"({ga.ncell} leaves), Voronoi {nvg} cells")
+              f"({ga.ncell} leaves), Voronoi {nvg} cells; "
+              f"methods {', '.join(COARSE_METHODS)}")
+        # deposit every method onto the coarse meshes (cheap here) so the profile
+        # can overlay gather / scatter / petkova; the 3D figure + budget below
+        # use one representative (petkova — the exact, mass-conserving integral).
+        coarse_by_method = {}
+        for m in COARSE_METHODS:
+            coarse_by_method[m] = {}
+            for n, g in coarse_grids.items():
+                res, _ = timed("interp", f"coarse {n}/{m}",
+                               interpolate, p, g, method=m, values=[fld])
+                coarse_by_method[m][n] = res
+        tb_coarse = tbu + tba + tbv
+        ti_coarse = sum(dt for st, lb, dt in timings
+                        if st == "interp" and lb.startswith("coarse "))
+        print(f"    coarse totals: t_tot = {tb_coarse + ti_coarse:.3f}s   "
+              f"t_mesh = {tb_coarse:.3f}s   t_inter = {ti_coarse:.3f}s "
+              f"({len(COARSE_METHODS)} methods x 3 geometries)")
 
     # --- mass / volume budget (printed text) --------------------------------
-    report_budget(results, coarse, p, fld)
+    report_budget(results, coarse_by_method, p, fld)
 
     # --- second figure: the TRUE 3D cells on the coarse meshes --------------
     if args.mesh3d:
-        print("  rendering true 3D cells ...")
-        cvall = np.concatenate([np.asarray(coarse[n].data[fld]).ravel()
-                                for n in coarse])
+        print("  rendering true 3D cells (petkova) ...")
+        c3 = coarse_by_method["petkova"]            # one method suffices in 3D
+        cvall = np.concatenate([np.asarray(c3[n].data[fld]).ravel()
+                                for n in c3])
         cvp = cvall[cvall > 0]
         cnorm3 = (LogNorm(vmin=cvp.min(), vmax=cvp.max())
                   if cvp.size and cvp.max() / cvp.min() > 50
@@ -519,10 +618,10 @@ def main(argv=None):
         fig3.suptitle(f"sph_interp — actual 3D cells (coarse meshes, "
                       f"{args.mesh3d_clip} cutaway) — "
                       f"{os.path.basename(args.snapshot)}, field '{fld}', "
-                      f"method '{args.method}'", fontsize=15, fontweight="bold")
+                      f"method 'petkova'", fontsize=15, fontweight="bold")
         for j, name in enumerate(["UniformGrid", "AMRGrid", "VoronoiGrid"], 1):
             ax3 = fig3.add_subplot(1, 3, j, projection="3d")
-            _, lab = draw_cells_3d(ax3, coarse[name], fld, norm=cnorm3, cmap=cmap,
+            _, lab = draw_cells_3d(ax3, c3[name], fld, norm=cnorm3, cmap=cmap,
                                    max_cells=args.mesh3d_cells,
                                    cull_percentile=args.mesh3d_cull,
                                    clip=clipdef)
@@ -532,7 +631,7 @@ def main(argv=None):
         out3 = os.path.splitext(args.out)[0] + "_mesh3d.png"
         fig3.savefig(out3, dpi=130, bbox_inches="tight")
         print(f"wrote 3D cells -> {out3}")
-        show_figure(out3, show)
+        show_figure(out3, show and not interactive)
 
     # --- third figure: density vs radius, full-res and coarse meshes --------
     if args.profile:
@@ -548,32 +647,69 @@ def main(argv=None):
 
         gcol = {"UniformGrid": "tab:blue", "AMRGrid": "tab:green",
                 "VoronoiGrid": "tab:red"}
-        panels = [("full-resolution meshes", results),
-                  ("coarse meshes", coarse)]
-        figp, axp = plt.subplots(1, 2, figsize=(15, 6.2), sharex=True, sharey=True)
-        for ax, (label, meshes) in zip(axp, panels):
-            # light particle scatter for context (subsampled)
+        # each geometry keeps its colour family; on the coarse panel the three
+        # methods are light->dark shades within it (sph-gather light, sph-scatter
+        # mid, petkova dark), so method differences read as brightness.
+        geom_shades = {
+            "UniformGrid": {"sph-gather": "#9ecae1", "sph-scatter": "#3182bd",
+                            "petkova": "#08306b"},
+            "AMRGrid":     {"sph-gather": "#a1d99b", "sph-scatter": "#31a354",
+                            "petkova": "#006d2c"},
+            "VoronoiGrid": {"sph-gather": "#fc9272", "sph-scatter": "#de2d26",
+                            "petkova": "#67000d"},
+        }
+        # 2x2 layout: top-left = full-resolution meshes (all geometries, single
+        # --method); the other three = one geometry each on its COARSE mesh with
+        # all three methods as light->dark shades.
+        figp, axp = plt.subplots(2, 2, figsize=(15, 12), sharex=True, sharey=True)
+
+        def _profile_context(ax):
+            """SPH particle scatter + shell-binned reference (shared by every panel)."""
             sub = (np.random.default_rng(0).choice(p.n, 20000, replace=False)
                    if p.n > 20000 else np.arange(p.n))
             ax.scatter(rpart[sub], p.rho[sub], s=1, alpha=0.08, color="0.6",
                        linewidths=0, zorder=1)
             ax.plot(rmid, sph_prof, "k-", lw=2.6, label="SPH particles", zorder=5)
-            rng_prof = np.random.default_rng(7)
-            for name in ("UniformGrid", "AMRGrid", "VoronoiGrid"):
+
+        # sample the mesh field on each radial shell (not bin cell centres), so a
+        # coarse / single-cell mesh reads as a flat line at its density.
+        # top-left: full-resolution meshes, the single chosen --method
+        ax = axp[0, 0]
+        _profile_context(ax)
+        rng_prof = np.random.default_rng(7)
+        for name in ("UniformGrid", "AMRGrid", "VoronoiGrid"):
+            if geom_cells(results[name], fld) is None:
+                continue
+            prof = sampled_radial_profile(results[name], fld, cc, rmid,
+                                          p.box, p.periodic, rng_prof)
+            ax.plot(rmid, prof, lw=2.0, color=gcol[name],
+                    label=f"{name} ({args.method})", zorder=4)
+        ax.set_title(f"full-resolution meshes — {args.method}")
+
+        # one coarse panel per geometry: three methods as light->dark shades
+        coarse_axes = [axp[0, 1], axp[1, 0], axp[1, 1]]
+        for ax, name in zip(coarse_axes,
+                            ("UniformGrid", "AMRGrid", "VoronoiGrid")):
+            _profile_context(ax)
+            rng_prof = np.random.default_rng(7)     # same shells across methods
+            for method in COARSE_METHODS:
+                meshes = coarse_by_method[method]
                 if geom_cells(meshes[name], fld) is None:
                     continue
-                # sample the mesh field on each radial shell (not bin cell centres),
-                # so a coarse / single-cell mesh reads as a flat line at its density
                 prof = sampled_radial_profile(meshes[name], fld, cc, rmid,
                                               p.box, p.periodic, rng_prof)
-                ax.plot(rmid, prof, lw=2.0, color=gcol[name], label=name, zorder=4)
+                ax.plot(rmid, prof, lw=2.0, color=geom_shades[name][method],
+                        label=method, zorder=4)
+            ax.set_title(f"coarse {name} — gather / scatter / petkova")
+
+        for ax in axp.ravel():
             ax.set_yscale("log")                    # density spans decades
             ax.set_xlim(0, rmax)
             ax.set_xlabel("radius from core")
-            ax.set_title(label)
             ax.grid(True, which="both", ls=":", alpha=0.3)
-            ax.legend(fontsize=9)
-        axp[0].set_ylabel(f"{fld} (radial mean: mesh field-sampled, SPH shell-binned)")
+            ax.legend(fontsize=8)
+        for ax in axp[:, 0]:
+            ax.set_ylabel(f"{fld} (radial mean: mesh field-sampled, SPH shell-binned)")
         figp.suptitle(f"sph_interp — {fld} vs radius — "
                       f"{os.path.basename(args.snapshot)}, method '{args.method}'",
                       fontsize=14, fontweight="bold")
@@ -581,7 +717,7 @@ def main(argv=None):
         outp = os.path.splitext(args.out)[0] + "_profile.png"
         figp.savefig(outp, dpi=130, bbox_inches="tight")
         print(f"wrote profile -> {outp}")
-        show_figure(outp, show)
+        show_figure(outp, show and not interactive)
 
     if args.per_geometry:
         stem = os.path.splitext(args.out)[0]
@@ -590,7 +726,22 @@ def main(argv=None):
             visualise(results[name], p, field=fld, out=out, plane=(a1, a2),
                       title=f"{name} / {args.method} — {fld}")
 
+    # --- timing summary: mesh generation vs interpolation -------------------
+    t_mesh = sum(dt for st, _, dt in timings if st == "build")
+    t_inter = sum(dt for st, _, dt in timings if st == "interp")
+    print("=" * 70)
+    print("  timing (mesh generation vs interpolation)")
+    for st, lb, dt in timings:
+        print(f"    {st:<6s} {lb:<28s} {dt:8.3f}s")
+    print(f"  t_tot = {t_mesh + t_inter:.3f}s   t_mesh = {t_mesh:.3f}s   "
+          f"t_inter = {t_inter:.3f}s")
+    print("=" * 70)
+
     print("done.")
+
+    if interactive:
+        print(f"  showing figures ({matplotlib.get_backend()}) — close windows to exit")
+        plt.show()
 
 
 if __name__ == "__main__":

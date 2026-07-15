@@ -11,9 +11,12 @@ equals the particle mass to high precision.
 `exact_interpolate` to an axis-aligned cube with the PARTICLE at the origin,
 returning the fraction of the (unit-normalized) kernel mass contained in the cube.
 
-Currently implements the UniformGrid target. NOTE: the exact integral is
-expensive (per particle × overlapping cell × 6 faces × 4 edges); intended for
-accuracy/validation. Far cells (entirely beyond 2h) are skipped.
+The per-triangle cone integral `_cone_tri` is REGIME-DISPATCHED (2026-07-02,
+see its block comment + PLAN_PETKOVA_FIX.md): exact solid angle when saturated,
+calibrated-order Duffy quadrature when converged, and an exact analytic-radial
+wedge decomposition for scale-separated triangles; cell integrals additionally
+take a closed-form regime-0 shortcut when the kernel crosses at most one face
+plane (h << cell). Far cells (entirely beyond 2h) are skipped.
 
 VERIFIED mass-conserving: a single particle deposits its full mass for any npx;
 on a real orzag snapshot the summed grid mass matches the particle mass to 0.00%
@@ -29,9 +32,9 @@ import numpy as np
 import numba
 from numba import njit, prange
 
-from .kernels import pcum, PCUM_TABLE, gcum3D
+from .kernels import pcum, PCUM_TABLE, gcum3D, gcum3D_anti
 from .targets import (UniformGrid, Projection2D, AMRGrid, VoronoiGrid,
-                      voronoi_candidates)
+                      generator_buckets)
 
 # Gauss-Legendre nodes/weights on [0,1] for the per-edge angular quadrature of
 # the exact 2D column integral (the integrand is smooth and bounded, so a modest
@@ -39,6 +42,23 @@ from .targets import (UniformGrid, Projection2D, AMRGrid, VoronoiGrid,
 _GLX, _GLW = np.polynomial.legendre.leggauss(32)
 _GLX = 0.5 * (_GLX + 1.0)          # map [-1,1] -> [0,1]
 _GLW = 0.5 * _GLW
+
+# Gauss-Legendre nodes/weights on [0,1] for the 3D per-triangle CONE integral
+# (`_cone_tri`): Duffy tensor orders 3/6/12 (regime-2 ladder, order picked per
+# triangle by the calibrated dispatch) and the 16-node angular rule of the
+# regime-3 wedge path. n=2 was calibrated too but REJECTED: its ~1e-13 error
+# floor accumulates same-sign over the ~(4h/pw)^3*12 triangles of a big-h
+# particle (measured 4e-8 on a single-particle mass sweep at h/pw=10).
+def _gauss01(n):
+    x, w = np.polynomial.legendre.leggauss(n)
+    return 0.5 * (x + 1.0), 0.5 * w
+
+_D3X, _D3W = _gauss01(3)
+_D6X, _D6W = _gauss01(6)
+_D12X, _D12W = _gauss01(12)
+# 12 angular nodes: 3.7e-14 vs the 48-node reference over the calibration
+# battery (16 gave 2.6e-16, 10 gave 4e-12 — too close to the 1e-12 bar).
+_AGX, _AGW = _gauss01(12)
 
 
 @njit(cache=True)
@@ -168,30 +188,86 @@ _CUBE_FACES = np.array([
 ], dtype=np.int64)
 
 
+# --------------------------------------------------------------------------- #
+#  The per-triangle cone integral: regime-dispatched (2026-07-02 rewrite).
+#
+#  cone = int_{Omega in tri} g(R(Omega)) dOmega
+#       = int int_tri g(|Q|) * r0/|Q|^3 dA,     g(R) = gcum3D(R/h)/pi,
+#  with the particle at the origin, Q the point on the triangle and r0 the
+#  perpendicular particle->plane distance.
+#
+#  History: the original analytic wedge (`_vertex_integral` + foot-point
+#  cond/sign assembly) was exact for generic positions but its (h/r0)^3 and
+#  R_0/r0 terms blew up for lattice-aligned near-face particles (striping,
+#  +2% net mass). The 2026-07-01 "conefix" replaced it with a fixed 12x12
+#  Duffy tensor Gauss rule — robust near faces, but ~20x slower everywhere
+#  and silently UNCONVERGED whenever h or r0 << triangle size (a fixed-order
+#  rule cannot resolve the kernel bump or the solid-angle peak inside a much
+#  larger triangle): +1.66%/+0.81% mass on coarse grids, 2.4e-3 on collapsed
+#  cores. This rewrite dispatches per triangle on cheap geometry to a rung
+#  that is BOTH converged (<=~1e-12 abs, calibrated) and near-minimal cost.
+#  Prototype + calibration battery: PLAN_PETKOVA_FIX.md ("Step-1 results").
+# --------------------------------------------------------------------------- #
+
+# Regime-2 ratio thresholds (squared): use Duffy order n when
+#   smax <= c_n * min(dmin, h)
+# (smax = longest edge, dmin = min particle->triangle-BODY distance),
+# with SEPARATE ladders for triangles whose radial range straddles a kernel
+# break (T = h or 2h crosses the triangle: integrand only C3 there) and for
+# non-straddling ones (smooth integrand; n=12 held <=1e-11 at any measured
+# ratio — the r0/|Q|^3 peak is cancelled by gcum3D ~ T^3). Calibrated at
+# tol 1e-12 abs/triangle over a 1770-config randomized battery, safety
+# factor ~0.9; n=2 rejected (same-sign error accumulation over the ~1e5
+# triangles of a big-h particle).
+_C3SQ_NS = 0.19 ** 2
+_C6SQ_NS = 0.85 ** 2
+_C12SQ_NS = 8.0 ** 2
+_C3SQ_ST = 0.22 ** 2
+_C6SQ_ST = 0.32 ** 2
+_C12SQ_ST = 0.65 ** 2
+
+
 @njit(cache=True)
-def _cone_tri(ax, ay, az, bx, by, bz, cx, cy, cz, h):
-    """Kernel integral over the cone from the PARTICLE (at the origin) through the
-    triangle A,B,C (coords RELATIVE to the particle). Always >= 0.
+def _halfspace_frac(s, h):
+    """Kernel-mass fraction on the INTERIOR side of a single face plane.
 
-    Building block of the signed-tetrahedralization cell integral:
-     int_cell W = sum over faces (front/back sign) * sum over fan-triangles
-    _cone_tri. The cone integral is int_{Omega in tri} g(R(Omega)) dOmega with
-    g(R) = int_0^R W r^2 dr the radial mass profile and R(Omega) = r0/cos(theta)
-    the distance to the triangle's plane (r0 = perp distance particle->plane).
-
-    Computed ANALYTICALLY (exact at any face size): a triangle entirely beyond 2h
-    (r0 >= 2h) is SATURATED -> closed-form solid angle (Van Oosterom & Strijbos);
-    otherwise the triangle is split into right-triangle wedges about the in-plane
-    foot of the particle and each wedge is the exact `_vertex_integral` (the
-    support-aware Petkova M-integral, verified == the cone integral to ~1e-16),
-    combined per edge by the foot-inside/outside-segment rule and the edge's
-    in-plane orientation. This is the per-TRIANGLE wedge decomposition (always
-    correct); the OLD bug was the per-POLYGON assembly (cond/sign_M across a whole
-    face with the particle outside) — avoided entirely by the signed-tet outer
-    loop. Unlike a fixed quadrature it does not under-resolve a huge cube face
-    whose kernel-active patch is tiny (the coarse-UniformGrid case).
+    s : signed particle->plane distance, positive when the particle is on the
+    interior (cell) side. Exact when the kernel crosses no OTHER face plane of
+    a convex cell (regime 0): the closed-form full-plane limit of the cone
+    radial integral, mass beyond a plane at r0 = 1/2 - 2q(0.35 - Gc(q)),
+    q = r0/h.
     """
-    # plane normal n = (B-A) x (C-A); area2 = |n| = 2 * triangle area
+    q = abs(s) / h
+    if q >= 2.0:
+        return 1.0 if s >= 0.0 else 0.0
+    mb = 0.5 - 2.0 * q * (0.35 - gcum3D_anti(q))
+    if s >= 0.0:
+        return 1.0 - mb
+    return mb
+
+
+@njit(cache=True)
+def _solid_frac(ax, ay, az, bx, by, bz, cx, cy, cz):
+    """(1/4pi) * solid angle of triangle ABC from the origin (Van Oosterom &
+    Strijbos 1983). Exact saturated cone: g = 0.25/pi for the whole triangle."""
+    la = math.sqrt(ax*ax + ay*ay + az*az)
+    lb = math.sqrt(bx*bx + by*by + bz*bz)
+    lc = math.sqrt(cx*cx + cy*cy + cz*cz)
+    triple = (ax*(by*cz - bz*cy) + ay*(bz*cx - bx*cz) + az*(bx*cy - by*cx))
+    dab = ax*bx + ay*by + az*bz
+    dac = ax*cx + ay*cy + az*cz
+    dbc = bx*cx + by*cy + bz*cz
+    denom = la*lb*lc + dab*lc + dac*lb + dbc*la
+    omega = 2.0 * math.atan2(abs(triple), denom)
+    return (0.25 / math.pi) * omega
+
+
+@njit(cache=True)
+def _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h, xs, ws):
+    """Duffy-mapped tensor Gauss cone integral at the order of the given
+    node/weight tables (regime 2). Q = A + s(B-A) + t(1-s)(C-A),
+    dA = area2 (1-s) ds dt; r0 in the NUMERATOR keeps the integrand finite
+    for near-plane particles."""
     e1x = bx - ax; e1y = by - ay; e1z = bz - az
     e2x = cx - ax; e2y = cy - ay; e2z = cz - az
     nx = e1y*e2z - e1z*e2y
@@ -201,62 +277,480 @@ def _cone_tri(ax, ay, az, bx, by, bz, cx, cy, cz, h):
     if area2 < 1e-300:
         return 0.0
     invn = 1.0 / area2
-    nhx = nx*invn; nhy = ny*invn; nhz = nz*invn
-    cpl = ax*nhx + ay*nhy + az*nhz       # signed plane offset (particle at origin)
+    cpl = ax*nx*invn + ay*ny*invn + az*nz*invn
     r0 = abs(cpl)
     if r0 < 1e-300:
         return 0.0
-    if r0 >= 2.0 * h:
-        # saturated: cone = (1/(4 pi)) * solid angle (Van Oosterom & Strijbos)
-        la = math.sqrt(ax*ax + ay*ay + az*az)
-        lb = math.sqrt(bx*bx + by*by + bz*bz)
-        lc = math.sqrt(cx*cx + cy*cy + cz*cz)
-        triple = (ax*(by*cz - bz*cy) + ay*(bz*cx - bx*cz) + az*(bx*cy - by*cx))
-        dab = ax*bx + ay*by + az*bz
-        dac = ax*cx + ay*cy + az*cz
-        dbc = bx*cx + by*cy + bz*cz
-        denom = la*lb*lc + dab*lc + dac*lb + dbc*la
-        omega = 2.0 * math.atan2(abs(triple), denom)
-        return (0.25 / math.pi) * omega
-    # foot of the particle on the triangle plane
-    fx = cpl*nhx; fy = cpl*nhy; fz = cpl*nhz
+    invpi = 1.0 / math.pi
+    total = 0.0
+    ng = xs.shape[0]
+    for gi in range(ng):
+        s = xs[gi]
+        om1s = 1.0 - s
+        wsa = ws[gi] * om1s * area2 * r0
+        for gj in range(ng):
+            v = xs[gj] * om1s
+            qx = ax + s * e1x + v * e2x
+            qy = ay + s * e1y + v * e2y
+            qz = az + s * e1z + v * e2z
+            Q2 = qx*qx + qy*qy + qz*qz
+            if Q2 <= 0.0:
+                continue
+            Q = math.sqrt(Q2)
+            gR = gcum3D(Q / h) * invpi
+            total += ws[gj] * wsa * gR / (Q2 * Q)
+    return total
+
+
+@njit(cache=True)
+def _panel_gauss(lo, hi, top_heavy, d, T0sq, h, gc0):
+    """int_lo^hi (Gc(T/h) - gc0)/cosh(s) ds, T = sqrt(T0sq + (d sinh s)^2).
+
+    For long segments the integrand behaves like e^{+s} (T<h branch) or e^{-s}
+    (h<T<2h branch), so cover the HEAVY end with width-3 panels of 16-node
+    Gauss; beyond 12 panels the remainder is < e^{-36} relative and dropped.
+    """
+    width = hi - lo
+    if width <= 0.0:
+        return 0.0
+    npan = int(width / 3.0) + 1
+    if npan > 12:
+        npan = 12
+    acc = 0.0
+    ng = _AGX.shape[0]
+    for p in range(npan):
+        if top_heavy:
+            b = hi - 3.0 * p
+            a = hi - 3.0 * (p + 1)
+            if a < lo:
+                a = lo
+        else:
+            a = lo + 3.0 * p
+            b = lo + 3.0 * (p + 1)
+            if b > hi:
+                b = hi
+        wid = b - a
+        if wid <= 0.0:
+            continue
+        for k in range(ng):
+            s = a + wid * _AGX[k]
+            q = d * math.sinh(s)
+            T = math.sqrt(T0sq + q * q)
+            acc += _AGW[k] * wid * (gcum3D_anti(T / h) - gc0) / math.cosh(s)
+    return acc
+
+
+@njit(cache=True)
+def _edge_E(d, rfar, r0, h, gc0):
+    """Angular edge integral E(d, psi) = int_0^psi K(d/cos phi) dphi of the
+    regime-3 wedge decomposition, cos psi = d/rfar, with the ANALYTIC radial
+    integral K(P) = (r0/(pi h)) [Gc(T/h) - Gc(r0/h)], T = sqrt(r0^2 + P^2).
+
+    Substituting P = d cosh s (phi = atan(sinh s), dphi = ds/cosh s) makes the
+    integrand vary on O(1) scales in s for ANY d/h ratio (in phi it ramps like
+    1/(pi/2-phi)^2 when d << h). Segments split where T crosses the kernel
+    breaks h and 2h so each Gauss panel sees one polynomial branch of Gc; the
+    saturated T >= 2h tail is FULLY analytic:
+        int K/cosh ds = A [atan(sinh s)] - (1/4pi) [asin(r0 tanh s / T0)],
+        A = (r0/(pi h)) (0.35 - gc0),  T0^2 = r0^2 + d^2.
+    """
+    if rfar <= d * (1.0 + 1e-15):
+        return 0.0
+    T0sq = r0 * r0 + d * d
+    T0 = math.sqrt(T0sq)
+    send = math.acosh(rfar / d)
+    E = 0.0
+    # segment 1: T < h (top-heavy: integrand ~ e^{+s} for long segments)
+    sa = 0.0
+    if T0 < h:
+        sa = math.asinh(math.sqrt(h * h - T0sq) / d)
+        hi = sa if sa < send else send
+        E += _panel_gauss(0.0, hi, True, d, T0sq, h, gc0)
+    # segment 2: h <= T < 2h (bottom-heavy: ~ e^{-s})
+    sb = 0.0
+    if T0 < 2.0 * h:
+        sb = math.asinh(math.sqrt(4.0 * h * h - T0sq) / d)
+        lo = sa
+        hi = sb if sb < send else send
+        if hi > lo:
+            E += _panel_gauss(lo, hi, False, d, T0sq, h, gc0)
+    E *= r0 / (math.pi * h)
+    # segment 3: T >= 2h, analytic (endpoint values from geometry, so huge
+    # send cannot overflow sinh/tanh)
+    if send > sb:
+        A = (r0 / (math.pi * h)) * (0.35 - gc0)
+        tfar = math.sqrt(max(rfar * rfar - d * d, 0.0))
+        gd_hi = math.atan2(tfar, d)          # = atan(sinh send)
+        w_hi = tfar / rfar                   # = tanh send
+        gd_lo = math.atan(math.sinh(sb))
+        w_lo = math.tanh(sb)
+        arg_hi = r0 * w_hi / T0
+        arg_lo = r0 * w_lo / T0
+        if arg_hi > 1.0:
+            arg_hi = 1.0
+        if arg_lo > 1.0:
+            arg_lo = 1.0
+        E += A * (gd_hi - gd_lo) - (math.asin(arg_hi)
+                                    - math.asin(arg_lo)) / (4.0 * math.pi)
+    return E
+
+
+@njit(cache=True)
+def _cone_wedge2d(a2x, a2y, b2x, b2y, c2x, c2y, r0, h):
+    """Regime-3 cone integral: foot-point wedge decomposition in the triangle
+    plane (in-plane coords with the particle's foot at the 2D origin), analytic
+    radial integral + `_edge_E` per edge endpoint. EXACT at any h/r0/size ratio.
+    Combine/sign logic identical to the validated 2D `_pixel_column_integral`
+    (foot inside segment -> EA+EB, outside -> |EA-EB|; sign from the cross
+    product; abs at the end so the result is winding-independent)."""
+    gc0 = gcum3D_anti(r0 / h)
     total = 0.0
     for e in range(3):
         if e == 0:
-            p1x = ax; p1y = ay; p1z = az; p2x = bx; p2y = by; p2z = bz
+            px = a2x; py = a2y; qx = b2x; qy = b2y
         elif e == 1:
-            p1x = bx; p1y = by; p1z = bz; p2x = cx; p2y = cy; p2z = cz
+            px = b2x; py = b2y; qx = c2x; qy = c2y
         else:
-            p1x = cx; p1y = cy; p1z = cz; p2x = ax; p2y = ay; p2z = az
-        d1x = p1x - fx; d1y = p1y - fy; d1z = p1z - fz
-        d2x = p2x - fx; d2y = p2y - fy; d2z = p2z - fz
-        lx = p2x - p1x; ly = p2y - p1y; lz = p2z - p1z
-        r23 = math.sqrt(lx*lx + ly*ly + lz*lz)
-        if r23 < 1e-300:
+            px = c2x; py = c2y; qx = a2x; qy = a2y
+        lx = qx - px; ly = qy - py
+        ll = math.sqrt(lx * lx + ly * ly)
+        if ll < 1e-300:
             continue
-        # R_0 = perpendicular distance from the foot to the edge line = |d1 x L|/|L|
-        cx1 = d1y*lz - d1z*ly; cy1 = d1z*lx - d1x*lz; cz1 = d1x*ly - d1y*lx
-        R_0 = math.sqrt(cx1*cx1 + cy1*cy1 + cz1*cz1) / r23
-        r12 = math.sqrt(d1x*d1x + d1y*d1y + d1z*d1z)
-        r13 = math.sqrt(d2x*d2x + d2y*d2y + d2z*d2z)
-        phi1 = math.acos(R_0/r12) if (r12 > 0.0 and R_0 < r12) else 0.0
-        phi2 = math.acos(R_0/r13) if (r13 > 0.0 and R_0 < r13) else 0.0
-        v1 = _vertex_integral(phi1, r0, R_0, h)
-        v2 = _vertex_integral(phi2, r0, R_0, h)
-        # foot-on-edge-line inside the segment -> wedges add; outside -> subtract
-        s1 = math.sqrt(r12*r12 - R_0*R_0) if r12 > R_0 else 0.0
-        s2 = math.sqrt(r13*r13 - R_0*R_0) if r13 > R_0 else 0.0
-        if s1 >= r23 or s2 >= r23:
-            wedge = v1 - v2 if v1 >= v2 else v2 - v1
+        cross = px * qy - py * qx
+        d = abs(cross) / ll
+        rP = math.sqrt(px * px + py * py)
+        rQ = math.sqrt(qx * qx + qy * qy)
+        rmax = rP if rP > rQ else rQ
+        if d <= 1e-16 * rmax:    # foot on the edge line: zero-area wedges
+            continue
+        EP = _edge_E(d, rP, r0, h, gc0)
+        EQ = _edge_E(d, rQ, r0, h, gc0)
+        tP = math.sqrt(max(rP * rP - d * d, 0.0))
+        tQ = math.sqrt(max(rQ * rQ - d * d, 0.0))
+        outside = (tP + 1e-12 * ll >= ll) or (tQ + 1e-12 * ll >= ll)
+        contrib = abs(EP - EQ) if outside else (EP + EQ)
+        if cross > 0.0:
+            total += contrib
         else:
-            wedge = v1 + v2
-        # signed by the edge's in-plane orientation about the foot
-        sx = d1y*d2z - d1z*d2y; sy = d1z*d2x - d1x*d2z; sz = d1x*d2y - d1y*d2x
-        sgn = 1.0 if (sx*nhx + sy*nhy + sz*nhz) > 0.0 else -1.0
-        total += sgn * wedge
-    if total < 0.0:
-        total = -total
+            total -= contrib
+    return abs(total)
+
+
+@njit(cache=True)
+def _pseg2(px, py, qx, qy):
+    """Squared distance from the 2D origin to segment P-Q."""
+    lx = qx - px; ly = qy - py
+    l2 = lx * lx + ly * ly
+    if l2 <= 0.0:
+        return px * px + py * py
+    t = -(px * lx + py * ly) / l2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    ex = px + t * lx; ey = py + t * ly
+    return ex * ex + ey * ey
+
+
+@njit(cache=True)
+def _tri_frame(ax, ay, az, bx, by, bz, cx, cy, cz):
+    """Shared triangle geometry for the dispatch:
+    (area2, r0, dmin2, smax2, a2x, a2y, b2x, b2y, c2x, c2y).
+
+    In-plane coordinates put the foot of the particle on the triangle plane at
+    the 2D origin (particle at the 3D origin). dmin2 = squared min distance
+    from the particle to the triangle BODY (r0^2 if the foot is inside)."""
+    e1x = bx - ax; e1y = by - ay; e1z = bz - az
+    e2x = cx - ax; e2y = cy - ay; e2z = cz - az
+    nx = e1y*e2z - e1z*e2y
+    ny = e1z*e2x - e1x*e2z
+    nz = e1x*e2y - e1y*e2x
+    area2 = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if area2 < 1e-300:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    invn = 1.0 / area2
+    nhx = nx*invn; nhy = ny*invn; nhz = nz*invn
+    cpl = ax*nhx + ay*nhy + az*nhz
+    r0 = abs(cpl)
+    l1 = math.sqrt(e1x*e1x + e1y*e1y + e1z*e1z)
+    exx = e1x / l1; exy = e1y / l1; exz = e1z / l1
+    eyx = nhy*exz - nhz*exy
+    eyy = nhz*exx - nhx*exz
+    eyz = nhx*exy - nhy*exx
+    a2x = ax*exx + ay*exy + az*exz
+    a2y = ax*eyx + ay*eyy + az*eyz
+    b2x = bx*exx + by*exy + bz*exz
+    b2y = bx*eyx + by*eyy + bz*eyz
+    c2x = cx*exx + cy*exy + cz*exz
+    c2y = cx*eyx + cy*eyy + cz*eyz
+    d1 = e1x*e1x + e1y*e1y + e1z*e1z
+    d2 = e2x*e2x + e2y*e2y + e2z*e2z
+    fx = cx - bx; fy = cy - by; fz = cz - bz
+    d3 = fx*fx + fy*fy + fz*fz
+    smax2 = d1
+    if d2 > smax2:
+        smax2 = d2
+    if d3 > smax2:
+        smax2 = d3
+    c1 = (b2x - a2x) * (-a2y) - (b2y - a2y) * (-a2x)
+    c2 = (c2x - b2x) * (-b2y) - (c2y - b2y) * (-b2x)
+    c3 = (a2x - c2x) * (-c2y) - (a2y - c2y) * (-c2x)
+    inside = (c1 >= 0.0 and c2 >= 0.0 and c3 >= 0.0) or \
+             (c1 <= 0.0 and c2 <= 0.0 and c3 <= 0.0)
+    if inside:
+        dmin2 = r0 * r0
+    else:
+        p1 = _pseg2(a2x, a2y, b2x, b2y)
+        p2 = _pseg2(b2x, b2y, c2x, c2y)
+        p3 = _pseg2(c2x, c2y, a2x, a2y)
+        pm = p1
+        if p2 < pm:
+            pm = p2
+        if p3 < pm:
+            pm = p3
+        dmin2 = r0 * r0 + pm
+    return area2, r0, dmin2, smax2, a2x, a2y, b2x, b2y, c2x, c2y
+
+
+@njit(cache=True)
+def _cone_tri(ax, ay, az, bx, by, bz, cx, cy, cz, h):
+    """Kernel integral over the cone from the PARTICLE (at the origin) through
+    the triangle A,B,C (coords RELATIVE to the particle). Always >= 0.
+
+    Building block of the signed-tetrahedralization cell integral:
+     int_cell W = sum over faces (front/back sign) * sum over fan-triangles
+    _cone_tri. Regime-dispatched on cheap geometry (see the block comment
+    above and PLAN_PETKOVA_FIX.md):
+      1. whole triangle beyond 2h -> exact solid angle (Van Oosterom-Strijbos);
+      2. converged-by-calibration Duffy tensor Gauss at order 3/6/12, with a
+         stricter ladder when the triangle straddles a kernel break (T=h/2h);
+      3. otherwise (scale-separated: h or r0 << triangle) the foot-point wedge
+         decomposition with analytic radial integral — exact at any ratio.
+    """
+    (area2, r0, dmin2, smax2,
+     a2x, a2y, b2x, b2y, c2x, c2y) = _tri_frame(ax, ay, az, bx, by, bz,
+                                                cx, cy, cz)
+    if area2 < 1e-300 or r0 < 1e-300:
+        return 0.0
+    hsq = h * h
+    if dmin2 >= 4.0 * hsq:
+        return _solid_frac(ax, ay, az, bx, by, bz, cx, cy, cz)
+    # straddle test: does the radial range [rmin, rmax] contain h or 2h?
+    # Padded by 0.35*smax (the calibration battery's straddle offsets): a kink
+    # just OUTSIDE the radial range degrades the smooth-ladder accuracy almost
+    # as much as one inside it (worst case: the kink exactly at rmin, e.g. a
+    # cell-centre particle with 2h touching all faces).
+    ra2 = ax*ax + ay*ay + az*az
+    rb2 = bx*bx + by*by + bz*bz
+    rc2 = cx*cx + cy*cy + cz*cz
+    rmax2 = ra2
+    if rb2 > rmax2:
+        rmax2 = rb2
+    if rc2 > rmax2:
+        rmax2 = rc2
+    L2 = dmin2 if dmin2 < hsq else hsq
+    pad = 0.35 * math.sqrt(smax2)
+    rlo = math.sqrt(dmin2) - pad
+    rhi = math.sqrt(rmax2) + pad
+    if (rlo < h < rhi) or (rlo < 2.0 * h < rhi):
+        if smax2 <= _C3SQ_ST * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D3X, _D3W)
+        if smax2 <= _C6SQ_ST * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D6X, _D6W)
+        if smax2 <= _C12SQ_ST * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D12X, _D12W)
+    else:
+        if smax2 <= _C3SQ_NS * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D3X, _D3W)
+        if smax2 <= _C6SQ_NS * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D6X, _D6W)
+        if smax2 <= _C12SQ_NS * L2:
+            return _cone_duffy(ax, ay, az, bx, by, bz, cx, cy, cz, h,
+                               _D12X, _D12W)
+    return _cone_wedge2d(a2x, a2y, b2x, b2y, c2x, c2y, r0, h)
+
+
+# --------------------------------------------------------------------------- #
+#  Quad (rectangle) cone integral: cube faces are integrated as ONE planar
+#  rectangle instead of two fan triangles — half the frame setups and rule
+#  evaluations, no wasted shared-diagonal wedge work, identical regime
+#  dispatch (smax = diagonal, the same value the two fan triangles saw).
+#  PARALLELOGRAM assumption (Q = v0 + u e1 + v e3): exact for the axis-aligned
+#  cube faces this is used for; Voronoi polygon fans keep `_cone_tri`.
+# --------------------------------------------------------------------------- #
+
+@njit(cache=True)
+def _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z, e3x, e3y, e3z,
+                     area, r0, h, xs, ws):
+    """Tensor Gauss cone integral over the parallelogram v0 + u e1 + v e3,
+    u,v in [0,1]; area = |e1 x e3| (regime 2, quad version)."""
+    invpi = 1.0 / math.pi
+    total = 0.0
+    ng = xs.shape[0]
+    for gi in range(ng):
+        u = xs[gi]
+        bx = v0x + u * e1x
+        by = v0y + u * e1y
+        bz = v0z + u * e1z
+        wu = ws[gi] * area * r0
+        for gj in range(ng):
+            v = xs[gj]
+            qx = bx + v * e3x
+            qy = by + v * e3y
+            qz = bz + v * e3z
+            Q2 = qx*qx + qy*qy + qz*qz
+            if Q2 <= 0.0:
+                continue
+            Q = math.sqrt(Q2)
+            gR = gcum3D(Q / h) * invpi
+            total += ws[gj] * wu * gR / (Q2 * Q)
     return total
+
+
+@njit(cache=True)
+def _cone_wedge2d_quad(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, r0, h):
+    """Regime-3 wedge decomposition over a planar quad (4 directed edges);
+    same construction as `_cone_wedge2d`."""
+    gc0 = gcum3D_anti(r0 / h)
+    total = 0.0
+    for e in range(4):
+        if e == 0:
+            px = p0x; py = p0y; qx = p1x; qy = p1y
+        elif e == 1:
+            px = p1x; py = p1y; qx = p2x; qy = p2y
+        elif e == 2:
+            px = p2x; py = p2y; qx = p3x; qy = p3y
+        else:
+            px = p3x; py = p3y; qx = p0x; qy = p0y
+        lx = qx - px; ly = qy - py
+        ll = math.sqrt(lx * lx + ly * ly)
+        if ll < 1e-300:
+            continue
+        cross = px * qy - py * qx
+        d = abs(cross) / ll
+        rP = math.sqrt(px * px + py * py)
+        rQ = math.sqrt(qx * qx + qy * qy)
+        rmax = rP if rP > rQ else rQ
+        if d <= 1e-16 * rmax:
+            continue
+        EP = _edge_E(d, rP, r0, h, gc0)
+        EQ = _edge_E(d, rQ, r0, h, gc0)
+        tP = math.sqrt(max(rP * rP - d * d, 0.0))
+        tQ = math.sqrt(max(rQ * rQ - d * d, 0.0))
+        outside = (tP + 1e-12 * ll >= ll) or (tQ + 1e-12 * ll >= ll)
+        contrib = abs(EP - EQ) if outside else (EP + EQ)
+        if cross > 0.0:
+            total += contrib
+        else:
+            total -= contrib
+    return abs(total)
+
+
+@njit(cache=True)
+def _cone_quad(v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z, v3x, v3y, v3z, h):
+    """Kernel cone integral through a planar RECTANGLE v0..v3 (winding order,
+    coords relative to the particle). Regime dispatch identical to
+    `_cone_tri` (see there); always >= 0."""
+    e1x = v1x - v0x; e1y = v1y - v0y; e1z = v1z - v0z
+    e3x = v3x - v0x; e3y = v3y - v0y; e3z = v3z - v0z
+    nx = e1y*e3z - e1z*e3y
+    ny = e1z*e3x - e1x*e3z
+    nz = e1x*e3y - e1y*e3x
+    area = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if area < 1e-300:
+        return 0.0
+    invn = 1.0 / area
+    nhx = nx*invn; nhy = ny*invn; nhz = nz*invn
+    cpl = v0x*nhx + v0y*nhy + v0z*nhz
+    r0 = abs(cpl)
+    if r0 < 1e-300:
+        return 0.0
+    hsq = h * h
+    # in-plane frame (foot of the particle at the 2D origin)
+    l1 = math.sqrt(e1x*e1x + e1y*e1y + e1z*e1z)
+    exx = e1x / l1; exy = e1y / l1; exz = e1z / l1
+    eyx = nhy*exz - nhz*exy
+    eyy = nhz*exx - nhx*exz
+    eyz = nhx*exy - nhy*exx
+    p0x = v0x*exx + v0y*exy + v0z*exz
+    p0y = v0x*eyx + v0y*eyy + v0z*eyz
+    p1x = v1x*exx + v1y*exy + v1z*exz
+    p1y = v1x*eyx + v1y*eyy + v1z*eyz
+    p2x = v2x*exx + v2y*exy + v2z*exz
+    p2y = v2x*eyx + v2y*eyy + v2z*eyz
+    p3x = v3x*exx + v3y*exy + v3z*exz
+    p3y = v3x*eyx + v3y*eyy + v3z*eyz
+    # origin-in-quad via edge cross signs (convex, consistent winding)
+    c1 = (p1x - p0x) * (-p0y) - (p1y - p0y) * (-p0x)
+    c2 = (p2x - p1x) * (-p1y) - (p2y - p1y) * (-p1x)
+    c3 = (p3x - p2x) * (-p2y) - (p3y - p2y) * (-p2x)
+    c4 = (p0x - p3x) * (-p3y) - (p0y - p3y) * (-p3x)
+    inside = (c1 >= 0.0 and c2 >= 0.0 and c3 >= 0.0 and c4 >= 0.0) or \
+             (c1 <= 0.0 and c2 <= 0.0 and c3 <= 0.0 and c4 <= 0.0)
+    if inside:
+        dmin2 = r0 * r0
+    else:
+        pm = _pseg2(p0x, p0y, p1x, p1y)
+        p_ = _pseg2(p1x, p1y, p2x, p2y)
+        if p_ < pm:
+            pm = p_
+        p_ = _pseg2(p2x, p2y, p3x, p3y)
+        if p_ < pm:
+            pm = p_
+        p_ = _pseg2(p3x, p3y, p0x, p0y)
+        if p_ < pm:
+            pm = p_
+        dmin2 = r0 * r0 + pm
+    if dmin2 >= 4.0 * hsq:
+        return (_solid_frac(v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z)
+                + _solid_frac(v0x, v0y, v0z, v2x, v2y, v2z, v3x, v3y, v3z))
+    # size measure: max diagonal (what the two fan triangles saw as smax)
+    dgx = v2x - v0x; dgy = v2y - v0y; dgz = v2z - v0z
+    s1 = dgx*dgx + dgy*dgy + dgz*dgz
+    dgx = v3x - v1x; dgy = v3y - v1y; dgz = v3z - v1z
+    s2 = dgx*dgx + dgy*dgy + dgz*dgz
+    smax2 = s1 if s1 > s2 else s2
+    r_a = v0x*v0x + v0y*v0y + v0z*v0z
+    r_b = v1x*v1x + v1y*v1y + v1z*v1z
+    if r_b > r_a:
+        r_a = r_b
+    r_b = v2x*v2x + v2y*v2y + v2z*v2z
+    if r_b > r_a:
+        r_a = r_b
+    r_b = v3x*v3x + v3y*v3y + v3z*v3z
+    if r_b > r_a:
+        r_a = r_b
+    rmax2 = r_a
+    L2 = dmin2 if dmin2 < hsq else hsq
+    pad = 0.35 * math.sqrt(smax2)
+    rlo = math.sqrt(dmin2) - pad
+    rhi = math.sqrt(rmax2) + pad
+    if (rlo < h < rhi) or (rlo < 2.0 * h < rhi):
+        if smax2 <= _C3SQ_ST * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D3X, _D3W)
+        if smax2 <= _C6SQ_ST * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D6X, _D6W)
+        if smax2 <= _C12SQ_ST * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D12X, _D12W)
+    else:
+        if smax2 <= _C3SQ_NS * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D3X, _D3W)
+        if smax2 <= _C6SQ_NS * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D6X, _D6W)
+        if smax2 <= _C12SQ_NS * L2:
+            return _cone_duffy_quad(v0x, v0y, v0z, e1x, e1y, e1z,
+                                    e3x, e3y, e3z, area, r0, h, _D12X, _D12W)
+    return _cone_wedge2d_quad(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, r0, h)
 
 
 @njit(cache=True)
@@ -267,7 +761,52 @@ def _cube_integral(vx, vy, vz, h, faces):
     Returns the contained kernel-mass fraction (>= 0). Signed tetrahedralization
     from the particle: one front/back sign per face, fan-triangulate, sum
     `_cone_tri` (see its docstring). Mass-conserving for any cube position/size.
+
+    Regime-0 pre-pass (h << cell): from the 6 signed inward face-plane
+    distances (vertex 0/7 are the box corners), if the kernel sphere crosses
+    NO plane the integral is exactly 1 (inside) or 0 (outside); if it crosses
+    exactly ONE plane the cell sees a single infinite plane and the integral
+    is the closed-form half-space split. Collapses the entire collapsed-core
+    population (h down to ~0.01 cell) to O(1) flops; only particles within 2h
+    of an edge/corner fall through to the per-triangle path.
     """
+    th = 2.0 * h
+    nclose = 0
+    sclose = 0.0
+    s = -vx[0]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    s = vx[7]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    s = -vy[0]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    s = vy[7]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    s = -vz[0]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    s = vz[7]
+    if s <= -th:
+        return 0.0
+    if s < th:
+        nclose += 1; sclose = s
+    if nclose == 0:
+        return 1.0
+    if nclose == 1:
+        return _halfspace_frac(sclose, h)
     # interior point = centroid of the 8 vertices (particle-relative), used to
     # orient each face's outward normal.
     cgx = 0.0; cgy = 0.0; cgz = 0.0
@@ -275,9 +814,8 @@ def _cube_integral(vx, vy, vz, h, faces):
         cgx += vx[k]; cgy += vy[k]; cgz += vz[k]
     cgx *= 0.125; cgy *= 0.125; cgz *= 0.125
     total = 0.0
-    nfv = faces.shape[1]
     for f in range(faces.shape[0]):
-        i0 = faces[f, 0]; i1 = faces[f, 1]; i2 = faces[f, 2]
+        i0 = faces[f, 0]; i1 = faces[f, 1]; i2 = faces[f, 2]; i3 = faces[f, 3]
         v0x = vx[i0]; v0y = vy[i0]; v0z = vz[i0]
         ax = vx[i1]-v0x; ay = vy[i1]-v0y; az = vz[i1]-v0z
         bx = vx[i2]-v0x; by = vy[i2]-v0y; bz = vz[i2]-v0z
@@ -286,13 +824,12 @@ def _cube_integral(vx, vy, vz, h, faces):
         if nx*(cgx-v0x) + ny*(cgy-v0y) + nz*(cgz-v0z) > 0.0:
             nx = -nx; ny = -ny; nz = -nz
         sgn = 1.0 if (v0x*nx + v0y*ny + v0z*nz) > 0.0 else -1.0
-        # fan-triangulate the face polygon from vertex 0
-        for k in range(1, nfv - 1):
-            ka = faces[f, k]; kb = faces[f, k + 1]
-            total += sgn * _cone_tri(
-                v0x, v0y, v0z,
-                vx[ka], vy[ka], vz[ka],
-                vx[kb], vy[kb], vz[kb], h)
+        # one planar-rectangle cone integral per face (was: 2 fan triangles)
+        total += sgn * _cone_quad(
+            v0x, v0y, v0z,
+            vx[i1], vy[i1], vz[i1],
+            vx[i2], vy[i2], vz[i2],
+            vx[i3], vy[i3], vz[i3], h)
     if total < 0.0:
         total = 0.0
     return total
@@ -320,9 +857,46 @@ def _nearest_dist2(xi, yi, zi, x0, x1, y0, y1, z0, z1):
 
 
 @njit(parallel=True, cache=True)
+def _reduce_threads(local, out):
+    """Parallel sum over the leading (thread) axis: out[...] = sum_t local[t].
+    np.sum(axis=0) is single-threaded and costs seconds on the multi-GB
+    per-thread accumulators."""
+    nt = local.shape[0]
+    flat = local.reshape(nt, -1)
+    oflat = out.reshape(-1)
+    for i in prange(oflat.shape[0]):
+        s = 0.0
+        for t in range(nt):
+            s += flat[t, i]
+        oflat[i] = s
+
+
+def _needs_weights(names):
+    """True unless every interpolated field is density-like (those use only the
+    conserved mass accumulator, so the kernel-volume den/num accumulators — two
+    of the three scattered write streams — can be skipped entirely)."""
+    return any(n.lower() not in ("rho", "density") for n in names)
+
+
+# Particles are usually stored in spatially coherent order, so equal-size
+# prange chunks give some threads all the big-h (expensive) particles;
+# a small chunk size lets numba's scheduler rebalance.
+_CHUNKSIZE = 16
+
+
+class _chunked:
+    """Context manager: numba parallel chunk size around a deposit call."""
+    def __enter__(self):
+        self._old = numba.set_parallel_chunksize(_CHUNKSIZE)
+
+    def __exit__(self, *exc):
+        numba.set_parallel_chunksize(self._old)
+
+
+@njit(parallel=True, cache=True)
 def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                              nx, ny, nz, lox, loy, loz, pwx, pwy, pwz,
-                             perx, pery, perz, faces,
+                             perx, pery, perz, faces, need_w,
                              mass_local, den_local, num_local):
     npart = x.shape[0]
     K = vals.shape[1]
@@ -383,9 +957,10 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                     if frac <= 0.0:
                         continue
                     mass_local[t, iw, jw, kw] += mi * frac
-                    den_local[t, iw, jw, kw] += wi * frac
-                    for p in range(K):
-                        num_local[t, iw, jw, kw, p] += wi * vals[i, p] * frac
+                    if need_w:
+                        den_local[t, iw, jw, kw] += wi * frac
+                        for p in range(K):
+                            num_local[t, iw, jw, kw, p] += wi * vals[i, p] * frac
 
 
 def interpolate_uniform_petkova(particles, grid, values=None):
@@ -407,23 +982,30 @@ def interpolate_uniform_petkova(particles, grid, values=None):
 
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
+    need_w = _needs_weights(names)
+    wshape = (nx, ny, nz) if need_w else (1, 1, 1)
     mass_local = np.zeros((nthreads, nx, ny, nz), dtype=np.float64)
-    den_local = np.zeros((nthreads, nx, ny, nz), dtype=np.float64)
-    num_local = np.zeros((nthreads, nx, ny, nz, K), dtype=np.float64)
+    den_local = np.zeros((nthreads,) + wshape, dtype=np.float64)
+    num_local = np.zeros((nthreads,) + wshape + (K,), dtype=np.float64)
 
     pos = particles.pos
-    _deposit_petkova_uniform(
-        np.ascontiguousarray(pos[:, 0]),
-        np.ascontiguousarray(pos[:, 1]),
-        np.ascontiguousarray(pos[:, 2]),
-        particles.h, particles.mass, particles.mass / particles.rho, vals,
-        nx, ny, nz, lo[0], lo[1], lo[2], pw[0], pw[1], pw[2],
-        perx, pery, perz, _CUBE_FACES,
-        mass_local, den_local, num_local)
+    with _chunked():
+        _deposit_petkova_uniform(
+            np.ascontiguousarray(pos[:, 0]),
+            np.ascontiguousarray(pos[:, 1]),
+            np.ascontiguousarray(pos[:, 2]),
+            particles.h, particles.mass, particles.mass / particles.rho, vals,
+            nx, ny, nz, lo[0], lo[1], lo[2], pw[0], pw[1], pw[2],
+            perx, pery, perz, _CUBE_FACES, need_w,
+            mass_local, den_local, num_local)
 
-    mass = mass_local.sum(axis=0)
-    den = den_local.sum(axis=0)
-    num = num_local.sum(axis=0)
+    mass = np.empty((nx, ny, nz), dtype=np.float64)
+    _reduce_threads(mass_local, mass)
+    den = np.zeros((nx, ny, nz), dtype=np.float64)
+    num = np.zeros((nx, ny, nz, K), dtype=np.float64)
+    if need_w:
+        _reduce_threads(den_local, den)
+        _reduce_threads(num_local, num)
     cv = grid.cell_volume
     mask = den > 0.0
 
@@ -451,7 +1033,7 @@ def interpolate_uniform_petkova(particles, grid, values=None):
 def _deposit_petkova_amr(x, y, z, h, mass, volw, vals, cell_lo, cell_size,
                          base_start, base_count, blo0, blo1, blo2,
                          bpw0, bpw1, bpw2, nbx, nby, nbz,
-                         perx, pery, perz, boxx, boxy, boxz, faces,
+                         perx, pery, perz, boxx, boxy, boxz, faces, need_w,
                          mass_local, den_local, num_local):
     npart = x.shape[0]
     K = vals.shape[1]
@@ -524,9 +1106,10 @@ def _deposit_petkova_amr(x, y, z, h, mass, volw, vals, cell_lo, cell_size,
                         if frac <= 0.0:
                             continue
                         mass_local[t, li] += mi * frac
-                        den_local[t, li] += wi * frac
-                        for p in range(K):
-                            num_local[t, li, p] += wi * vals[i, p] * frac
+                        if need_w:
+                            den_local[t, li] += wi * frac
+                            for p in range(K):
+                                num_local[t, li, p] += wi * vals[i, p] * frac
 
 
 def interpolate_amr_petkova(particles, grid, values=None):
@@ -551,24 +1134,32 @@ def interpolate_amr_petkova(particles, grid, values=None):
 
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
+    need_w = _needs_weights(names)
+    nw = Ncell if need_w else 1
     mass_local = np.zeros((nthreads, Ncell), dtype=np.float64)
-    den_local = np.zeros((nthreads, Ncell), dtype=np.float64)
-    num_local = np.zeros((nthreads, Ncell, K), dtype=np.float64)
+    den_local = np.zeros((nthreads, nw), dtype=np.float64)
+    num_local = np.zeros((nthreads, nw, K), dtype=np.float64)
 
     pos = particles.pos
-    _deposit_petkova_amr(
-        np.ascontiguousarray(pos[:, 0]),
-        np.ascontiguousarray(pos[:, 1]),
-        np.ascontiguousarray(pos[:, 2]),
-        particles.h, particles.mass, particles.mass / particles.rho, vals,
-        grid.cell_lo, grid.cell_size, grid.base_start, grid.base_count,
-        blo[0], blo[1], blo[2], bpw[0], bpw[1], bpw[2],
-        nbx, nby, nbz, perx, pery, perz, box[0], box[1], box[2], _CUBE_FACES,
-        mass_local, den_local, num_local)
+    with _chunked():
+        _deposit_petkova_amr(
+            np.ascontiguousarray(pos[:, 0]),
+            np.ascontiguousarray(pos[:, 1]),
+            np.ascontiguousarray(pos[:, 2]),
+            particles.h, particles.mass, particles.mass / particles.rho, vals,
+            grid.cell_lo, grid.cell_size, grid.base_start, grid.base_count,
+            blo[0], blo[1], blo[2], bpw[0], bpw[1], bpw[2],
+            nbx, nby, nbz, perx, pery, perz, box[0], box[1], box[2],
+            _CUBE_FACES, need_w,
+            mass_local, den_local, num_local)
 
-    mass = mass_local.sum(axis=0)
-    den = den_local.sum(axis=0)
-    num = num_local.sum(axis=0)
+    mass = np.empty(Ncell, dtype=np.float64)
+    _reduce_threads(mass_local, mass)
+    den = np.zeros(Ncell, dtype=np.float64)
+    num = np.zeros((Ncell, K), dtype=np.float64)
+    if need_w:
+        _reduce_threads(den_local, den)
+        _reduce_threads(num_local, num)
     vol = grid.volumes()
     mask = den > 0.0
 
@@ -606,9 +1197,42 @@ def _voro_cell_integral(px, py, pz, h, gx, gy, gz, c,
     failed to telescope for cells straddling the kernel break (h/2h) when the
     particle is outside the cell — the ~1-1.5% Voronoi conservation error on
     high-dynamic-range (collapsed-core) meshes. Now machine-precision conserving.
+
+    Regime-0 pre-pass (h << cell), as in `_cube_integral` but per face plane
+    of the convex polyhedron: if the kernel sphere crosses no plane the
+    integral is exactly 1/0; exactly one plane -> closed-form half-space split.
     """
-    total = 0.0
+    th = 2.0 * h
     f0 = cf_start[c]; f1 = cf_start[c + 1]
+    nclose = 0
+    sclose = 0.0
+    grx = gx - px; gry = gy - py; grz = gz - pz
+    for f in range(f0, f1):
+        i0 = fv_start[f]; i1 = fv_start[f + 1]
+        if i1 - i0 < 3:
+            continue
+        v0x = fvx[i0] - px;   v0y = fvy[i0] - py;   v0z = fvz[i0] - pz
+        ax = fvx[i0+1] - px - v0x; ay = fvy[i0+1] - py - v0y; az = fvz[i0+1] - pz - v0z
+        bx = fvx[i0+2] - px - v0x; by = fvy[i0+2] - py - v0y; bz = fvz[i0+2] - pz - v0z
+        nx = ay*bz - az*by; ny = az*bx - ax*bz; nz = ax*by - ay*bx
+        # orient outward (away from the generator)
+        if nx*(grx - v0x) + ny*(gry - v0y) + nz*(grz - v0z) > 0.0:
+            nx = -nx; ny = -ny; nz = -nz
+        nn = math.sqrt(nx*nx + ny*ny + nz*nz)
+        if nn < 1e-300:
+            continue
+        # signed inward particle->plane distance (positive on the cell side)
+        s = (v0x*nx + v0y*ny + v0z*nz) / nn
+        if s <= -th:
+            return 0.0
+        if s < th:
+            nclose += 1
+            sclose = s
+    if nclose == 0:
+        return 1.0
+    if nclose == 1:
+        return _halfspace_frac(sclose, h)
+    total = 0.0
     for f in range(f0, f1):
         i0 = fv_start[f]; i1 = fv_start[f + 1]
         nfv = i1 - i0
@@ -636,14 +1260,48 @@ def _voro_cell_integral(px, py, pz, h, gx, gy, gz, c,
     return total
 
 
+@njit(cache=True)
+def _petkova_voro_pair(xi, yi, zi, hi, mi, wi, i, c, kr,
+                       genx, geny, genz, gen_rad,
+                       cf_start, fv_start, fvx, fvy, fvz, need_w, vals,
+                       t, mass_local, den_local, num_local):
+    """One particle-cell pair: exact circumradius prune (the kernel reaches
+    cell c only if |particle-gen| < 2h + rad_c), then the cell integral."""
+    dx = genx[c] - xi; dy = geny[c] - yi; dz = genz[c] - zi
+    reach = kr + gen_rad[c]
+    if dx*dx + dy*dy + dz*dz >= reach * reach:
+        return
+    frac = _voro_cell_integral(xi, yi, zi, hi,
+                               genx[c], geny[c], genz[c], c,
+                               cf_start, fv_start, fvx, fvy, fvz)
+    if frac <= 0.0:
+        return
+    mass_local[t, c] += mi * frac
+    if need_w:
+        den_local[t, c] += wi * frac
+        for p in range(vals.shape[1]):
+            num_local[t, c, p] += wi * vals[i, p] * frac
+
+
 @njit(parallel=True, cache=True)
 def _deposit_petkova_voronoi(x, y, z, h, mass, volw, vals,
                              genx, geny, genz, gen_rad,
-                             cand_start, cand_count, cand_cell,
-                             cf_start, fv_start, fvx, fvy, fvz,
+                             nb, blo, bw, bstart, border, bradmax, rmax_small,
+                             brute_cell,
+                             cf_start, fv_start, fvx, fvy, fvz, need_w,
                              mass_local, den_local, num_local):
+    """Candidate search FUSED into the deposit: per particle, walk the uniform
+    generator-bucket grid (`generator_buckets`) over the index cube reached by
+    2h + rmax_small, prune whole buckets by distance-to-bucket-box against
+    2h + bradmax[b], and test each surviving generator with the exact
+    |particle-gen| < 2h + rad_c condition. No per-particle candidate lists —
+    materializing them (cKDTree.query_ball_point Python lists) cost minutes at
+    >=1e8 pairs and dominated the whole deposit. `brute_cell` holds the few
+    giant cells (rad > rmax_small) EVERY particle tests directly, so the walk
+    extent stays bounded by the SMALL-cell radius, not the global max."""
     npart = x.shape[0]
-    K = vals.shape[1]
+    nbrute = brute_cell.shape[0]
+    nb2 = nb * nb
     for i in prange(npart):
         mi = mass[i]
         hi = h[i]
@@ -653,23 +1311,57 @@ def _deposit_petkova_voronoi(x, y, z, h, mass, volw, vals,
         wi = volw[i]
         xi = x[i]; yi = y[i]; zi = z[i]
         kr = 2.0 * hi
-        s0 = cand_start[i]; n0 = cand_count[i]
-        for jj in range(s0, s0 + n0):
-            c = cand_cell[jj]
-            # prune: the kernel reaches cell c only if |particle-gen| < 2h + rad
-            dx = genx[c] - xi; dy = geny[c] - yi; dz = genz[c] - zi
-            reach = kr + gen_rad[c]
-            if dx*dx + dy*dy + dz*dz >= reach * reach:
-                continue
-            frac = _voro_cell_integral(xi, yi, zi, hi,
-                                       genx[c], geny[c], genz[c], c,
-                                       cf_start, fv_start, fvx, fvy, fvz)
-            if frac <= 0.0:
-                continue
-            mass_local[t, c] += mi * frac
-            den_local[t, c] += wi * frac
-            for p in range(K):
-                num_local[t, c, p] += wi * vals[i, p] * frac
+        ext = kr + rmax_small
+        ix0 = int((xi - ext - blo[0]) / bw[0]); ix1 = int((xi + ext - blo[0]) / bw[0])
+        iy0 = int((yi - ext - blo[1]) / bw[1]); iy1 = int((yi + ext - blo[1]) / bw[1])
+        iz0 = int((zi - ext - blo[2]) / bw[2]); iz1 = int((zi + ext - blo[2]) / bw[2])
+        if ix0 < 0: ix0 = 0
+        if iy0 < 0: iy0 = 0
+        if iz0 < 0: iz0 = 0
+        if ix1 > nb - 1: ix1 = nb - 1
+        if iy1 > nb - 1: iy1 = nb - 1
+        if iz1 > nb - 1: iz1 = nb - 1
+        for ix in range(ix0, ix1 + 1):
+            bx0 = blo[0] + ix * bw[0]
+            dxb = 0.0
+            if xi < bx0:
+                dxb = bx0 - xi
+            elif xi > bx0 + bw[0]:
+                dxb = xi - bx0 - bw[0]
+            for iy in range(iy0, iy1 + 1):
+                by0 = blo[1] + iy * bw[1]
+                dyb = 0.0
+                if yi < by0:
+                    dyb = by0 - yi
+                elif yi > by0 + bw[1]:
+                    dyb = yi - by0 - bw[1]
+                dxy2 = dxb * dxb + dyb * dyb
+                for iz in range(iz0, iz1 + 1):
+                    b = (ix * nb + iy) * nb + iz
+                    s0 = bstart[b]; s1 = bstart[b + 1]
+                    if s1 == s0:
+                        continue
+                    bz0 = blo[2] + iz * bw[2]
+                    dzb = 0.0
+                    if zi < bz0:
+                        dzb = bz0 - zi
+                    elif zi > bz0 + bw[2]:
+                        dzb = zi - bz0 - bw[2]
+                    breach = kr + bradmax[b]
+                    if dxy2 + dzb * dzb >= breach * breach:
+                        continue
+                    for jj in range(s0, s1):
+                        _petkova_voro_pair(
+                            xi, yi, zi, hi, mi, wi, i, border[jj], kr,
+                            genx, geny, genz, gen_rad,
+                            cf_start, fv_start, fvx, fvy, fvz, need_w, vals,
+                            t, mass_local, den_local, num_local)
+        for jj in range(nbrute):
+            _petkova_voro_pair(
+                xi, yi, zi, hi, mi, wi, i, brute_cell[jj], kr,
+                genx, geny, genz, gen_rad,
+                cf_start, fv_start, fvx, fvy, fvz, need_w, vals,
+                t, mass_local, den_local, num_local)
 
 
 def interpolate_voronoi_petkova(particles, grid, values=None):
@@ -689,37 +1381,72 @@ def interpolate_voronoi_petkova(particles, grid, values=None):
 
     vals, names = particles.value_array(values)
     Ntot = grid.ntotal                # deposit over ALL cells (incl. ghosts)
-    # candidate cells: generator within 2h + max circumradius (necessary overlap
-    # condition |particle-gen| < 2h + cell_rad; the integral itself -> 0 for any
-    # marginal cell the kernel does not actually reach).
-    Rmax = float(grid.cell_rad.max()) if Ntot else 0.0
-    radii = 2.0 * np.asarray(particles.h, dtype=np.float64) + Rmax
-    cand_start, cand_count, cand_cell = voronoi_candidates(
-        grid.gen, particles.pos, radii)
 
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
+    need_w = _needs_weights(names)
+    nw = Ntot if need_w else 1
     mass_local = np.zeros((nthreads, Ntot), dtype=np.float64)
-    den_local = np.zeros((nthreads, Ntot), dtype=np.float64)
-    num_local = np.zeros((nthreads, Ntot, K), dtype=np.float64)
+    den_local = np.zeros((nthreads, nw), dtype=np.float64)
+    num_local = np.zeros((nthreads, nw, K), dtype=np.float64)
 
     pos = particles.pos
-    _deposit_petkova_voronoi(
-        np.ascontiguousarray(pos[:, 0]),
-        np.ascontiguousarray(pos[:, 1]),
-        np.ascontiguousarray(pos[:, 2]),
-        particles.h, particles.mass, particles.mass / particles.rho, vals,
-        np.ascontiguousarray(grid.gen[:, 0]),
-        np.ascontiguousarray(grid.gen[:, 1]),
-        np.ascontiguousarray(grid.gen[:, 2]), grid.cell_rad,
-        cand_start, cand_count, cand_cell,
-        grid.cf_start, grid.fv_start, grid.fvx, grid.fvy, grid.fvz,
-        mass_local, den_local, num_local)
+    px = np.ascontiguousarray(pos[:, 0])
+    py = np.ascontiguousarray(pos[:, 1])
+    pz = np.ascontiguousarray(pos[:, 2])
+    gx = np.ascontiguousarray(grid.gen[:, 0])
+    gy = np.ascontiguousarray(grid.gen[:, 1])
+    gz = np.ascontiguousarray(grid.gen[:, 2])
+    volw = particles.mass / particles.rho
+
+    # Cell overlap condition: |particle-gen| < 2h + cell circumradius (the
+    # integral itself -> 0 for any marginal cell the kernel does not actually
+    # reach). The candidate search is FUSED into the numba deposit as a
+    # uniform-bucket-grid walk (`generator_buckets`): tree-querying every
+    # particle with a circumradius-inflated radius and materializing the
+    # Python candidate lists cost minutes at >=1e8 pairs (measured 1.6e9
+    # pairs / 13 GB / ~4 min on a clustered merger mesh vs ~2e8 true pairs),
+    # dominating the whole deposit. The few GIANT cells (rad > 8x median)
+    # would put every particle in reach anyway, so they go to the deposit as
+    # a brute list and the bucket-walk extent stays bounded by the small-cell
+    # circumradius, not the global max.
+    rad = np.asarray(grid.cell_rad, dtype=np.float64)
+    nbig = int((rad > 8.0 * float(np.median(rad))).sum()) if Ntot else 0
+    nbig = min(nbig, 2048)
+    order = np.argsort(rad)
+    brute = np.ascontiguousarray(order[Ntot - nbig:]) if nbig else \
+        np.zeros(0, dtype=np.int64)
+    small = order[:Ntot - nbig]
+    rmax_s = float(rad[small].max()) if small.size else 0.0
+    NB = 64
+    blo, bw, bstart, border, bradmax = generator_buckets(
+        grid.gen[small], rad[small], nb=NB)
+    border = small[border] if border.size else border   # bucket CSR -> global ids
+    with _chunked():
+        _deposit_petkova_voronoi(
+            px, py, pz,
+            particles.h, particles.mass, volw, vals,
+            gx, gy, gz, rad,
+            NB, blo, bw, bstart,
+            np.ascontiguousarray(border, dtype=np.int64), bradmax, rmax_s,
+            brute,
+            grid.cf_start, grid.fv_start, grid.fvx, grid.fvy, grid.fvz,
+            need_w, mass_local, den_local, num_local)
 
     # fold periodic ghost-cell deposits back onto the real (central) cells
-    mass = grid.fold_to_central(mass_local.sum(axis=0))
-    den = grid.fold_to_central(den_local.sum(axis=0))
-    num = grid.fold_to_central(num_local.sum(axis=0))
+    msum = np.empty(Ntot, dtype=np.float64)
+    _reduce_threads(mass_local, msum)
+    mass = grid.fold_to_central(msum)
+    if need_w:
+        dsum = np.empty(Ntot, dtype=np.float64)
+        _reduce_threads(den_local, dsum)
+        den = grid.fold_to_central(dsum)
+        nsum = np.empty((Ntot, K), dtype=np.float64)
+        _reduce_threads(num_local, nsum)
+        num = grid.fold_to_central(nsum)
+    else:
+        den = np.zeros(grid.ncell, dtype=np.float64)
+        num = np.zeros((grid.ncell, K), dtype=np.float64)
     Ncell = grid.ncell
     vol = grid.volumes()
     mask = den > 0.0

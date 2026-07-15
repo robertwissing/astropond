@@ -1,11 +1,24 @@
 #!/bin/bash
 
-export SPHEXA_DIR=/mn/stornext/d17/extragalactic/personal/robertwi/Projects/ICGEN/sims/OPTKERNELSIMS/newtests/sphexa/sphexa/build/main/src/sphexa/
-export GASOLINE_DIR=/mn/stornext/d17/extragalactic/personal/robertwi/Projects/ICGEN/sims/OPTKERNELSIMS/newtests/gasoline_claude/gasoline_claude
-# CHANGA_DIR may be overridden from the environment (e.g. CI points it at the
-# build dir); falls back to this local default otherwise.
-export CHANGA_DIR="${CHANGA_DIR:-/mn/stornext/d17/extragalactic/personal/robertwi/Projects/ICGEN/sims/OPTKERNELSIMS/a/testsuite/ci/changa_ci_test/changa/}"
-export AREPO_DIR=/mn/stornext/d17/extragalactic/personal/robertwi/Projects/ICGEN/sims/OPTKERNELSIMS/a/testsuite/codes/arepo/
+# Per-code binary directories. Each defaults to the reproducible local build under
+# codes/<code>/ (built by codes/<code>/get_<code>.sh + build_<code>.sh) but may be
+# overridden from the environment (e.g. CI, or to point at a private/MHD tree).
+# See codes/CODES_BUILD_PLAN.md.
+codes_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/codes"
+export SPHEXA_DIR="${SPHEXA_DIR:-$codes_dir/sphexa/sphexa/build/main/src/sphexa/}"
+# Gasoline: public N-BodyShop build is hydro-only (binary `gasoline`); the suite's
+# MHD reference binary `gasolinemhd` comes from a private tree -- export
+# GASOLINE_DIR to point at that build for MHD tests (see CODES_BUILD_PLAN.md).
+
+export GASOLINE_DIR="${GASOLINE_DIR:-$codes_dir/gasoline/gasoline-public}"
+export CHANGA_DIR="${CHANGA_DIR:-$codes_dir/changa/changa-public/}"
+export AREPO_DIR="${AREPO_DIR:-$codes_dir/arepo/}"
+export RAMSES_DIR="${RAMSES_DIR:-$codes_dir/ramses/ramses/bin/}"
+export GIZMO_DIR="${GIZMO_DIR:-$codes_dir/gizmo/gizmo/}"
+export PHANTOM_DIR="${PHANTOM_DIR:-$codes_dir/phantom/phantom/bin/}"
+export ATHENA_DIR="${ATHENA_DIR:-$codes_dir/athena++/athena/bin/}"
+export PKDGRAV3_DIR="${PKDGRAV3_DIR:-$codes_dir/pkdgrav3/pkdgrav3/build/}"
+export OPENGADGET3_DIR="${OPENGADGET3_DIR:-$codes_dir/opengadget3/opengadget3/}"
 
 #Directory for the setupfiles
 current_dir=$(pwd -P)
@@ -13,15 +26,52 @@ analysisdir=$current_dir/setupfiles/
 #Python (numba) glass-relaxation IC generator package root (see PLAN.md there)
 glassgenpydir=$current_dir/icgenerator/glassgen_python
 
-# AREPO (code=3): how ICconvert_tipsytoarepo.py turns the tipsy IC into an AREPO
-# moving-mesh IC. "particles" (default) = a 1:1 copy of the SPH particles as mesh
-# generators (most faithful, no interpolation; AREPO tessellates). For a
-# regridded IC instead set "voronoi", "amr" or "uniform" (deposits the SPH fields
+# AREPO (code=3):
+# "particles" (default) = a 1:1 copy of the SPH particles as mesh generators.
+#For a regridded IC instead set "voronoi", "amr" or "uniform" (deposits the SPH fields
 # onto that mesh, petkova/mass-conserving).
 AREPOICMODE="particles"
 
-#Code is selected by the 4th positional argument: 0=Gasoline 1=ChaNGa 2=SPH-EXA 3=AREPO
+#RAMSESIC uniform or amr
+RAMSESICMODE="amr"
+
+#Code is selected by the 4th positional argument:
+#  0=Gasoline 1=ChaNGa 2=SPH-EXA 3=AREPO  (wired: build + IC conversion)
+#  5=GIZMO 6=Phantom 8=PKDGRAV3 9=OpenGadget3  (wired: build + IC conversion)
+#  4=RAMSES 7=Athena++  (build only so far; IC conversion + run/convert blocks
+#  pending -- see codes/CODES_BUILD_PLAN.md)
 #The executable directory and binary name per code are set in the code-selection block after arg parsing.
+#Each code is obtained/built by codes/<code>/get_<code>.sh + build_<code>.sh.
+
+# --- RUNPHYSICS support matrix -------------------------------------------------
+# Which physics (hydro|mhd|grav|gravmhd) each code is WIRED to run end-to-end in
+# THIS script today. Each setup_<test>() declares the test's RUNPHYSICS; the gate
+# below refuses unsupported (code, physics) pairs early. Seeded to current reality
+# -- edit as codes gain physics (grid self-gravity, a combined grav+mhd build,
+# validated PKDGRAV3 SPH-MHD, ...). `runtest.sh support` prints this table.
+declare -a CODENAMES=( Gasoline ChaNGa SPH-EXA AREPO RAMSES GIZMO Phantom Athena++ PKDGRAV3 OpenGadget3 )
+declare -a SUPPORT
+SUPPORT[0]="hydro mhd grav gravmhd"   # Gasoline    (gasolinemhd; verified)
+SUPPORT[1]="hydro mhd grav gravmhd"   # ChaNGa      (--enable-mhd; verified)
+SUPPORT[2]="hydro mhd grav"           # SPH-EXA     (converter sets gravConstant=1/open box on bDoGravity; --prop std Barnes-Hut)
+SUPPORT[3]="hydro mhd grav"           # AREPO       (Arepo_grav: Config_grav.sh SELFGRAVITY+GRAVITY_NOT_PERIODIC, arepo-grid bggrid IC)
+SUPPORT[4]="hydro mhd"                # RAMSES      (grav needs poisson=.true. -- GRID_CODES_PLAN)
+SUPPORT[5]="hydro mhd grav"           # GIZMO       (GIZMO_grav wired; gravmhd not built)
+SUPPORT[6]="hydro mhd grav"           # Phantom     (phantom_grav: SETUP=evrard, adiabatic isolated self-gravity)
+SUPPORT[7]="hydro mhd"                # Athena++    (grav needs self-gravity -- GRID_CODES_PLAN)
+SUPPORT[8]="hydro grav"               # PKDGRAV3    (N-body+SPH: gravity native; no public SPMHD -> no mhd/gravmhd)
+SUPPORT[9]="hydro mhd grav"           # OpenGadget3 (OpenGadget3_grav: Config_grav.sh, isolated adaptive-softening self-gravity)
+
+physics_supported() {  # $1 = code index, $2 = physics label -> 0 iff supported
+    local p; for p in ${SUPPORT[$1]}; do [ "$p" = "$2" ] && return 0; done; return 1
+}
+print_support_matrix() {
+    printf '%-5s %-12s %s\n' code code-name "supported physics (RUNPHYSICS)"
+    printf '%-5s %-12s %s\n' ----- ------------ ------------------------------
+    local i; for i in "${!CODENAMES[@]}"; do
+        printf '%-5s %-12s %s\n' "$i" "${CODENAMES[$i]}" "${SUPPORT[$i]}"
+    done
+}
 
 #If running serial/mpi or with charmrun
 #mpirun="$dir/charmrun.smp +p 63"
@@ -29,7 +79,7 @@ AREPOICMODE="particles"
 mpirun="mpirun "
 
 #An extra word added at the end of the simulation output files and directory
-EXTRANAME=""
+EXTRANAME="amrnew3"
 
 #An extra word added to the glass file names (e.g. to tag the code used to relax)
 GLASSNAME=""
@@ -70,7 +120,7 @@ ICCONFIGPY="-n 4800 -oi 0 --icr0 1.0 --icrloop0 0.5 --rhopow 2.0 --icr0rate 1.5"
 
 #Extra condition during runtime
 #EXTRACONDALL=" -facQ 1.0 -fch 1.0 -psidecfac 1.0 -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -nInitCorrIter 50 -smin 32 -smax 40000 "
-EXTRACONDALL=" "
+EXTRACONDALL=" -thermaldiff 0.1 -alpha 0.5 -beta 8.0 "
 
 
 #Extra runtime conditions and output fields specific to SPH-EXA (code=2)
@@ -100,7 +150,9 @@ usage() {
     echo "                     0: lattice"
     echo "                     1: random"
     echo "                     2: glass"
-    echo "  code               Simulation code: 0: Gasoline  1: ChaNGa  2: SPH-EXA  3: AREPO"
+    echo "  code               Simulation code: 0: Gasoline  1: ChaNGa  2: SPH-EXA  3: AREPO  4: RAMSES  5: GIZMO  6: Phantom  7: Athena++  8: PKDGRAV3  9: OpenGadget3"
+    echo "                     (Each test declares its physics hydro|mhd|grav|gravmhd; a code that"
+    echo "                      does not support it is rejected. Run '$0 support' for the matrix.)"
     echo "  vm                 (optional) enable variable SPH particle masses in the IC generator (default 0 = equal-mass particles)."
     echo "  extra              (optional) extra flags appended to the runtime command."
     echo "If glass data file exist for a specific Nsmooth it will skipp the glass generation and run the simulation. If you choose an nSmooth that does not have a glass datafile it will do the whole glass generation again."
@@ -112,6 +164,8 @@ usage() {
     echo "  mhdcollapse        MHD collapse simulation."
     echo "  kh                 Kelvin-Helmholtz instability simulation."
     echo "  orzag              Orszag-Tang vortex simulation (-a 1 for true 3D, Tu 2022 / Helzel et al. 2011)."
+    echo "  abcflow            ABC-flow kinematic dynamo (3D, Teyssier et al. 2006)."
+    echo "  ponomarenko        Ponomarenko screw-flow kinematic dynamo (3D, Teyssier et al. 2006)."
     echo "  mhdrotor           MHD rotor simulation."
     echo "  mhdloop            MHD loop advection simulation."
     echo "  shocktube          Different kinds of shock tubes."
@@ -171,6 +225,12 @@ while getopts ":ira:b:c:d:e:f:g:h:" opt; do
 done
 shift $((OPTIND -1))
 
+# `runtest.sh support` -> print the code x physics support matrix and exit.
+if [ "${1:-}" = "support" ]; then
+    print_support_matrix
+    exit 0
+fi
+
 # Check for the testsim argument
 testsim=${1:-"default"}
 if [ "$testsim" = "default" ]; then
@@ -179,8 +239,22 @@ if [ "$testsim" = "default" ]; then
 fi
 shift
 
+# RUNPHYSICS helpers (see the support matrix + gate below). Each setup_<test>()
+# declares RUNPHYSICS (hydro|mhd|grav|gravmhd); it is a property of the TEST, used
+# ONLY to pick the per-code binary/config and to gate unsupported (code,physics)
+# pairs. It is NEVER passed to a converter -- converters auto-detect physics from
+# the IC so they stay usable standalone (outside runtest.sh).
+nonzero() { awk -v v="$1" 'BEGIN { print (v+0 != 0) ? 1 : 0 }'; }  # numeric != 0
+combine_physics() {  # $1 mhd(0/1) $2 grav(0/1) -> hydro|mhd|grav|gravmhd
+    if [ "$1" = 1 ] && [ "$2" = 1 ]; then echo gravmhd
+    elif [ "$1" = 1 ]; then echo mhd
+    elif [ "$2" = 1 ]; then echo grav
+    else echo hydro; fi
+}
+
 # Function for mhdcollapse setup with generic parameters
 setup_mhdcollapse() {
+    RUNPHYSICS="gravmhd"
     # Set default values if not specified
     mu=${args[0]:-10}
     rhodiff=${args[1]:-360}
@@ -203,6 +277,7 @@ setup_mhdcollapse() {
 
 # Function for accdisk setup with generic parameters
 setup_accdisk() {
+    RUNPHYSICS="grav"
     # Set default values if not specified
     hr=${args[0]:-0.1}
     massrat=${args[1]:-1E-3}
@@ -231,6 +306,7 @@ setup_accdisk() {
 
 # Function for alfven setup with generic parameters
 setup_alfven() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     rotate=${args[0]:-1}
 
@@ -276,6 +352,14 @@ setup_shocktube() {
     fi
     shockname=${shocks[$((shock_index - 1))]}
 
+    # Physics: only Sod (1) and the strong-blast (11) presets are hydro (B=0);
+    # every other choose_shock preset carries a nonzero B -> MHD.
+    if [ "$shock_index" = 1 ] || [ "$shock_index" = 11 ]; then
+        RUNPHYSICS="hydro"
+    else
+        RUNPHYSICS="mhd"
+    fi
+
     # Display the settings being used
     echo "Using settings for Shocktube:"
     echo "Different shocks (argument -a): $shock"
@@ -306,6 +390,7 @@ setup_shocktube() {
 
 # Function for Orzag-Tang Vortex setup with generic parameters
 setup_orzag() {
+    RUNPHYSICS="mhd"
     dim3=${args[0]:-0}
     # Set default values if not specified
     echo "Using settings for Orzag-Tang Vortex:"
@@ -324,8 +409,39 @@ setup_orzag() {
     fi
 }
 
+# Function for the ABC-flow kinematic dynamo (Teyssier et al. 2006)
+setup_abcflow() {
+    RUNPHYSICS="mhd"
+    B0=${args[0]:-1e-3}
+    amp=${args[1]:-1.0}
+    echo "Using settings for the ABC-flow kinematic dynamo:"
+    echo "uniform seed Bz -a : $B0"
+    echo "ABC flow amplitude (A=B=C) -b : $amp"
+    # Order matches IC_setup_abcflow.create(... B0, amp) signature
+    EXTRACONDIC="$B0 $amp "
+    EXTRACONDRUN=""
+    prefile_extra=""
+    glassfile_extra="${GLASSNAME}"
+    runname_extra="B$(fmt "${B0}")amp$(fmt "${amp}")"
+}
+
+# Function for the Ponomarenko screw-flow kinematic dynamo (Teyssier et al. 2006)
+setup_ponomarenko() {
+    RUNPHYSICS="mhd"
+    B0=${args[0]:-0.1}
+    echo "Using settings for the Ponomarenko screw-flow dynamo:"
+    echo "seed vector-potential amplitude -a : $B0"
+    # Order matches IC_setup_ponomarenko.create(... B0) signature
+    EXTRACONDIC="$B0 "
+    EXTRACONDRUN=""
+    prefile_extra=""
+    glassfile_extra="${GLASSNAME}"
+    runname_extra="B$(fmt "${B0}")"
+}
+
 # Function for Magnetized Rotor setup with generic parameters
 setup_mhdrotor() {
+    RUNPHYSICS="mhd"
     rhodisk=${args[0]:-10.0}
     # Set default values if not specified
     echo "Using settings for Magnetized Rotor:"
@@ -341,6 +457,7 @@ setup_mhdrotor() {
 
 # Function for Magnetized advection loop setup with generic parameters
 setup_mhdloop() {
+    RUNPHYSICS="mhd"
     rhodisk=${args[0]:-1.0}
     # Set default values if not specified
     echo "Using settings for Magnetized Advection Loop:"
@@ -356,6 +473,7 @@ setup_mhdloop() {
 
 # Function for gresho setup with generic parameters
 setup_gresho() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     result=$(echo "scale=5; sqrt(3/25)" | bc -l)
     echo "$result"
@@ -374,6 +492,7 @@ setup_gresho() {
 
 # Function for kelvin-helmholtz setup with generic parameters
 setup_kh() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     result=$(echo "scale=5; sqrt(6)/5" | bc -l)
     echo "$result"
@@ -400,6 +519,7 @@ setup_kh() {
 
 # Function for Sedov blast wave + mhd setup with generic parameters
 setup_sedov() {
+    RUNPHYSICS="hydro"
     select=${args[0]:-1.0}
     betain=${args[1]:-0.0}
     ublast=${args[2]:-10.0}
@@ -434,6 +554,7 @@ setup_sedov() {
 
 # Function for alfven setup with generic parameters
 setup_evrard() {
+    RUNPHYSICS="grav"
     # Set default values if not specifie
     echo "Using settings for evrard collapse:"
     # Setup based on the potentially updated values
@@ -442,10 +563,16 @@ setup_evrard() {
     prefile_extra=""
     glassfile_extra="${GLASSNAME}"
     runname_extra=""
+    # evrard's density is dICdensprofile=8 (1/r cusp), which the Python glassgen
+    # backend cannot evaluate analytically -> relax against the radial density
+    # table the rand pre-IC writes (test_cases/evrard/densitytable_xdr, the glass
+    # step's cwd). dICdensdir=4 = spherical radius, so index by r_sph.
+    GLASSMODE="--table densitytable_xdr --direction r_sph"
 }
 
 # Function for alfven setup with generic parameters
 setup_polytrope() {
+    RUNPHYSICS="grav"
         # Set default values if not specifie
         echo "Using settings for polytrope:"
         # Setup based on the potentially updated values
@@ -458,6 +585,7 @@ setup_polytrope() {
 
 # Function for static blobs (force test) setup with generic parameters
 setup_areablob() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     rhodiff=${args[0]:-1000}
     multcloud=${args[1]:-1}
@@ -479,6 +607,7 @@ setup_areablob() {
 
 # Function for Taylor-green setup with generic parameters
 setup_taylorgreen() {
+    RUNPHYSICS="hydro"
     etavisc=${args[0]:-0.1}
     xivisc=${args[1]:-0.0}
     # Set default values if not specified
@@ -496,6 +625,7 @@ setup_taylorgreen() {
 
 # Function for cloud crushing (wind-cloud) setup with generic parameters
 setup_blob() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     rhodiff=${args[0]:-10}
     beta=${args[1]:-0}
@@ -531,6 +661,8 @@ setup_rt() {
     smooth=${args[3]:-0}
     beta=${args[4]:-0.0}
     bdir=${args[5]:-1}
+    # MHD only when a nonzero interface plasma-beta is requested (beta=0 -> hydro).
+    RUNPHYSICS="hydro"; [ "$(nonzero "$beta")" = 1 ] && RUNPHYSICS="mhd"
     echo "Using settings for rayleigh-taylor:"
     echo "rho diff -a : $rhodiff"
     echo "Case 1 for symmetric and 2 for unsymmetric -b : $case"
@@ -548,6 +680,7 @@ setup_rt() {
 
 # Function for magneto-thermal instability setup
 setup_mti() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     echo "Using settings for MTI:"
     # Setup based on the potentially updated values
@@ -560,6 +693,7 @@ setup_mti() {
 
 # Function for isolated MHD wave setup with generic parameters
 setup_mhdisowave() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     beta=${args[0]:-0.1}
     echo "Using settings for isolated wave:"
@@ -574,6 +708,7 @@ setup_mhdisowave() {
 
 # Function for magnetic divergence test setup with generic parameters
 setup_mhddivtest() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     rhodiff=${args[0]:-1}
     smooth=${args[1]:-1}
@@ -594,6 +729,7 @@ setup_mhddivtest() {
 
 # Function for planet (single body) setup with generic parameters
 setup_planet() {
+    RUNPHYSICS="grav"
     # Set default values if not specified
     planet=${args[0]:-"Earth_PES095_2layer"}
     echo "Using settings for planet:"
@@ -607,6 +743,7 @@ setup_planet() {
 
 # Function for planet collision setup with generic parameters
 setup_planetcollision() {
+    RUNPHYSICS="grav"
     # Set default values if not specified
     target=${args[0]:-"None"}
     impactor=${args[1]:-"None"}
@@ -626,6 +763,7 @@ setup_planetcollision() {
 # is3d=0: 2D thin-slab variant (Saitoh-Makino 2013; Hopkins 2013, 2015; Hu et al. 2014)
 # is3d=1: 3D inner-cube variant (Sandnes et al. 2025)
 setup_square() {
+    RUNPHYSICS="hydro"
     gamma_default=$(echo "scale=12; 5/3" | bc -l)
     rhodiff=${args[0]:-4.0}
     przero=${args[1]:-2.5}
@@ -652,6 +790,8 @@ setup_cosmowave() {
     case=${args[0]:-3}
     factor_A=${args[1]:-1}
     factor_G=${args[2]:-0}
+    # MHD when factor_A (omega_A) != 0; self-gravity when factor_G (omega_G) != 0.
+    RUNPHYSICS="$(combine_physics "$(nonzero "$factor_A")" "$(nonzero "$factor_G")")"
     echo "Using settings for cosmowave (Berlok 2022):"
     echo "test case -a : $case  (0:standing Alfven 1:traveling Alfven 2:standing compr. 3:traveling compr. gamma=4/3 4:div-clean EdS)"
     echo "factor_A (omega_A = factor_A*pi; 0=MHD off, 1=paper default) -b : $factor_A"
@@ -666,6 +806,7 @@ setup_cosmowave() {
 
 # Function for Balsara MHD vortex setup with generic parameters
 setup_mhdbalsaravortex() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     u=${args[0]:-1.0}
     k=${args[1]:-1.0}
@@ -682,6 +823,7 @@ setup_mhdbalsaravortex() {
 
 # Function for Zeldovich pancake (cosmological) setup with generic parameters
 setup_zeldovich() {
+    RUNPHYSICS="grav"
     # Set default values if not specified
     Lboxinkpc=${args[0]:-1000.0}
     zi=${args[1]:-100}
@@ -698,6 +840,7 @@ setup_zeldovich() {
 
 # Function for magnetorotational instability (MRI) setup with generic parameters
 setup_mri() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     case=${args[0]:-2}
     echo "Using settings for MRI:"
@@ -712,6 +855,7 @@ setup_mri() {
 
 # Function for Magnetized advection loop with shear setup with generic parameters
 setup_mhdloopshear() {
+    RUNPHYSICS="mhd"
     rhodiff=${args[0]:-1.0}
     # Set default values if not specified
     echo "Using settings for Magnetized Advection Loop with shear:"
@@ -726,6 +870,7 @@ setup_mhdloopshear() {
 
 # Function for MHD current sheet (Gardiner & Stone 2005) setup with generic parameters
 setup_currentsheet() {
+    RUNPHYSICS="mhd"
     # Set default values if not specified
     beta=${args[0]:-0.1}
     v0=${args[1]:-0.1}
@@ -742,6 +887,7 @@ setup_currentsheet() {
 
 # Function for the Noh problem (converging strong shock) setup with generic parameters
 setup_noh() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     is3d=${args[0]:-1}
     pini=${args[1]:-1e-6}
@@ -760,6 +906,7 @@ setup_noh() {
 
 # Function for the isentropic (Yee) vortex setup with generic parameters
 setup_isentropicvortex() {
+    RUNPHYSICS="hydro"
     # Set default values if not specified
     beta_v=${args[0]:-5.0}
     vadv=${args[1]:-1.0}
@@ -779,6 +926,8 @@ setup_wave() {
     # Set default values if not specified
     wavetype=${args[0]:-0}
     ampl=${args[1]:-1e-4}
+    # wavetype 0 = sound (hydro); 1/2/3 = (fast/slow magnetosonic, Alfven) = MHD.
+    RUNPHYSICS="mhd"; [ "$wavetype" = 0 ] && RUNPHYSICS="hydro"
     echo "Using settings for linear (M)HD wave:"
     echo "wave type -a : $wavetype  (0:sound 1:fast magnetosonic 2:slow magnetosonic 3:Alfven)"
     echo "eigenmode amplitude -b : $ampl"
@@ -792,6 +941,7 @@ setup_wave() {
 
 # Function for the cold Keplerian disk/ring setup with generic parameters
 setup_coldkeplerian() {
+    RUNPHYSICS="grav"
     # Set default values if not specified
     hr=${args[0]:-0.05}
     rinner=${args[1]:-1.0}
@@ -830,6 +980,12 @@ case $testsim in
         ;;
     orzag)
         setup_orzag
+        ;;
+    abcflow)
+        setup_abcflow
+        ;;
+    ponomarenko)
+        setup_ponomarenko
         ;;
     mhdrotor)
         setup_mhdrotor
@@ -923,7 +1079,7 @@ cd test_cases/$testsim
 CURRENT_DIR=$(pwd -P)
 
 if [ "$#" -lt 4 ]; then
-    echo "Usage: $0 <Nsmooth> <Nres> <0: lattice 1: rand 2: glass> <code 0:Gasoline 1:ChaNGa 2:SPH-EXA 3:AREPO> [vm] [extra]"
+    echo "Usage: $0 <Nsmooth> <Nres> <0: lattice 1: rand 2: glass> <code 0:Gasoline 1:ChaNGa 2:SPH-EXA 3:AREPO 4:RAMSES 5:GIZMO 6:Phantom 7:Athena++ 8:PKDGRAV3 9:OpenGadget3> [vm] [extra]"
     exit 1
 fi
 echo "$0 $1 $2 $3 $4 $5 $6"
@@ -992,9 +1148,6 @@ echo "RUNNING CHANGA"
     codename="CHANGA"
     dir=$CHANGA_DIR
     coderun=ChaNGa.smp
-    # CHANGA_CHARMRUN_OPTS overrides the charmrun options from the environment
-    # (e.g. CI and run_changa_ci_test.sh set "++local +p 2"); defaults to all
-    # cores for a normal interactive run.
     runlauncher="$CHANGA_DIR/charmrun ${CHANGA_CHARMRUN_OPTS:-+p $(nproc)}"
 elif [ "$4" -eq 2 ]; then
 echo "RUNNING SPH-EXA"
@@ -1006,7 +1159,55 @@ echo "RUNNING AREPO"
     codename="AREPO"
     dir=$AREPO_DIR
     coderun=Arepo
+elif [ "$4" -eq 4 ]; then
+echo "RUNNING RAMSES"
+    codename="RAMSES"
+    dir=$RAMSES_DIR
+    coderun=ramses3d
+elif [ "$4" -eq 5 ]; then
+echo "RUNNING GIZMO"
+    codename="GIZMO"
+    dir=$GIZMO_DIR
+    coderun=GIZMO
+elif [ "$4" -eq 6 ]; then
+echo "RUNNING PHANTOM"
+    codename="PHANTOM"
+    dir=$PHANTOM_DIR
+    coderun=phantom
+elif [ "$4" -eq 7 ]; then
+echo "RUNNING ATHENA"
+    codename="ATHENA"
+    dir=$ATHENA_DIR
+    coderun=athena_hydro
+elif [ "$4" -eq 8 ]; then
+echo "RUNNING PKDGRAV3"
+    codename="PKDGRAV3"
+    dir=$PKDGRAV3_DIR
+    coderun=pkdgrav3
+elif [ "$4" -eq 9 ]; then
+echo "RUNNING OPENGADGET3"
+    codename="OPENGADGET3"
+    dir=$OPENGADGET3_DIR
+    coderun=OpenGadget3
 fi
+
+# RUNPHYSICS support gate: refuse (code, physics) pairs this script can't run,
+# BEFORE building any IC. RUNPHYSICS was declared by setup_<testsim>() above; the
+# code blocks below map it to the per-code binary/config.
+if [ -z "${RUNPHYSICS:-}" ]; then
+    echo "Internal error: setup_$testsim did not set RUNPHYSICS."; exit 1
+fi
+if ! physics_supported "$4" "$RUNPHYSICS"; then
+    echo "Error: $codename does not support $RUNPHYSICS tests (test '$testsim')."
+    echo "       $codename supports: ${SUPPORT[$4]}."
+    echo "       (See 'runtest.sh support'; edit the SUPPORT matrix as codes gain physics.)"
+    exit 1
+fi
+echo "Physics: $testsim -> RUNPHYSICS=$RUNPHYSICS ($codename)"
+
+# All codes 0-9 are wired: 0 Gasoline, 1 ChaNGa, 2 SPH-EXA, 3 AREPO, 4 RAMSES
+# (cubic first cut, hydro+MHD), 5 GIZMO, 6 Phantom, 7 Athena++ (cubic first
+# cut, hydro+MHD, uniform), 8 PKDGRAV3, 9 OpenGadget3.
 
 glassfile_prefix="$testsim$2_glassN$1${glassfile_extra}"
 ICfile="${simfilename}"
@@ -1125,40 +1326,58 @@ mkdir initruns
 		}' "$paramfile"
 	}
 
-	dxP=$(get_param dxPeriod)
-	dyP=$(get_param dyPeriod)
-	dzP=$(get_param dzPeriod)
 	iOutInterval=$(get_param iOutInterval)
-	if [[ -z "$dxP" || -z "$iOutInterval" ]]; then
-	    echo "Error: missing dxPeriod/iOutInterval in $paramfile"
-	    exit 1
-	fi
-	[ -z "$dyP" ] && dyP=$dxP
-	[ -z "$dzP" ] && dzP=$dxP
-	# AREPO BoxSize is the X period; the other axes are set by the COMPILE-TIME
-	# LONG_Y/LONG_Z = dyPeriod/dxPeriod, dzPeriod/dxPeriod (boxSize_Y=BoxSize*LONG_Y).
-	# (The run times / timestepping go into param.txt on the Python side below.)
-	boxsize=$dxP
-	LONGY=$(awk -v a="$dyP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
-	LONGZ=$(awk -v a="$dzP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
-
-	# Non-cubic box -> AREPO needs LONG_Y/LONG_Z compiled in (public AREPO is
-	# cubic by default). Cubic (both ~1): use the prebuilt MHD `Arepo`. Else
-	# build (once, cached by aspect tag) Arepo_asp<LY>_<LZ> from Config.sh + the
-	# LONG_Y/LONG_Z lines.
-	iscubic=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { d=0.0005; print (y>1-d && y<1+d && z>1-d && z<1+d)?1:0 }')
-	if [ "$iscubic" != "1" ]; then
-	    tag=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { printf "%.4f_%.4f", y, z }' | tr '.' 'p')
-	    coderun="Arepo_asp${tag}"
+	if [ -z "$iOutInterval" ]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	arepo_boxopt=""
+	if [ "$RUNPHYSICS" = grav ]; then
+	    # Isolated self-gravity (evrard, ...): the Arepo_grav binary (Config_grav.sh:
+	    # SELFGRAVITY + GRAVITY_NOT_PERIODIC + ADAPTIVE_HYDRO_SOFTENING) with the
+	    # arepo-grid IC mode FORCED. An isolated cloud needs mesh generators in the
+	    # OPEN space around it (else the outer Voronoi cells are unbounded), so
+	    # arepo-grid builds the ADDBACKGROUNDGRID-equivalent oct-tree, enlarges the box
+	    # to >=2x the gas extent (background shell), and writes THAT box into param.txt.
+	    # No dxPeriod / LONG_* aspect (bPeriodic=0, the .param has none). The converter
+	    # auto-detects gravity (bDoGravity) -> GravityConstantInternal=1 + adaptive
+	    # softening params. Build Arepo_grav on demand.
+	    coderun=Arepo_grav
+	    AREPOICMODE=arepo-grid
 	    if [ ! -x "$dir/$coderun" ]; then
-		echo "Building AREPO with LONG_Y=$LONGY LONG_Z=$LONGZ -> $coderun"
-		cfg="Config_asp${tag}.sh"
-		cp "$dir/Config.sh" "$dir/$cfg"
-		printf "\nLONG_Y=%s\nLONG_Z=%s\n" "$LONGY" "$LONGZ" >> "$dir/$cfg"
-		( cd "$dir" && make -j8 CONFIG="$cfg" BUILD_DIR="build_asp${tag}" EXEC="$coderun" )
-		if [ ! -x "$dir/$coderun" ]; then echo "Error: AREPO LONG build failed."; exit 1; fi
+		echo "Building self-gravity AREPO -> $coderun (Config_grav.sh)"
+		( cd "$dir" && make -j8 CONFIG=Config_grav.sh BUILD_DIR=build_grav EXEC="$coderun" )
+		if [ ! -x "$dir/$coderun" ]; then echo "Error: Arepo_grav build failed (see codes/arepo/Config_grav.sh)."; exit 1; fi
 	    fi
-	    echo "Non-cubic box [$dxP,$dyP,$dzP] -> using $coderun (LONG_Y=$LONGY LONG_Z=$LONGZ)"
+	else
+	    dxP=$(get_param dxPeriod)
+	    dyP=$(get_param dyPeriod)
+	    dzP=$(get_param dzPeriod)
+	    if [ -z "$dxP" ]; then echo "Error: missing dxPeriod in $paramfile"; exit 1; fi
+	    [ -z "$dyP" ] && dyP=$dxP
+	    [ -z "$dzP" ] && dzP=$dxP
+	    # AREPO BoxSize is the X period; the other axes are set by the COMPILE-TIME
+	    # LONG_Y/LONG_Z = dyPeriod/dxPeriod, dzPeriod/dxPeriod (boxSize_Y=BoxSize*LONG_Y).
+	    boxsize=$dxP
+	    arepo_boxopt="--boxsize $boxsize"
+	    LONGY=$(awk -v a="$dyP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+	    LONGZ=$(awk -v a="$dzP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+
+	    # Non-cubic box -> AREPO needs LONG_Y/LONG_Z compiled in (public AREPO is
+	    # cubic by default). Cubic (both ~1): use the prebuilt MHD `Arepo`. Else
+	    # build (once, cached by aspect tag) Arepo_asp<LY>_<LZ> from Config.sh + the
+	    # LONG_Y/LONG_Z lines.
+	    iscubic=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { d=0.0005; print (y>1-d && y<1+d && z>1-d && z<1+d)?1:0 }')
+	    if [ "$iscubic" != "1" ]; then
+		tag=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { printf "%.4f_%.4f", y, z }' | tr '.' 'p')
+		coderun="Arepo_asp${tag}"
+		if [ ! -x "$dir/$coderun" ]; then
+		    echo "Building AREPO with LONG_Y=$LONGY LONG_Z=$LONGZ -> $coderun"
+		    cfg="Config_asp${tag}.sh"
+		    cp "$dir/Config.sh" "$dir/$cfg"
+		    printf "\nLONG_Y=%s\nLONG_Z=%s\n" "$LONGY" "$LONGZ" >> "$dir/$cfg"
+		    ( cd "$dir" && make -j8 CONFIG="$cfg" BUILD_DIR="build_asp${tag}" EXEC="$coderun" )
+		    if [ ! -x "$dir/$coderun" ]; then echo "Error: AREPO LONG build failed."; exit 1; fi
+		fi
+		echo "Non-cubic box [$dxP,$dyP,$dzP] -> using $coderun (LONG_Y=$LONGY LONG_Z=$LONGZ)"
+	    fi
 	fi
 
 	# tipsy IC -> AREPO IC (sph_interp). $AREPOICMODE picks the conversion
@@ -1170,13 +1389,389 @@ mkdir initruns
 	# replacing the old noh-template sed (MaxSizeTimestep is now dDelta, not 0.01).
 	arepoIC="datafiles/${ICfile}_arepo.hdf5"
 	arepoparam="$runname/param.txt"
-	convertcmd="python ${analysisdir}/ICconvert_tipsytoarepo.py datafiles/$ICfile.00000 $arepoIC $AREPOICMODE --param-out $arepoparam --output-dir $runname/ --boxsize $boxsize"
+	# Grid resolution for the DEPOSIT modes -> tie to the SPH per-axis resolution
+	# (Nres = $2) instead of the converter's npx=128 default:
+	#   uniform : npx = Nres                 (Nres^3 uniform cells = the SPH lattice).
+	#   amr     : quasi-Lagrangian (RAMSES-style, the converter default --refine
+	#             mass). START from a COARSE base grid = Nres/2 and refine DOWN to
+	#             the SPH resolution (finest npx = Nres) where a cell's mass exceeds
+	#             the mean base-cell mass. The base MUST be coarser than the particle
+	#             sampling: a mass/Lagrangian threshold can only tell dense from
+	#             sparse when each base cell holds SEVERAL particles -- at base=Nres
+	#             every cell holds <~1 particle and it refines ~everywhere.
+	# Override with AREPOICNPX (finest/uniform), AREPOICBASE (amr base grid).
+	# (particles mode: 1:1 copy, no grid -> no resolution flag.)
+	Nres=$2
+	arepres=""
+	if [ "$AREPOICMODE" == "uniform" ]; then
+	    arepres="--npx ${AREPOICNPX:-$Nres}"
+	elif [ "$AREPOICMODE" == "amr" ]; then
+	    arepres="--base-npx ${AREPOICBASE:-$((Nres / 2))} --npx ${AREPOICNPX:-$Nres}"
+	elif [ "$AREPOICMODE" == "arepo-grid" ]; then
+	    # pure-Python bggrid octree: --gridsize is the COARSE void floor (== AREPO
+	    # GridSize == base_npx); refines down to ~1 cell/particle where the gas is.
+	    arepres="--gridsize ${AREPOICGRIDSIZE:-16}"
+	    # AREPOICOCCUPIED=0 -> emit ONLY empty-leaf centres (reproduce AREPO bggrid
+	    # exactly); default keeps a generator at every particle cell (finer mesh).
+	    [ "${AREPOICOCCUPIED:-1}" == "0" ] && arepres="$arepres --no-include-occupied"
+	fi
+	convertcmd="python ${analysisdir}/ICconvert_tipsytoarepo.py datafiles/$ICfile.00000 $arepoIC $AREPOICMODE $arepres --param-out $arepoparam --output-dir $runname/ $arepo_boxopt"
 	echo "$convertcmd"
 	eval "$convertcmd"
 	if [ $? -ne 0 ]; then echo "Error: AREPO IC conversion failed."; exit 1; fi
 
 	# RestartFlag 0 = start from the IC (AREPO rebuilds the Voronoi mesh).
 	runline=( $mpirun "$dir/${coderun}" "$arepoparam" 0)
+    fi
+
+    if [ "$4" == 5 ]; then
+	# GIZMO (particle code): 1:1 copy the tipsy SPH particles into the GADGET
+	# type-0 HDF5 GIZMO reads (no interpolation), and write a GIZMO
+	# parameterfile from the gasoline .param. Snapshots land in $runname/output/.
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	dxP=$(get_param dxPeriod); dyP=$(get_param dyPeriod); dzP=$(get_param dzPeriod)
+	iOutInterval=$(get_param iOutInterval)
+	if [ -z "$iOutInterval" ]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	# Non-periodic IC (bPeriodic=0, e.g. isolated evrard): the .param has no
+	# dxPeriod. The box handling below keys on this, INDEPENDENT of gravity.
+	isperiodic=1; [ "$(get_param bPeriodic)" = "0" ] && isperiodic=0
+	# Binary/config from the TEST's declared RUNPHYSICS (not sniffed from the IC).
+	# The converter still auto-detects MHD (B aux) / gravity (bDoGravity) itself,
+	# so it agrees with this by construction and stays usable standalone.
+	isgrav=0
+	case "$RUNPHYSICS" in
+	    hydro) gizmo_base="GIZMO";      gizmo_cfg="Config_hydro.sh" ;;
+	    mhd)   gizmo_base="GIZMO_mhd";  gizmo_cfg="Config_mhd.sh" ;;
+	    grav)  gizmo_base="GIZMO_grav"; gizmo_cfg="Config_grav.sh"; isgrav=1
+		   # Isolated self-gravity binary (Config_grav.sh: no BOX_PERIODIC /
+		   # no SELFGRAVITY_OFF / +ADAPTIVE_GRAVSOFT_FORGAS); built on demand.
+		   if [ ! -x "$dir/$gizmo_base" ]; then
+			echo "Building isolated self-gravity GIZMO -> $gizmo_base (Config_grav.sh)"
+			( cd "$dir" && make clean EXEC="$gizmo_base" >/dev/null 2>&1 || true
+			  make -j8 CONFIG="$gizmo_cfg" EXEC="$gizmo_base" )
+			if [ ! -x "$dir/$gizmo_base" ]; then echo "Error: GIZMO_grav build failed (run codes/gizmo/build_gizmo.sh)."; exit 1; fi
+		   fi ;;
+	    *) echo "Error: GIZMO has no build for RUNPHYSICS=$RUNPHYSICS."; exit 1 ;;
+	esac
+	coderun_run="$gizmo_base"
+	boxopt=""
+	if [ "$isperiodic" = "0" ]; then
+	    # Non-periodic IC (isolated: evrard, ...): the gasoline .param has no
+	    # dxPeriod. The converter frames coords to the particle extent and writes
+	    # THAT BoxSize into both the IC HDF5 header and the parameterfile (read
+	    # back from the header), so DON'T force --boxsize and skip the BOX_LONG
+	    # aspect machinery (which needs BOX_PERIODIC). NB: the binary must also be
+	    # non-periodic — GIZMO_grav is (no BOX_PERIODIC); a non-periodic non-gravity
+	    # hydro test would need its own non-periodic Config (none in the suite yet).
+	    echo "Non-periodic run -> BoxSize derived from the particle extent."
+	else
+	    if [ -z "$dxP" ]; then echo "Error: missing dxPeriod in $paramfile"; exit 1; fi
+	    [ -z "$dyP" ] && dyP=$dxP; [ -z "$dzP" ] && dzP=$dxP
+	    boxopt="--boxsize $dxP"
+	    # GIZMO bakes the box aspect ratio in at COMPILE time via BOX_LONG_Y/BOX_LONG_Z
+	    # (= dyPeriod/dxPeriod, dzPeriod/dxPeriod; BoxSize=dxPeriod is the X side), like
+	    # AREPO's LONG_Y/LONG_Z. Cubic (both ~1): use the prebuilt base binary. Else
+	    # build (once, cached by aspect tag) <base>_asp<LY>_<LZ> from its base Config +
+	    # the BOX_LONG lines.
+	    LONGY=$(awk -v a="$dyP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+	    LONGZ=$(awk -v a="$dzP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+	    iscubic=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { d=0.0005; print (y>1-d && y<1+d && z>1-d && z<1+d)?1:0 }')
+	    if [ "$iscubic" != "1" ]; then
+		tag=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { printf "%.4f_%.4f", y, z }' | tr '.' 'p')
+		coderun_run="${gizmo_base}_asp${tag}"
+		if [ ! -x "$dir/$coderun_run" ]; then
+		    echo "Building GIZMO with BOX_LONG_Y=$LONGY BOX_LONG_Z=$LONGZ -> $coderun_run"
+		    cfg="$(basename "$gizmo_cfg" .sh)_asp${tag}.sh"
+		    cp "$dir/$gizmo_cfg" "$dir/$cfg"
+		    printf "\nBOX_LONG_Y=%s\nBOX_LONG_Z=%s\n" "$LONGY" "$LONGZ" >> "$dir/$cfg"
+		    # clean+build with EXEC override so this aspect build only removes/links
+		    # its OWN binary (the cubic base binaries survive).
+		    ( cd "$dir" && make clean EXEC="$coderun_run" >/dev/null 2>&1 || true
+		      make -j8 CONFIG="$cfg" EXEC="$coderun_run" )
+		    if [ ! -x "$dir/$coderun_run" ]; then echo "Error: GIZMO BOX_LONG build failed."; exit 1; fi
+		fi
+		echo "Non-cubic box [$dxP,$dyP,$dzP] -> using $coderun_run (BOX_LONG_Y=$LONGY BOX_LONG_Z=$LONGZ)"
+	    fi
+	fi
+	gizmoIC="datafiles/${ICfile}_gizmo.hdf5"
+	gizmoparam="$runname/gizmo.params"
+	mkdir -p "$runname/output"
+	# No --mhd/--grav: the converter auto-detects both from the IC (standalone).
+	convertcmd="python ${analysisdir}/ICconvert_tipsytogizmo.py datafiles/$ICfile.00000 $gizmoIC --param-out $gizmoparam --output-dir $runname/output/ $boxopt"
+	echo "$convertcmd"; eval "$convertcmd"
+	if [ $? -ne 0 ]; then echo "Error: GIZMO IC conversion failed."; exit 1; fi
+	runline=( $mpirun "$dir/${coderun_run}" "$gizmoparam" )
+    fi
+
+    if [ "$4" == 9 ]; then
+	# OpenGadget3 (Gadget-family TreeSPH/SPMHD particle code): 1:1 copy the tipsy
+	# SPH particles into the GADGET type-0 HDF5 it reads (no interpolation; same
+	# writer as GIZMO/AREPO), and write a GADGET-style parameterfile from the
+	# gasoline .param. Snapshots land in $runname/output/ as snap_NNN.hdf5.
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	iOutInterval=$(get_param iOutInterval)
+	if [ -z "$iOutInterval" ]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	# Binary/config from the TEST's declared RUNPHYSICS (not sniffed from the IC);
+	# the converter auto-detects MHD (B aux) / gravity (bDoGravity) itself (standalone).
+	case "$RUNPHYSICS" in
+	    hydro) og_base="OpenGadget3";      og_cfg="Config_hydro.sh" ;;
+	    mhd)   og_base="OpenGadget3_mhd";  og_cfg="Config_mhd.sh" ;;
+	    grav)  og_base="OpenGadget3_grav"; og_cfg="Config_grav.sh" ;;
+	    *) echo "Error: OpenGadget3 has no build for RUNPHYSICS=$RUNPHYSICS."; exit 1 ;;
+	esac
+	coderun_run="$og_base"
+	boxopt=""
+	if [ "$RUNPHYSICS" = grav ]; then
+	    # Isolated self-gravity (evrard, ...): the .param has no dxPeriod (bPeriodic=0).
+	    # Build the isolated OpenGadget3_grav (Config_grav.sh: no PERIODIC/NOGRAVITY +
+	    # ADAPTIVE_GRAVSOFT_FORGAS) on demand; no BoxSize/LONG_* aspect (open box). The
+	    # converter auto-detects gravity (bDoGravity) -> GravityConstantInternal=1 +
+	    # PeriodicBoundariesOn=0 (isolated).
+	    if [ ! -x "$dir/$coderun_run" ]; then
+		echo "Building isolated self-gravity OpenGadget3 -> $coderun_run (Config_grav.sh)"
+		( cd "$dir" && make clean EXEC="$coderun_run" >/dev/null 2>&1 || true
+		  make -j8 CONFIG="$og_cfg" EXEC="$coderun_run" )
+		if [ ! -x "$dir/$coderun_run" ]; then echo "Error: OpenGadget3_grav build failed (run codes/opengadget3/build_opengadget3.sh)."; exit 1; fi
+	    fi
+	else
+	    # Periodic hydro/MHD: BoxSize=dxPeriod; OpenGadget3 bakes the box aspect in at
+	    # COMPILE time via LONG_X/LONG_Y/LONG_Z (dimension_i = BoxSize*LONG_i), like
+	    # GIZMO's BOX_LONG_*. Cubic -> prebuilt base binary; else build (once, cached
+	    # by aspect tag) <base>_asp<LY>_<LZ>.
+	    dxP=$(get_param dxPeriod); dyP=$(get_param dyPeriod); dzP=$(get_param dzPeriod)
+	    if [ -z "$dxP" ]; then echo "Error: missing dxPeriod in $paramfile"; exit 1; fi
+	    [ -z "$dyP" ] && dyP=$dxP; [ -z "$dzP" ] && dzP=$dxP
+	    boxopt="--boxsize $dxP"
+	    LONGY=$(awk -v a="$dyP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+	    LONGZ=$(awk -v a="$dzP" -v b="$dxP" 'BEGIN { printf "%.10g", a/b }')
+	    iscubic=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { d=0.0005; print (y>1-d && y<1+d && z>1-d && z<1+d)?1:0 }')
+	    if [ "$iscubic" != "1" ]; then
+		tag=$(awk -v y="$LONGY" -v z="$LONGZ" 'BEGIN { printf "%.4f_%.4f", y, z }' | tr '.' 'p')
+		coderun_run="${og_base}_asp${tag}"
+		if [ ! -x "$dir/$coderun_run" ]; then
+		    echo "Building OpenGadget3 with LONG_Y=$LONGY LONG_Z=$LONGZ -> $coderun_run"
+		    cfg="$(basename "$og_cfg" .sh)_asp${tag}.sh"
+		    cp "$dir/$og_cfg" "$dir/$cfg"
+		    printf "\nLONG_X=1\nLONG_Y=%s\nLONG_Z=%s\n" "$LONGY" "$LONGZ" >> "$dir/$cfg"
+		    ( cd "$dir" && make clean EXEC="$coderun_run" >/dev/null 2>&1 || true
+		      make -j8 CONFIG="$cfg" EXEC="$coderun_run" )
+		    if [ ! -x "$dir/$coderun_run" ]; then echo "Error: OpenGadget3 LONG_* build failed."; exit 1; fi
+		fi
+		echo "Non-cubic box [$dxP,$dyP,$dzP] -> using $coderun_run (LONG_Y=$LONGY LONG_Z=$LONGZ)"
+	    fi
+	fi
+	ogIC="datafiles/${ICfile}_opengadget3.hdf5"
+	ogparam="$runname/opengadget3.params"
+	mkdir -p "$runname/output"
+	# No --mhd/--grav: the converter auto-detects MHD (B aux) + gravity (bDoGravity).
+	convertcmd="python ${analysisdir}/ICconvert_tipsytoopengadget3.py datafiles/$ICfile.00000 $ogIC --param-out $ogparam --output-dir $runname/output/ $boxopt"
+	echo "$convertcmd"; eval "$convertcmd"
+	if [ $? -ne 0 ]; then echo "Error: OpenGadget3 IC conversion failed."; exit 1; fi
+	runline=( $mpirun "$dir/${coderun_run}" "$ogparam" )
+    fi
+
+    if [ "$4" == 8 ]; then
+	# PKDGRAV3 (particle code): reads the tipsy IC natively (NO conversion) and
+	# writes tipsy snapshots. Just generate a .par from the gasoline .param,
+	# pointing achInFile at the tipsy IC and snapshots into $runname/.
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	dxP=$(get_param dxPeriod); iOutInterval=$(get_param iOutInterval)
+	if [[ -z "$dxP" || -z "$iOutInterval" ]]; then echo "Error: missing dxPeriod/iOutInterval in $paramfile"; exit 1; fi
+	pkdpar="$runname/run.par"
+	gencmd="python ${analysisdir}/IC_pkdgrav3_param.py datafiles/$ICfile.00000 $runname $pkdpar --boxsize $dxP"
+	echo "$gencmd"; eval "$gencmd"
+	if [ $? -ne 0 ]; then echo "Error: PKDGRAV3 .par generation failed."; exit 1; fi
+	runline=( $mpirun "$dir/${coderun}" "$pkdpar" )
+    fi
+
+    if [ "$4" == 6 ]; then
+	# PHANTOM (SPH particle code): 1:1 copy the tipsy SPH particles into a
+	# Phantom full-dump IC (no interpolation) + a .in run file. Phantom runs as
+	# `phantom <prefix>.in` and writes dumps <prefix>_NNNNN into the cwd, so run
+	# from inside $runname/.
+	# Need iOutInterval (snapshot stride) for the reverse converter below.
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	iOutInterval=$(get_param iOutInterval)
+	if [[ -z "$iOutInterval" ]]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	phantomprefix="$runname"
+	# Binary from the TEST's declared RUNPHYSICS (not sniffed). The hydro `phantom`
+	# binary silently ignores any magnetic block and evolves pure hydro; phantom_mhd
+	# is the MHD build; phantom_grav is the self-gravity build (SETUP=evrard:
+	# GRAVITY=yes, adiabatic, non-periodic). The converter auto-detects MHD (real B)
+	# and self-gravity (G_code=1 units when bDoGravity) from the IC, so it needs no
+	# physics flag.
+	case "$RUNPHYSICS" in
+	    hydro) coderun=phantom ;;
+	    mhd)   coderun=phantom_mhd ;;
+	    grav)  coderun=phantom_grav ;;
+	    *) echo "Error: PHANTOM has no build for RUNPHYSICS=$RUNPHYSICS."; exit 1 ;;
+	esac
+	# Build on demand (grav especially -- it's the newest variant). Phantom builds
+	# are serial/finicky, so delegate to the idempotent build script (skips the
+	# already-built phantom/phantom_mhd, builds only what's missing).
+	if [ ! -x "$dir/$coderun" ]; then
+	    echo "PHANTOM binary $coderun missing -> building via codes/phantom/build_phantom.sh"
+	    bash "$current_dir/codes/phantom/build_phantom.sh"
+	    if [ ! -x "$dir/$coderun" ]; then echo "Error: PHANTOM $coderun build failed (see codes/phantom/build_phantom.sh)."; exit 1; fi
+	fi
+	convertcmd="python ${analysisdir}/ICconvert_tipsytophantom.py datafiles/$ICfile.00000 $runname/$phantomprefix --in-out $runname/$phantomprefix.in"
+	echo "$convertcmd"; eval "$convertcmd"
+	if [ $? -ne 0 ]; then echo "Error: PHANTOM IC conversion failed."; exit 1; fi
+	# phantom reads/writes relative to its cwd -> launch from $runname/.
+	#
+	# Two-pass .in handshake: Phantom rejects our minimal .in, REWRITES a complete
+	# one for its compile options and aborts ("try again"). So: keep our values in
+	# .in.user, run pass 1 (expected non-zero -> '|| true'), re-assert our values
+	# onto Phantom's rewritten .in with phantom_patch_infile.py, then run pass 2 to
+	# actually evolve.
+	#
+	# SINGLE MPI RANK + OpenMP (mpirun -np 1, parallelism via OMP_NUM_THREADS).
+	# Phantom is built with MPI, but multi-rank MPI is broken on this Intel-MPI stack
+	# ("Fatal error in internal_Test: Invalid MPI_Request" once the run starts) -- the
+	# same upstream MPI breakage seen with AREPO/madvoro here. Single-rank + OpenMP
+	# evolves correctly and still parallelises across the node, so BOTH passes run
+	# -np 1. (Pass 1 must be single-rank anyway: under multi-rank MPI every rank calls
+	# MPI_Abort(666) on the incomplete .in *without* the master rewriting it, so the
+	# .in is never completed and pass 2 aborts on the same 4-entry file.)
+	#
+	# Pass 1 rewrites the incomplete .in and aborts ("try again" -> '|| true'); the
+	# patch re-asserts our values onto Phantom's rewritten .in; pass 2 evolves.
+	#
+	# env -u GFORTRAN_CONVERT_UNIT: the global big_endian (set for SPLASH/tipsy)
+	# would make Phantom misread our native-endian dumps as 'wrong endian'. Phantom
+	# dumps are native-endian, so strip the override for these launches only.
+	#
+	# OMP_STACKSIZE: Phantom's kdtree neighbour cache lives on the OpenMP thread
+	# stack; the default size overflows and SEGVs in getneigh on the first density
+	# iteration. 512M is the value Phantom's own docs recommend.
+	export OMP_STACKSIZE="${OMP_STACKSIZE:-512M}"
+	export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
+	patchscript="$current_dir/setupfiles/phantom_patch_infile.py"
+	runline=( bash -c "cd $runname \
+	    && cp $phantomprefix.in $phantomprefix.in.user \
+	    && { env -u GFORTRAN_CONVERT_UNIT mpirun -np 1 $dir/${coderun} $phantomprefix.in || true; } \
+	    && python $patchscript $phantomprefix.in --from $phantomprefix.in.user \
+	    && env -u GFORTRAN_CONVERT_UNIT mpirun -np 1 $dir/${coderun} $phantomprefix.in" )
+    fi
+
+    if [ "$4" == 4 ]; then
+	# RAMSES (grid AMR code): no file-based hydro IC — deposit the SPH IC onto
+	# a fine uniform GridIC (sph_interp petkova) + generate run.nml; the PATCHED
+	# condinit (codes/ramses/patches/suite, condinit_kind='gridic') reads it.
+	# First cut (codes/GRID_CODES_PLAN.md): CUBIC boxes only (the converter
+	# fails loudly on slabs), no self-gravity. MHD supported: a genuinely
+	# nonzero BField aux routes to ramses3d_mhd (suite_mhd gridic condinit)
+	# and the converter writes the hlld MHD namelist + face-B GridIC.
+	# Serial binary; parallelism not needed at test sizes.
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	iOutInterval=$(get_param iOutInterval)
+	if [[ -z "$iOutInterval" ]]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	# GridIC resolution: the BASE level matches the SPH per-axis resolution,
+	# npx = 2**levelmin = Nres — so Nres must be a power of two.
+	Nres=$2
+	lmax=$(awk -v n="$Nres" 'BEGIN { l=int(log(n)/log(2)+0.5); print ((2^l==n)?l:-1) }')
+	if [ "$lmax" == "-1" ]; then echo "Error: RAMSES needs Nres = a power of 2 (got $Nres)."; exit 1; fi
+	# MHD binary from the TEST's declared RUNPHYSICS. The converter independently
+	# auto-detects the same nonzero B (_has_nonzero_b) to write the MHD namelist +
+	# face-B GridIC, so binary and namelist always agree; hydro tests (sedov) stay
+	# on ramses3d.
+	if [ "$RUNPHYSICS" = mhd ]; then
+	    coderun=ramses3d_mhd
+	    echo "MHD test -> $coderun (hlld, gridic face-B)"
+	fi
+	# RAMSESICMODE selects the grid mode; BOTH keep the base level at the SPH
+	# per-axis resolution (2**levelmin = Nres) so coarse regions have the SAME
+	# element count as the SPH run:
+	#   amr (default): quasi-Lagrangian (mass-based m_refine/mass_sph)
+	#        refinement adds RAMSESAMRLEVELS (default 2) levels ABOVE the SPH
+	#        IC resolution, mimicking SPH's Lagrangian adaptivity where mass
+	#        concentrates — the SPH-comparable mode.
+	#   uniform: levelmin=levelmax=log2(Nres) — one matched Nres^3 grid
+	#        (fixed-resolution baseline).
+	if [ "${RAMSESICMODE:-amr}" == "amr" ]; then
+	    ramseslevels="--levelmin $lmax --levelmax $((lmax + ${RAMSESAMRLEVELS:-2})) --grid amr"
+	else
+	    ramseslevels="--levelmax $lmax --grid uniform"
+	fi
+	# Everything RAMSES-native (ic_gridic.bin, run.nml, output_NNNNN dirs) lives
+	# under $runname/output/ — the analysis globs the run-dir ROOT for anything
+	# ending in 5 digits, so the output_NNNNN directories must not sit there
+	# (same layout as the GIZMO/Phantom blocks).
+	mkdir -p "$runname/output"
+	# Parallel by default like the other codes: RAMSESNP defaults to $(nproc).
+	# Resolved BEFORE the conversion so the namelist's per-rank ngridmax is
+	# scaled to the rank count; RAMSESNP=1 forces the serial binary.
+	RAMSESNP="${RAMSESNP:-$(nproc)}"
+	convertcmd="python ${analysisdir}/ICconvert_tipsytoramses.py datafiles/$ICfile.00000 $runname/output $ramseslevels --np $RAMSESNP"
+	echo "$convertcmd"; eval "$convertcmd"
+	if [ $? -ne 0 ]; then echo "Error: RAMSES IC conversion failed."; exit 1; fi
+	# RAMSES writes output_NNNNN into its cwd -> run from $runname/output/. The
+	# '[gridic] loaded' line in the log is the sanity check that the PATCHED
+	# condinit (not the stock region IC) initialised the run.
+	# env -u GFORTRAN_CONVERT_UNIT: the global big_endian (for SPLASH/tipsy)
+	# byte-swaps ALL gfortran unformatted I/O — RAMSES would misread the
+	# little-endian GridIC ("bad magic") and write byte-swapped outputs. Strip
+	# it here AND for the reverse converter below (amr2cell is gfortran too),
+	# exactly like the Phantom launch.
+	# RAMSESNP (resolved above, default nproc) > 1 selects the MPI twin
+	# (built when mpif90 exists) under mpirun; a missing twin falls back to
+	# serial with a warning (serial 64^3 MHD was ~32 min, 4 ranks ~4x faster).
+	ramseslaunch="$dir/${coderun}"
+	if [ "$RAMSESNP" -gt 1 ]; then
+	    if [ -x "$dir/${coderun}_mpi" ]; then
+		ramseslaunch="mpirun -np $RAMSESNP $dir/${coderun}_mpi"
+	    else
+		echo "WARNING: $dir/${coderun}_mpi missing (rerun build_ramses.sh with mpif90 on PATH) — falling back to serial ${coderun}."
+	    fi
+	fi
+	runline=( bash -c "cd $runname/output && env -u GFORTRAN_CONVERT_UNIT $ramseslaunch run.nml" )
+    fi
+
+    if [ "$4" == 7 ]; then
+	# Athena++ (grid, UNIFORM mesh) — same GridIC layer as RAMSES:
+	# tipsy -> ic_gridic.bin (petkova; 6 solenoidal face-B components when B
+	# is genuinely nonzero) + athinput -> the from_gridic problem generator.
+	# NON-CUBIC (slab) boxes supported: the converter scales the per-axis
+	# cell counts by the box aspect (kh + the 2D orzag slabs run here even
+	# though RAMSES's 2^levelmin cube can't). MPI by default (ATHENANP ranks,
+	# default nproc; built against the local parallel HDF5 — see
+	# codes/athena++/build_athena.sh), capped at the meshblock count the
+	# converter prints (ranks > meshblocks aborts Athena++; meshblock sizes
+	# are divisors of each axis' cell count, so no power-of-2 Nres needed).
+	paramfile="datafiles/$ICfile.param"
+	get_param () { awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { gsub(/[[:space:]]*/,"",$2); print $2 }' "$paramfile"; }
+	iOutInterval=$(get_param iOutInterval)
+	if [[ -z "$iOutInterval" ]]; then echo "Error: missing iOutInterval in $paramfile"; exit 1; fi
+	# npx = Nres = the SPH per-axis X resolution; other axes follow the aspect
+	Nres=$2
+	# MHD binary from the TEST's declared RUNPHYSICS; the converter independently
+	# auto-detects the same nonzero B for the CT face-B GridIC (they always agree).
+	if [ "$RUNPHYSICS" = mhd ]; then
+	    coderun=athena_mhd
+	    echo "MHD test -> $coderun (CT, gridic face-B)"
+	fi
+	ATHENANP="${ATHENANP:-$(nproc)}"
+	mkdir -p "$runname/output"
+	convertcmd="python ${analysisdir}/ICconvert_tipsytoathena.py datafiles/$ICfile.00000 $runname/output --npx $Nres --np $ATHENANP"
+	echo "$convertcmd"
+	convout=$(eval "$convertcmd") || { echo "Error: Athena++ IC conversion failed."; exit 1; }
+	echo "$convout"
+	# cap ranks at the meshblock count (blocks are >= 8 cells/axis, so small
+	# grids can have fewer blocks than cores; ranks > blocks aborts Athena++)
+	nblocks=$(echo "$convout" | awk -F= '/^meshblocks=/{print $2}')
+	if [ -n "$nblocks" ] && [ "$ATHENANP" -gt "$nblocks" ]; then
+	    echo "ATHENANP=$ATHENANP > $nblocks meshblocks -> using -np $nblocks"
+	    ATHENANP=$nblocks
+	fi
+	# Athena++ writes its outputs into cwd -> run from $runname/output/ (the
+	# analysis globs the run-dir ROOT, same layout rule as RAMSES/GIZMO).
+	# '[from_gridic] loaded' in the log = the suite pgen initialised the run.
+	runline=( bash -c "cd $runname/output && mpirun -np $ATHENANP $dir/${coderun} -i athinput.gridic" )
     fi
     echo "${runline[@]}"
     "${runline[@]}"
@@ -1192,6 +1787,55 @@ mkdir initruns
 	# tipsy .param so the per-axis periods (non-cubic box) centre the snapshots
 	# correctly and land in the .log.
 	python $current_dir/setupfiles/ICconvert_arepototipsy.py $runname $runname $iOutInterval datafiles/$ICfile.param
+    fi
+
+    if [ "$4" == 4 ]; then
+	# convert RAMSES output_NNNNN (in the run dir) back into tipsy snapshots:
+	# the shipped amr2cell dumps one ASCII row per LEAF cell (all hydro vars in
+	# one pass) -> cells_to_tipsy (one gas particle per cell, AMR structure
+	# preserved) + gasoline-style .log with the dTuFac stamp. env -u: amr2cell
+	# (gfortran) must read RAMSES's native-LE outputs — see the runline note.
+	env -u GFORTRAN_CONVERT_UNIT python $current_dir/setupfiles/ICconvert_ramsestotipsy.py $runname/output $runname $iOutInterval datafiles/$ICfile.param --amr2cell $RAMSES_DIR/../utils/f90/amr2cell
+    fi
+
+    if [ "$4" == 7 ]; then
+	# convert Athena++ gridic.out2.NNNNN.athdf (in the run dir) back into
+	# tipsy snapshots: one gas particle per cell via cells_to_tipsy, MHD Bcc
+	# -> BField aux, .log with the dTuFac stamp.
+	python $current_dir/setupfiles/ICconvert_athenatotipsy.py $runname/output $runname $iOutInterval datafiles/$ICfile.param
+    fi
+
+    if [ "$4" == 5 ]; then
+	# convert GIZMO snapshot_*.hdf5 output back into tipsy snapshots (same GADGET
+	# layout as AREPO; reuses that field mapping). Pass the tipsy .param for box
+	# centring.
+	python $current_dir/setupfiles/ICconvert_gizmototipsy.py $runname $runname $iOutInterval datafiles/$ICfile.param
+    fi
+
+    if [ "$4" == 9 ]; then
+	# convert OpenGadget3 snap_*.hdf5 output back into tipsy snapshots (same GADGET
+	# layout as AREPO/GIZMO; reuses that field mapping). Pass the tipsy .param for
+	# box centring + dTuFac.
+	python $current_dir/setupfiles/ICconvert_opengadget3totipsy.py $runname $runname $iOutInterval datafiles/$ICfile.param
+    fi
+
+    if [ "$4" == 8 ]; then
+	# PKDGRAV3 snapshots are already tipsy (<runname>/<runname>.<NNNNN>); just
+	# write the gasoline-style .log (box params) the analysis framework needs.
+	python $current_dir/setupfiles/ICconvert_pkdgrav3totipsy.py $runname $runname $iOutInterval datafiles/$ICfile.param
+    fi
+
+    if [ "$4" == 6 ]; then
+	# Move Phantom's native dumps (<runname>_NNNNN, underscore) into <runname>/output/
+	# BEFORE reverse conversion: the analysis globs the run-dir root for tipsy
+	# snapshots (<runname>.NNNNN, dot) and gets confused by the underscore dumps +
+	# .ev/.in sitting beside them. The reverse converter then reads from output/.
+	mkdir -p $runname/output
+	mv $runname/${phantomprefix}_[0-9][0-9][0-9][0-9][0-9] $runname/output/ 2>/dev/null || true
+	# convert Phantom dumps (<runname>/output/<runname>_NNNNN) back into tipsy
+	# snapshots (read via Phantom's own readPhantomDump; rho reconstructed from h,
+	# B + dTuFac stamped). Pass the .param for box centring + dTuFac.
+	python $current_dir/setupfiles/ICconvert_phantomtotipsy.py $runname/output/$runname $runname $iOutInterval datafiles/$ICfile.param
     fi
 
 ## Reference (regression baseline): -r saves the analysis result of this run as

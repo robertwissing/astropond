@@ -31,13 +31,16 @@ capture is actually called; AMRTable.load needs nothing but numpy/numba).
 import os
 import re
 import sys
+import warnings
 
 import numpy as np
 
 from .amrtable import AMRTable          # re-exported (moved out of this module)
 from .density import TableDensity
-from .envelope import (_fill_empty, _pad_periodic_box, _with_values,
-                       edge_floor_spacing, frame_open_box, table_cells)
+from .envelope import (NL0_DEFAULT, _fill_empty, _pad_periodic_box,
+                       _with_values, check_scaffold_resolvability,
+                       edge_floor_spacing, frame_open_box, resolve_bg_k,
+                       solve_tail_reach, table_cells)
 from .kernels import W0, wzero_wc2
 from .neighbors import NeighborList
 from .sph_core import density_loop
@@ -433,13 +436,14 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          method='petkova', base_npx=None, max_level=16,
                          part_per_cell=8, relax_kw=None, seed=0, progress=None,
                          amr_cap=None, pad_frac=0.1, cascade=True,
-                         bg_c=None, bg_k=2.0, bg_tail=False, kernel_match=True,
+                         bg_c=None, bg_k=None, kernel_match=True,
                          contour_refine=True, contour_band=8.0,
                          contour_beta=0.5, target_interp='vertex',
                          grade=True, shell_start='local', decay_cells=2.0,
                          scaffold='exp', alpha=None, decay_spacing=None,
-                         decay_local=False, bg_mode='lattice',
-                         flat_floor=False, tail_reach=6.0,
+                         decay_local=False,
+                         flat_floor=False, tail_reach=None,
+                         n_frame=None, nl0=None,
                          km_hmode='particle', km_hscale=1.0, verbose=False):
     """The `glassresample --op reconstruct` engine - a THIN WRAPPER around
     the glassgen table builder (decided 2026-07-10): capture the input gas
@@ -455,13 +459,13 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                         onto the survivors (the glass has no history to inherit).
       cascade         : False -> single full-res relax of the placed ensemble
                         (the --no-progressive fallback), same envelope + cull.
-      bg_c, bg_k      : envelope knobs (rho_edge cut count; rho_floor=re/k**3).
-      scaffold, alpha : 'exp' (M12 taper + lattice) or 'cubic' (2026-07-13
-                        resolvability scaffold, lattice retired; alpha =
-                        the shared cascade constant, default 2.0).
-      bg_tail         : backed-tail experiment (2026-07-11): background over
-                        the whole frame down to rho_frame, frame cap grows
-                        ~k on capped axes (envelope.build_table_envelope).
+      bg_c, bg_k      : envelope knobs (rho_edge cut count; two-rung ladder
+                        rho_frame = rho_edge/k**6). The background is always
+                        sampled backing (mass-contract closure; the lattice
+                        and bg_tail were retired 2026-07-16, CLEANUP_PLAN C1).
+      scaffold, alpha : 'exp' (M12/M18 profile) or 'cubic' (2026-07-13
+                        resolvability scaffold, FALSIFIED - kept for the
+                        record; alpha = the shared cascade constant, 2.0).
       contour_refine  : M10 contour-resolving capture (default ON): refine
                         cells straddling the rho_edge(count) band so the
                         flat occupancy verdict is not cell-quantized
@@ -525,14 +529,14 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     t0 = _time.perf_counter()
     res = build_from_table(table, count, box=box, gas_mass=M_gas,
                            nsmooth=nsmooth, bg_c=bg_c, bg_k=bg_k,
-                           bg_tail=bg_tail,
                            envelope='on', cascade=cascade, seed=seed,
                            open_pad=pad_frac, kernel_match=kernel_match,
                            shell_start=shell_start, decay_cells=decay_cells,
                            scaffold=scaffold, alpha=alpha,
                            decay_spacing=decay_spacing,
-                           decay_local=decay_local, bg_mode=bg_mode,
+                           decay_local=decay_local,
                            flat_floor=flat_floor, tail_reach=tail_reach,
+                           n_frame=n_frame, nl0=nl0,
                            km_hmode=km_hmode, km_hscale=km_hscale,
                            filler_field_hook=_hook, verbose=verbose, **rkw)
     timings['build'] = _time.perf_counter() - t0
@@ -543,7 +547,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     is_filler = np.zeros(len(pos_f), dtype=bool)
     a.update({k: v for k, v in res.table_build.items()
               if k in ('rho_edge', 'rho_frame', 'delta_bg', 'm',
-                       'n_bg_tail', 'scaffold', 'alpha')},
+                       'scaffold', 'alpha')},
              relax_iters=int(res.niter), relax_stop=str(res.stop_reason),
              timings=timings,
              levels=[dict(name=lv.get('name'), n=lv.get('n'),
@@ -571,10 +575,10 @@ def gather_fields(qpos, src_pos, src_mass, src_rho, fields, box=None,
         box = np.asarray(box, dtype=np.float64)
         lo = np.minimum(qpos.min(0), src_pos.min(0))
         tree = cKDTree(np.mod(src_pos - lo, box), boxsize=box)
-        dist, nn = tree.query(np.mod(qpos - lo, box), k=k)
+        dist, nn = tree.query(np.mod(qpos - lo, box), k=k, workers=-1)
     else:
         tree = cKDTree(src_pos)
-        dist, nn = tree.query(qpos, k=k)
+        dist, nn = tree.query(qpos, k=k, workers=-1)
     if k == 1:
         dist, nn = dist[:, None], nn[:, None]
     H = dist[:, -1:]
@@ -649,10 +653,11 @@ def _grid_rho(res, volumes, method):
     return np.asarray(res.data['rho'], dtype=np.float64)
 
 
-def apply_count_overlay(table, count, c=64, k=2.0, decay_cells=2.0,
+def apply_count_overlay(table, count, c=64, k=None, decay_cells=2.0,
                         shell_start='local', scaffold='exp', alpha=None,
                         decay_spacing=None, decay_local=False,
-                        flat_floor=False, tail_reach=6.0):
+                        flat_floor=False, tail_reach=None,
+                        n_frame=None, nl0=None):
     """The N-aware envelope fill on a captured table: returns
     ``(filled_table, info)`` - a NEW table (the input is untouched). Uses the
     SAME rho_edge scheme as the glassgen builder
@@ -673,9 +678,8 @@ def apply_count_overlay(table, count, c=64, k=2.0, decay_cells=2.0,
     lambda in OUTPUT-spacing units (``lambda = eta*(m/rho_edge)**(1/3)``,
     N-invariant reach, overrides ``decay_cells``); ``decay_local``
     evaluates it at the launch cell's own density (floored at rho_edge,
-    the M16 skirt). ``bg_mode='sample'`` has no table-side effect (it
-    changes the builder's background PARTICLES, not the density target),
-    so it has no counterpart here.
+    the M16 skirt). The builder's background (sampled backing) changes
+    PARTICLES, not the density target, so it has no counterpart here.
 
     ``flat_floor=False`` (+ ``tail_reach`` steepness, plan M18 2026-07-14)
     retires the flat rho_floor shelf: the 'decay' fill becomes ONE
@@ -689,29 +693,43 @@ def apply_count_overlay(table, count, c=64, k=2.0, decay_cells=2.0,
     vals = np.asarray(vals, dtype=np.float64)
     vols = sizes.prod(1)
     m = float((vals * vols).sum()) / int(count)
+    # M20: k from n_frame unless legacy-explicit (lockstep with
+    # build_table_envelope - same resolve, same solve below)
+    k = resolve_bg_k(k, n_frame, nsmooth=c)
     re, delta_bg = edge_floor_spacing(vals, vols, m, c=c, k=k)
     fbox = table.box if getattr(table, 'periodic', False) is True \
         or (hasattr(table, 'periodic') and bool(np.ravel(table.periodic)[0])) \
         else None
-    # frame extent for the M6 tail scale, sized as the builder does (M2 rule;
-    # taper reach from the gas-edge cell size, nsmooth ~ c)
+    # frame extent for the M6 tail scale, sized as the builder does (M2 rule,
+    # nsmooth ~ c). taper_len retired 2026-07-16 (CLEANUP_PLAN C1a) - it must
+    # stay in lockstep with build_table_envelope or the rendered target and
+    # the relaxed target disagree on tail_scale.
     if fbox is None:
-        cell_edge = np.cbrt(vols[(vals >= re) & (vals <= 10.0 * re)])
-        if cell_edge.size == 0:
-            cell_edge = np.cbrt(vols[vals >= re])
-        cell0 = float(np.median(cell_edge)) if cell_edge.size else 0.0
-        lam0 = (decay_spacing * (m / re) ** (1.0 / 3.0)
-                if decay_spacing is not None else decay_cells * cell0)
-        taper_len = lam0 * 3.0 * max(
-            np.log(max(k, 1.0 + 1e-9)), 0.1) + cell0
         dom_lo = (centres - 0.5 * sizes).min(0)
         dom_hi = (centres + 0.5 * sizes).max(0)
-        frame_extent, _ = frame_open_box(dom_lo - taper_len,
-                                         dom_hi + taper_len, delta_bg,
-                                         nsmooth=c, taper_len=taper_len, k=k)
+        frame_extent, _ = frame_open_box(dom_lo, dom_hi, delta_bg,
+                                         nsmooth=c, k=k)
     else:
         frame_extent = np.asarray(fbox, dtype=np.float64).reshape(3)
     rho_frame = re / k ** 6               # two-rung ladder: rho_edge -> rho_frame
+    # M20: solve tail_reach from nl0 (or take the legacy explicit value) -
+    # MUST stay in lockstep with build_table_envelope or the rendered
+    # target and the relaxed target disagree on the profile.
+    nl0_eff = p_eff = None
+    tail_scale = 0.5 * float(np.max(frame_extent))
+    if flat_floor:
+        tail_reach = 6.0 if tail_reach is None else float(tail_reach)
+    else:
+        spacing_edge = (m / re) ** (1.0 / 3.0)
+        if tail_reach is None:
+            tail_reach = solve_tail_reach(
+                tail_scale, spacing_edge,
+                NL0_DEFAULT if nl0 is None else float(nl0), k, nsmooth=c)
+        elif nl0 is not None:
+            warnings.warn('explicit tail_reach overrides nl0 (legacy path)')
+        if scaffold == 'exp':
+            nl0_eff, p_eff = check_scaffold_resolvability(
+                tail_scale, spacing_edge, tail_reach, k, nsmooth=c)
     if shell_start not in ('edge', 'local'):
         raise ValueError(f"unknown shell_start {shell_start!r} "
                          "(use 'edge' or 'local')")
@@ -747,7 +765,7 @@ def apply_count_overlay(table, count, c=64, k=2.0, decay_cells=2.0,
                              sizes=fill_sizes, decay_cells=fill_dc,
                              floor=re,
                              cap=(re if shell_start == 'edge' else None),
-                             tail_scale=0.5 * float(np.max(frame_extent)),
+                             tail_scale=tail_scale,
                              tail_floor=rho_frame,
                              flat_floor=flat_floor,
                              tail_reach=tail_reach)
@@ -755,8 +773,11 @@ def apply_count_overlay(table, count, c=64, k=2.0, decay_cells=2.0,
     occ = float((vals >= re).mean())
     info = dict(m=m, rho_edge=re, rho_frame=rho_frame,
                 delta_bg=delta_bg, occ_frac=occ, scaffold=scaffold,
-                flat_floor=flat_floor, tail_reach=tail_reach,
+                flat_floor=flat_floor, tail_reach=tail_reach, bg_k=k,
                 n_emptied=n_emptied, n_cells=len(vals))
+    if nl0_eff is not None:               # M20: launch N_L + exponent
+        info['nl0'] = nl0_eff
+        info['profile_p'] = p_eff
     return _with_values(table, filled), info
 
 
@@ -855,10 +876,11 @@ def main(argv=None):
     ap.add_argument('--count', type=int, default=None,
                     help='target gas particle count N for the envelope-filled '
                          'table (m=M_gas/N -> rho_edge from the cumulative '
-                         'faint tail at bg-c*m, cells below '
-                         'rho_floor=rho_edge/bg-k**3 emptied + decay-tapered). '
-                         'Default: the snapshot gas count; required with '
-                         '--table unless --raw-only')
+                         'faint tail at bg-c*m; cells below rho_edge refilled '
+                         'with the strictly-decreasing rho_edge->rho_frame '
+                         'profile, rho_frame=rho_edge/bg-k**6). Default: the '
+                         'snapshot gas count; required with --table unless '
+                         '--raw-only')
     ap.add_argument('--raw-only', dest='raw_only', action='store_true',
                     help='write only the raw table + render (no envelope pair)')
     ap.add_argument('--no-contour-refine', dest='contour_refine',
@@ -882,19 +904,32 @@ def main(argv=None):
                          '(DEFAULT since 2026-07-13)')
     ap.add_argument('--no-grade', dest='grade', action='store_false',
                     help='ungraded capture (pre-M11 leaf set)')
-    ap.add_argument('--bg-c', dest='bg_c', type=int, default=0,
-                    help='envelope: particles per resolved kernel for rho_edge '
-                         '(0 = use --nsmooth/-s)')
-    ap.add_argument('--bg-k', dest='bg_k', type=float, default=2.0,
-                    help='envelope: background coarseness; rho_floor = '
-                         'rho_edge/k**3 (default 2.0)')
+    ap.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+                    help='envelope: resolvability contour count (INTEGRAL: '
+                         'rho_edge = where the cumulative faint-end mass '
+                         'first exceeds nedge*m - the whole discarded tail '
+                         'in particle masses, NOT a per-kernel count; 0 = '
+                         'use --nsmooth/-s). --bg-c is a legacy alias')
+    ap.add_argument('--nframe', dest='n_frame', type=float, default=None,
+                    help='M20: floor backability - expected particles per '
+                         'edge kernel at the profile floor (rho_frame = '
+                         'rho_edge*nframe/nsmooth, k=(nsmooth/nframe)^(1/6); '
+                         'default 16 ~ k1.26). Exclusive with legacy --bg-k')
+    ap.add_argument('--nl0', dest='nl0', type=float, default=None,
+                    help='M20: scaffold launch resolvability N_L(0) - the '
+                         'near-gas e-fold length in kernel supports; '
+                         'tail_reach is solved per build (default 1.35; '
+                         'avoid ~1, the metastable resonance band)')
+    ap.add_argument('--bg-k', dest='bg_k', type=float, default=None,
+                    help='LEGACY: backing coarseness k directly (rho_frame '
+                         '= rho_edge/k**6); bypasses --nframe')
     ap.add_argument('--shell-start', dest='shell_start', default='local',
                     choices=('edge', 'local'),
-                    help="vacuum-taper start: 'local' (default) = the "
-                         "nearest occupied cell's own value (local edge "
-                         "continuation - the exterior pressure-support "
-                         "scaffold); 'edge' = capped at the global rho_edge "
-                         "(the pre-M12 scheme)")
+                    help="LEGACY (shapes only the --floor-shelf fill; inert "
+                         "on the default no-floor profile). vacuum-taper "
+                         "start: 'local' (default) = the nearest occupied "
+                         "cell's own value; 'edge' = capped at the global "
+                         "rho_edge (the pre-M12 scheme)")
     ap.add_argument('--scaffold', default='exp', choices=('exp', 'cubic'),
                     help="vacuum scaffold: 'exp' (default) or 'cubic' "
                          "(resolvability profile; --bg-k/--shell-start "
@@ -904,19 +939,21 @@ def main(argv=None):
                          '(default 2.0)')
     ap.add_argument('--decay-cells', dest='decay_cells', type=float,
                     default=2.0,
-                    help="vacuum-taper reach in units of the empty cell's own "
-                         'width (lambda = decay_cells x cell width; default '
-                         '2.0). Capture-cell based, so N-dependent - prefer '
-                         '--decay-spacing for a resolution-invariant reach')
+                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
+                         "default no-floor profile). vacuum-taper reach in "
+                         "units of the empty cell's own width (lambda = "
+                         'decay_cells x cell width; default 2.0)')
     ap.add_argument('--decay-spacing', dest='decay_spacing', type=float,
                     default=None, metavar='ETA',
-                    help='vacuum-taper reach ETA in OUTPUT-spacing units '
-                         '(lambda = ETA*(m/rho_edge)**(1/3), N-invariant; '
-                         'overrides --decay-cells). eta~5 =~ 2 kernel supports')
+                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
+                         'default no-floor profile). vacuum-taper reach ETA '
+                         'in OUTPUT-spacing units (lambda = '
+                         'ETA*(m/rho_edge)**(1/3); overrides --decay-cells)')
     ap.add_argument('--decay-local', dest='decay_local', action='store_true',
-                    help="evaluate the ETA taper at the launch cell's own "
-                         'density (floored at rho_edge, the M16 skirt); '
-                         'requires --decay-spacing')
+                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
+                         "default no-floor profile). evaluate the ETA taper "
+                         "at the launch cell's own density (floored at "
+                         'rho_edge, the M16 skirt); requires --decay-spacing')
     ap.add_argument('--no-floor-shelf', dest='flat_floor',
                     action='store_false', default=False,
                     help='retire the flat rho_floor shelf (plan M18 - now the '
@@ -931,11 +968,11 @@ def main(argv=None):
                          '(pre-M18). NB the two-rung floor=rho_edge trigger '
                          'makes this path untested - diagnostics only')
     ap.add_argument('--tail-reach', dest='tail_reach', type=float,
-                    default=6.0, metavar='S',
-                    help='steepness knob for --no-floor-shelf: r_scale = '
-                         'tail_scale/S (larger S = steeper near the gas, '
-                         'shallower far out; default 6.0). Ignored with the '
-                         'shelf on')
+                    default=None, metavar='S',
+                    help='LEGACY: explicit no-floor profile steepness TR '
+                         '(r_scale = tail_scale/S; bypasses the --nl0 '
+                         'solve). Default: solved from --nl0. Ignored with '
+                         'the shelf on')
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument('--param', help='gasoline .param file for the box')
     grp.add_argument('--box', nargs=3, type=float,
@@ -1000,11 +1037,12 @@ def main(argv=None):
         shell_start=args.shell_start, scaffold=args.scaffold,
         alpha=args.alpha, decay_cells=args.decay_cells,
         decay_spacing=args.decay_spacing, decay_local=args.decay_local,
-        flat_floor=args.flat_floor, tail_reach=args.tail_reach)
+        flat_floor=args.flat_floor, tail_reach=args.tail_reach,
+        n_frame=args.n_frame, nl0=args.nl0)
     floor_mode = ('floor-shelf' if info['flat_floor']
                   else f'no-floor-shelf(reach={info["tail_reach"]:g})')
     print(f'count={args.count}: m={info["m"]:.3e} '
-          f'rho_edge={info["rho_edge"]:.3e} rho_floor={info["rho_floor"]:.3e} '
+          f'rho_edge={info["rho_edge"]:.3e} rho_frame={info["rho_frame"]:.3e} '
           f'delta_bg={info["delta_bg"]:.3g} occ(cells>=rho_edge)='
           f'{info["occ_frac"]:.3f} emptied {info["n_emptied"]}/'
           f'{info["n_cells"]} cells ({info["scaffold"]} scaffold, {floor_mode})',

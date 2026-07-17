@@ -30,8 +30,8 @@ import os
 import re
 import sys
 from collections import namedtuple
-from telegram_notify import TelegramNotifier
-tg = TelegramNotifier()
+from telegram_notify import make_notifier
+tg = make_notifier()  # no-op stub if TELEGRAM_BOT_TOKEN is unset
 import numpy as np
 
 from IC_analysis_general import (

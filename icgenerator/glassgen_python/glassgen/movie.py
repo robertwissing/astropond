@@ -32,8 +32,13 @@ class RelaxMovie:
                  finish() unless keep_frames.
     max_points : per-frame scatter budget; larger ensembles are stride-
                  subsampled (deterministic, no flicker).
-    clim       : colour range in DECADES of rho/rho0 (symmetric, so white =
-                 relaxed, red = overpressure, blue = underdensity).
+    clim       : colour range in DECADES of rho/rho0 (symmetric about 0).
+    cmap       : matplotlib colormap for log10(rho/rho0). Default 'turbo'
+                 (rainbow: blue = underdense, green = relaxed, red = over-
+                 pressure). 'coolwarm' is the old diverging render, whose
+                 midpoint reads WHITE = relaxed - on a rainbow the converged
+                 state is mid-spectrum instead, so judge convergence by the
+                 colourbar, not by "washes out".
     fps        : movie frame rate.
     lim        : ((xlo,xhi),(ylo,yhi),(zlo,zhi)) axis limits; None = frozen
                  from the first frame's extent (all frames share axes so the
@@ -43,7 +48,7 @@ class RelaxMovie:
     """
 
     def __init__(self, path, max_points=60000, clim=2.0, fps=14, lim=None,
-                 dpi=110, every=1, keep_frames=False):
+                 dpi=110, every=1, keep_frames=False, cmap='turbo'):
         base, ext = os.path.splitext(path)
         self.path = path if ext else path + '.mp4'
         self.framedir = base + '.frames'
@@ -53,6 +58,7 @@ class RelaxMovie:
                 os.unlink(os.path.join(self.framedir, f))
         self.max_points = int(max_points)
         self.clim = float(clim)
+        self.cmap = str(cmap)
         self.fps = int(fps)
         self.lim = lim
         self.dpi = int(dpi)
@@ -92,7 +98,7 @@ class RelaxMovie:
         for ax, (i, j), name in ((axs[0], (0, 1), 'x-y'),
                                  (axs[1], (0, 2), 'x-z')):
             sc = ax.scatter(p[:, i], p[:, j], c=c, s=0.7, linewidths=0,
-                            cmap='coolwarm', vmin=-self.clim, vmax=self.clim,
+                            cmap=self.cmap, vmin=-self.clim, vmax=self.clim,
                             rasterized=True)
             ax.set_xlim(*self.lim[i])
             ax.set_ylim(*self.lim[j])

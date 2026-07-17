@@ -1,6 +1,8 @@
 
 ## Setup for MHDCOLLAPSE
 import numpy as np
+if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
+    np.trapz = np.trapezoid
 import IC_distribute as distribute
 import IC_fixdens as fixdens
 import IC_smoothlength as smth

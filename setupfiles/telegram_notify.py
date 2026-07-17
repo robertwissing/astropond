@@ -251,6 +251,29 @@ class TelegramNotifier:
                 f[1].close()
 
 
+class _NullNotifier:
+    """No-op stand-in used when TELEGRAM_BOT_TOKEN is unset.
+
+    Any ``tg.send_*(...)`` call becomes a silent no-op so analysis scripts run
+    without a Telegram token configured (e.g. off the cluster).
+    """
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
+
+def make_notifier(token=None, chat_id=None, **kwargs):
+    """Return a TelegramNotifier if a token is configured, else a no-op stub.
+
+    Avoids constructing (and importing the config-requiring) TelegramNotifier
+    when TELEGRAM_BOT_TOKEN is not set, so callers can keep a module-level
+    ``tg = make_notifier()`` without crashing where notifications are unused.
+    """
+    if token or os.getenv("TELEGRAM_BOT_TOKEN"):
+        return TelegramNotifier(token=token, chat_id=chat_id, **kwargs)
+    return _NullNotifier()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Send files and/or a message to Telegram.",

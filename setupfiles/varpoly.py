@@ -12,6 +12,8 @@ import scipy.integrate as integrate
 #from mpmath import *
 import mpmath as mp
 import numpy as np
+if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
+    np.trapz = np.trapezoid
 import scipy.optimize as optimize
 import numba
 from scipy.optimize import curve_fit

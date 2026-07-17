@@ -9,8 +9,8 @@ from typing import List, Tuple
 import numpy as np
 import readtipsy as tip
 import IC_smoothlength as smth
-from telegram_notify import TelegramNotifier
-tg = TelegramNotifier()
+from telegram_notify import make_notifier
+tg = make_notifier()  # no-op stub if TELEGRAM_BOT_TOKEN is unset
 
 # ----------------------- aux-file readers ------------------------------
 

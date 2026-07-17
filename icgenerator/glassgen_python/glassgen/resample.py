@@ -517,7 +517,7 @@ def _interleave(arr, factor=2):
 
 
 def _split_once(pos, mass, aux, box, nsmooth, margin, dist, halve,
-                orient='random', scale='nn'):
+                orient='k1jitter', scale='nn'):
     """One binary split pass (N -> 2N)."""
     n = len(pos)
     periodic = box is not None
@@ -608,15 +608,15 @@ def _split_once(pos, mass, aux, box, nsmooth, margin, dist, halve,
 
 
 def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
-          dist=0.4, halve_fields=None, orient='random', scale='nn'):
+          dist=0.4, halve_fields=None, orient='k1jitter', scale='nn'):
     """Split every particle, multiplying the count by `factor` (a power of 2).
 
     orient selects the dumbbell-axis algorithm (all perpendicular to the
     nearest floor-cleared neighbour; 2026-07-06 benchmark in
     _bench_split.py, history in the split-quality notes):
       'random'  - deterministic pseudo-random azimuth about the perpendicular
-                  plane (the original SPH_methods nn_ort port; baseline).
-      'k1jitter'- the original nn_ort azimuth (set by the secondary
+                  plane (the original SPH_methods nn_ort port; former baseline).
+      'k1jitter'- (default) the original nn_ort azimuth (set by the secondary
                   neighbour), decorrelated only by a small +/- ~20 deg wiggle
                   instead of the full re-randomization.
       'jrN'     - iterative azimuth relaxation (up to N sweeps, early-stops):

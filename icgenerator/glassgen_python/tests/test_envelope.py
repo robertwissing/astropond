@@ -239,8 +239,15 @@ def test_vacuum_tail_monotone_home_pointing():
     env = E.build_table_envelope(t, E.table_mass(t), 5000, box=None,
                                  c=64, k=2.0)
     assert np.isclose(env['rho_frame'], env['rho_edge'] / 2.0 ** 6)
-    # radial ray: taper region, deep in-domain vacuum, outside the domain
-    radii = np.array([0.35, 0.46, 0.75, 1.05])
+    # radial ray: taper region, deep in-domain vacuum, outside the domain.
+    # Radii re-aimed 2026-07-16 (taper_len retired, CLEANUP_PLAN C1a): the
+    # frame is now 1.2 (half-extent 0.6), so probes must sit INSIDE it -
+    # beyond the frame the readout clamps flat at rho_frame, but positions
+    # wrap there and no particle can exist (benign, culled). 0.30/0.40/0.49
+    # land in distinct cells (width 1/24; finer spacing would alias two
+    # probes into one cell and read diff == 0); 0.58 is in the analytic
+    # _TailedShell region between the domain face (0.5) and the frame edge.
+    radii = np.array([0.30, 0.40, 0.49, 0.58])
     v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
     assert (np.diff(v) < 0).all()                  # strictly decreasing
     assert v.min() >= env['rho_frame'] * (1 - 1e-9)
@@ -333,7 +340,7 @@ def test_frame_open_box_thin_axis_capped_by_kernel():
     # long axes keep the plain pad_frac margin
     box, centre = E.frame_open_box([-50, -50, -2.5], [50, 50, 2.5],
                                    delta_bg=4.0, nsmooth=64, pad_frac=0.1,
-                                   taper_len=0.0, k=2.0)
+                                   k=2.0)
     h_bg = E.kernel_support(4.0, 64)
     assert np.all(box >= 2 * h_bg - 1e-12)
     assert np.isclose(box[0], 120.0) and np.isclose(box[1], 120.0)
@@ -342,14 +349,15 @@ def test_frame_open_box_thin_axis_capped_by_kernel():
 
 
 def test_frame_open_box_margins():
-    # cubic case, kernel small: margins are max(pad_frac*span, taper, H_edge)
+    # margins are max(pad_frac*span, H_edge) -- taper_len retired 2026-07-16
+    # (CLEANUP_PLAN C1a), so only these two terms compete.
+    # small kernel: the pad_frac margin (1.0 each side) wins
     box, _ = E.frame_open_box([0, 0, 0], [10, 10, 10], delta_bg=0.5,
-                              nsmooth=64, pad_frac=0.1, taper_len=2.0, k=2.0)
-    # pad_frac margin = 1.0 < taper 2.0 -> margin 2.0 each side
-    assert np.allclose(box, 14.0)
+                              nsmooth=64, pad_frac=0.1, k=2.0)
+    assert np.allclose(box, 12.0)
+    # bigger kernel: H_edge = H_bg/k ~ 2.48 dominates the 1.0 pad margin
     box2, _ = E.frame_open_box([0, 0, 0], [10, 10, 10], delta_bg=2.0,
-                               nsmooth=64, pad_frac=0.1, taper_len=0.0, k=2.0)
-    # H_edge = H_bg/k ~ 2.48 dominates the 1.0 pad margin
+                               nsmooth=64, pad_frac=0.1, k=2.0)
     assert np.allclose(box2, 10 + 2 * E.kernel_support(2.0, 64) / 2.0)
 
 
@@ -371,10 +379,6 @@ def test_build_table_envelope_frame_keys_open_only():
     env_per = E.build_table_envelope(t, gm, 5000, box=np.ones(3), c=64, k=2.0)
     assert 'frame_box' not in env_per
 
-# --------------------------------------------------------------------------- #
-#  Backed tail (bg_tail, 2026-07-11): background over the whole frame
-# --------------------------------------------------------------------------- #
-
 def _ball_table(n=24):
     from glassgen.density import TableDensity
     ax = (np.arange(n) + 0.5) / n - 0.5
@@ -384,52 +388,17 @@ def _ball_table(n=24):
 
 
 def test_frame_open_box_cap_delta_grows_cap():
-    # a backed tail's sparsest kernels sit at spacing k*delta_bg: the
-    # kernel-fits-the-box cap must grow with cap_delta or they wrap
-    kw = dict(delta_bg=4.0, nsmooth=64, pad_frac=0.1, taper_len=0.0, k=2.0)
+    # cap_delta grows the kernel-fits-the-box cap for sparser-than-delta_bg
+    # kernels (kept after the bg_tail retirement 2026-07-16: the sampled
+    # backing's faintest fillers can sit at spacing up to k*delta_bg - see
+    # CLEANUP_PLAN RECHECK caveat 2)
+    kw = dict(delta_bg=4.0, nsmooth=64, pad_frac=0.1, k=2.0)
     box0, _ = E.frame_open_box([-50, -50, -2.5], [50, 50, 2.5], **kw)
     box1, _ = E.frame_open_box([-50, -50, -2.5], [50, 50, 2.5],
                                cap_delta=8.0, **kw)
     assert np.isclose(box0[2], 2 * E.kernel_support(4.0, 64))
     assert np.isclose(box1[2], 2 * E.kernel_support(8.0, 64))  # x2 on z
     assert np.isclose(box1[0], box0[0])          # span-driven axes unchanged
-
-
-def test_backed_tail_populates_whole_frame():
-    t = _ball_table()
-    gm = E.table_mass(t)
-    env0 = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0)
-    env1 = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
-                                  bg_tail=True)
-    # default arm untouched: no tail counter, background confined to the taper
-    assert 'n_bg_tail' not in env0
-    # tail arm: sites beyond the taper population exist and are counted
-    assert env1['n_bg_tail'] > 0
-    r0 = np.linalg.norm(env0['bg_pos'], axis=1)
-    r1 = np.linalg.norm(env1['bg_pos'], axis=1)
-    assert r1.max() > r0.max() + 0.1             # reaches the deep vacuum
-    assert len(env1['bg_pos']) > len(env0['bg_pos'])
-    # every tail site: vacuum, inside the frame, target above rho_frame
-    assert (env1['occupancy'].rho0(env1['bg_pos']) < 0.5).all()
-    half = 0.5 * env1['frame_box']
-    assert (np.abs(env1['bg_pos'] - env1['frame_centre'])
-            <= half + 0.05).all()                # jitter can poke slightly out
-    v = env1['density'].rho0(env1['bg_pos'])
-    assert (v > env1['rho_frame'] * (1 - 1e-9)).all()
-    # mass-consistent: all background carries the same per-particle mass m
-    assert np.allclose(env1['bg_mass'], env1['m'])
-    # thinning tracks the decaying target: the taper band is denser than the
-    # deep tail (counts per volume in two radial annuli)
-    n_in = ((r1 > 0.28) & (r1 < 0.42)).sum()
-    n_out = ((r1 > 0.55) & (r1 < 0.69)).sum()
-    v_in = 0.42 ** 3 - 0.28 ** 3
-    v_out = 0.69 ** 3 - 0.55 ** 3
-    assert n_in / v_in > 2.0 * n_out / v_out
-    # periodic boxes reject the experiment (open builds only)
-    import pytest
-    with pytest.raises(ValueError):
-        E.build_table_envelope(t, gm, 5000, box=np.ones(3), c=64, k=2.0,
-                               bg_tail=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -503,7 +472,10 @@ def test_build_table_envelope_cubic_ball():
     # background (no lattice), monotone home-pointing padded target, keys
     t = _ball_table()
     gm = E.table_mass(t)
-    env = E.build_table_envelope(t, gm, 5000, box=None, c=64,
+    # k pinned to the historical 2.0: the cubic arm (falsified, documented-
+    # dead) predates the M20 n_frame default (k~1.26), whose shallower floor
+    # moves the closure's bg mass outward and breaks the concentration check
+    env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
                                  scaffold='cubic')
     assert env['scaffold'] == 'cubic'
     assert env['alpha'] == E.ALPHA_DEFAULT
@@ -528,9 +500,13 @@ def test_build_table_envelope_cubic_ball():
     assert n_in / v_in > 2.0 * n_out / v_out
     # padded target: exact in the gas, strictly decreasing along an outward
     # ray through the taper, in-domain vacuum and beyond the domain (the
-    # _CubicTail region), positive everywhere - never flat
+    # _CubicTail region), positive everywhere - never flat.
+    # Radii re-aimed 2026-07-16 (taper_len retired, CLEANUP_PLAN C1a): same
+    # frame shrink as the exp arm (cubic's own carried-skirt taper_len is
+    # gone too) - probes must sit inside the 0.6 frame half-extent; see
+    # test_vacuum_tail_monotone_home_pointing for the cell-aliasing note.
     assert np.isclose(env['density'].rho0(np.zeros((1, 3)))[0], 10.0)
-    radii = np.array([0.35, 0.46, 0.75, 1.05])
+    radii = np.array([0.30, 0.40, 0.49, 0.58])
     v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
     assert (np.diff(v) < 0).all()
     assert v.min() > 0.0
@@ -545,9 +521,6 @@ def test_cubic_scaffold_validation():
     gm = E.table_mass(t)
     with pytest.raises(ValueError):                  # unknown scaffold
         E.build_table_envelope(t, gm, 5000, scaffold='quartic')
-    with pytest.raises(ValueError):                  # bg_tail is exp-only
-        E.build_table_envelope(t, gm, 5000, box=None, scaffold='cubic',
-                               bg_tail=True)
 
 
 def test_build_uniform_envelope_cubic():
@@ -579,22 +552,26 @@ def test_build_uniform_envelope_cubic():
 
 
 def test_eta_lambda_and_sampled_backing():
-    # the post-cubic pivot: decay_spacing (lambda in output-spacing units)
-    # + bg_mode='sample' (closure as the sole sampler). Same exp shape;
-    # closure contract exact; all backing at particle mass m in vacuum.
+    # the post-cubic pivot: decay_spacing (lambda in output-spacing units,
+    # pinned to the legacy flat_floor=True taper it shapes - inert on the
+    # M18 no-floor profile) + sampled backing, the closure as the sole
+    # sampler (UNCONDITIONAL since the lattice retirement 2026-07-16,
+    # CLEANUP_PLAN C1). Closure contract exact; all backing at particle
+    # mass m in vacuum.
     t = _ball_table()
     gm = E.table_mass(t)
     env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
-                                 decay_spacing=1.0, bg_mode='sample')
-    assert env['bg_mode'] == 'sample'
+                                 decay_spacing=1.0, flat_floor=True)
     assert env['decay_spacing'] == 1.0
     assert len(env['bg_pos']) > 0
     assert np.allclose(env['bg_mass'], env['m'])
     carried = env['gas_mass'] + env['bg_mass'].sum()
     assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
     assert (env['occupancy'].rho0(env['bg_pos']) < 0.5).all()
-    # exp-shape target: monotone outward, floored at rho_frame
-    radii = np.array([0.35, 0.46, 0.75, 1.05])
+    # exp-shape target: monotone outward, floored at rho_frame (radii
+    # re-aimed inside the post-C1a frame, half-extent 0.6 - see
+    # test_vacuum_tail_monotone_home_pointing)
+    radii = np.array([0.30, 0.40, 0.49, 0.58])
     v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
     assert (np.diff(v) <= 0).all() and v[0] > v[-1]
     assert v.min() >= env['rho_frame'] * (1 - 1e-9)
@@ -605,13 +582,12 @@ def test_eta_lambda_and_sampled_backing():
     v_in = 0.35 ** 3 - 0.25 ** 3
     v_out = 0.55 ** 3 - 0.45 ** 3
     assert n_in / v_in > 2.0 * n_out / v_out
-    # guards
+    # the retired lattice/bg_tail machinery is really gone (C1)
     import pytest
-    with pytest.raises(ValueError):
-        E.build_table_envelope(t, gm, 5000, box=None, bg_mode='grid')
-    with pytest.raises(ValueError):
-        E.build_table_envelope(t, gm, 5000, box=None, bg_mode='sample',
-                               bg_tail=True)
+    with pytest.raises(TypeError):
+        E.build_table_envelope(t, gm, 5000, box=None, bg_mode='sample')
+    with pytest.raises(TypeError):
+        E.build_table_envelope(t, gm, 5000, box=None, bg_tail=True)
 
 
 def _two_brightness_table(n=32):
@@ -635,7 +611,9 @@ def test_decay_local_shrinks_bright_skirt():
     # sink the cusp drained into (table_res_probe vertical panel).
     t = _two_brightness_table()
     gm = E.table_mass(t)
-    kw = dict(box=None, c=64, k=2.0, decay_spacing=1.0, bg_mode='sample')
+    # flat_floor=True pins the legacy taper the eta/local lambda shapes
+    # (inert on the M18 no-floor profile); backing is always sampled (C1)
+    kw = dict(box=None, c=64, k=2.0, decay_spacing=1.0, flat_floor=True)
     envg = E.build_table_envelope(t, gm, 2000, **kw)
     envl = E.build_table_envelope(t, gm, 2000, decay_local=True, **kw)
     assert envl['decay_local'] and not envg['decay_local']
@@ -660,3 +638,111 @@ def test_decay_local_shrinks_bright_skirt():
     import pytest
     with pytest.raises(ValueError):
         E.build_table_envelope(t, gm, 2000, box=None, decay_local=True)
+
+
+# --------------------------------------------------------------------------- #
+#  M20: the (nl0, n_frame) reparametrization (RECONSTRUCT_PLAN M20)
+# --------------------------------------------------------------------------- #
+
+def test_resolve_bg_k_mapping():
+    import pytest
+    # pointwise ladder: k = (nsmooth/n_frame)^(1/6); n_frame=1 <=> old k=2
+    assert np.isclose(E.resolve_bg_k(n_frame=1.0, nsmooth=64), 2.0)
+    assert np.isclose(E.resolve_bg_k(n_frame=16.0, nsmooth=64),
+                      4.0 ** (1.0 / 6.0))
+    # default n_frame = NFRAME_DEFAULT
+    assert np.isclose(E.resolve_bg_k(nsmooth=64),
+                      (64.0 / E.NFRAME_DEFAULT) ** (1.0 / 6.0))
+    # legacy k passes straight through and excludes n_frame
+    assert E.resolve_bg_k(k=1.5) == 1.5
+    with pytest.raises(ValueError):
+        E.resolve_bg_k(k=1.5, n_frame=16.0)
+    with pytest.raises(ValueError):
+        E.resolve_bg_k(n_frame=0.0)
+
+
+def test_solve_tail_reach_pins_the_launch():
+    # the solved TR must give launch e-fold L(0) = rs/p = nl0 * 2h_e exactly
+    ts, sp, k, ns = 90.65, 4.53, 1.25, 64
+    for nl0 in (0.7, 1.35, 2.0):
+        tr = E.solve_tail_reach(ts, sp, nl0, k, nsmooth=ns)
+        rs = ts / tr
+        p = 6.0 * np.log(k) / np.log1p(tr)
+        assert np.isclose(rs / p, nl0 * E.kernel_support(sp, ns), rtol=1e-6)
+    # 2h_e grows (higher N) -> the solved TR SHRINKS (launch stays pinned)
+    tr20 = E.solve_tail_reach(ts, 4.53, 1.35, k, nsmooth=ns)
+    tr80 = E.solve_tail_reach(ts, 5.99, 1.35, k, nsmooth=ns)
+    assert tr80 < tr20
+    # the measured anchor cell: k1.25 nl0=1.35 at the 20k galaxy scale
+    # solves to TR ~ 12 (the k1.25-tr12 grid cell)
+    assert 10.0 < tr20 < 14.0
+
+
+def test_scaffold_resolvability_guard():
+    import warnings as _w
+
+    import pytest
+    ts, sp, ns = 90.65, 4.53, 64
+    # the M19 valley cell (k1.5, tr6): LAUNCHES in the band on a thin floor
+    with pytest.warns(UserWarning, match='LAUNCHES in the N_L resonance'):
+        E.check_scaffold_resolvability(ts, sp, 6.0, 1.5, nsmooth=ns)
+    # k2-tr3: p = 3.0 exactly - N_L flat, the whole vacuum resonant
+    with pytest.warns(UserWarning, match='flat'):
+        nl0, p = E.check_scaffold_resolvability(ts, sp, 3.0, 2.0, nsmooth=ns)
+    assert np.isclose(p, 3.0)
+    # k2-tr12 (huge-sigma grid cell): climbs across the band UNBACKED
+    with pytest.warns(UserWarning, match='UNBACKED'):
+        E.check_scaffold_resolvability(ts, sp, 12.0, 2.0, nsmooth=ns)
+    # k1.25-tr24: band-adjacent launch (~0.81) on the FAT buffer - silent
+    # (the measured 0.84+-0.07 cell; backing pins the marginal stretch)
+    with _w.catch_warnings():
+        _w.simplefilter('error')
+        nl0_f, _ = E.check_scaffold_resolvability(ts, sp, 24.0, 1.25,
+                                                  nsmooth=ns)
+    assert 0.75 <= nl0_f <= 1.15
+    # the M20 default anchor (k1.25-tr12 equivalent): silent
+    with _w.catch_warnings():
+        _w.simplefilter('error')
+        nl0, p = E.check_scaffold_resolvability(ts, sp, 12.0, 1.25,
+                                                nsmooth=ns)
+    assert 1.2 < nl0 < 1.5 and p < 3.0
+
+
+def test_build_table_envelope_m20_defaults_and_legacy():
+    import warnings as _w
+
+    import pytest
+    t = _ball_table()
+    gm = E.table_mass(t)
+
+    def _build(**kw):                   # guard warnings are advisory here
+        with _w.catch_warnings():
+            _w.simplefilter('ignore')
+            return E.build_table_envelope(t, gm, kw.pop('n', 2000),
+                                          box=None, **kw)
+
+    # defaults: k derived from NFRAME_DEFAULT, TR solved, launch recorded
+    env = _build()
+    assert np.isclose(env['bg_k'], (64.0 / E.NFRAME_DEFAULT) ** (1.0 / 6.0))
+    assert env['tail_reach'] > 0 and 'nl0' in env and 'profile_p' in env
+    assert np.isclose(env['nl0'], E.NL0_DEFAULT, rtol=1e-5)
+    # explicit nl0 moves the solved TR monotonically (steeper launch =
+    # larger TR)
+    env_st = _build(nl0=0.7)
+    assert env_st['tail_reach'] > env['tail_reach']
+    assert np.isclose(env_st['nl0'], 0.7, rtol=1e-5)
+    # legacy explicit (k, tail_reach) bypasses the solve bit-exactly and
+    # warns when nl0 is also passed
+    with pytest.warns(UserWarning, match='overrides nl0'):
+        env_l = E.build_table_envelope(t, gm, 2000, box=None, k=1.5,
+                                       tail_reach=12.0, nl0=3.0)
+    env_l2 = E.build_table_envelope(t, gm, 2000, box=None, k=1.5,
+                                    tail_reach=12.0)
+    assert env_l['tail_reach'] == 12.0 == env_l2['tail_reach']
+    q = np.random.default_rng(1).uniform(-0.55, 0.55, (256, 3))
+    assert np.array_equal(env_l['density'].rho0(q), env_l2['density'].rho0(q))
+    # launch pinning across N: same nl0 at two counts -> same recorded
+    # launch (the solver's whole point), different TR
+    env_b = _build(n=8000)
+    assert np.isclose(env_b['nl0'], env['nl0'], rtol=1e-6)
+    assert env_b['tail_reach'] != env['tail_reach']

@@ -221,17 +221,29 @@ def main(argv=None):
                           'the icr0 < 1e-3 quality stop, capped at 4800 '
                           'iterations (a from-scratch build runs the full '
                           'glassgen anneal)')
-    rec.add_argument('--bg-c', dest='bg_c', type=int, default=0,
-                     help='envelope: particles per resolved kernel for '
-                          'rho_edge (0 = use --nsmooth/-s)')
-    rec.add_argument('--bg-k', dest='bg_k', type=float, default=2.0,
-                     help='envelope: background coarseness; '
-                          'rho_floor = rho_edge/k**3 (default 2.0)')
+    rec.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+                     help='envelope: resolvability contour count (INTEGRAL: '
+                          'rho_edge = where the cumulative faint-end mass '
+                          'first exceeds nedge*m; 0 = use --nsmooth/-s). '
+                          '--bg-c is a legacy alias')
+    rec.add_argument('--nframe', dest='n_frame', type=float, default=None,
+                     help='M20: floor backability - expected particles per '
+                          'edge kernel at the profile floor (rho_frame = '
+                          'rho_edge*nframe/nsmooth; default 16 ~ k1.26). '
+                          'Exclusive with legacy --bg-k')
+    rec.add_argument('--nl0', dest='nl0', type=float, default=None,
+                     help='M20: scaffold launch resolvability N_L(0) in '
+                          'kernel supports; tail_reach solved per build '
+                          '(default 1.35; avoid ~1, the resonance band)')
+    rec.add_argument('--bg-k', dest='bg_k', type=float, default=None,
+                     help='LEGACY: backing coarseness k directly (rho_frame '
+                          '= rho_edge/k**6); bypasses --nframe')
     rec.add_argument('--scaffold', default='exp',
                      choices=('exp', 'cubic'),
-                     help="vacuum scaffold: 'exp' (default, taper + bg "
-                          "lattice) or 'cubic' (resolvability profile, "
-                          "lattice retired; --bg-k does not apply)")
+                     help="vacuum scaffold: 'exp' (default: monotone "
+                          "rho_edge->rho_frame profile + sampled backing) "
+                          "or 'cubic' (falsified M14 arm; --bg-k does not "
+                          "apply)")
     rec.add_argument('--alpha', type=float, default=None,
                      help='resolvability constant for --scaffold cubic '
                           '(default 2.0, the cascade auto_coarse_count '
@@ -404,7 +416,8 @@ def main(argv=None):
             pos2, mass2, aux2, _isf, ea = reconstruct.reconstruct_resample(
                 pos, mass, args.count, aux, box=box, nsmooth=args.nsmooth,
                 method=args.capture_method, base_npx=args.grid_npx,
-                bg_c=args.bg_c, bg_k=args.bg_k, cascade=args.cascade,
+                bg_c=args.bg_c, bg_k=args.bg_k,
+                n_frame=args.n_frame, nl0=args.nl0, cascade=args.cascade,
                 scaffold=args.scaffold, alpha=args.alpha,
                 relax_kw=rkw,
                 progress=lambda s: print(

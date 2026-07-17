@@ -9,6 +9,8 @@ Normalization (3D): W(r,h) = cnorm3D(h) * w(q),  cnorm3D(h) = 1 / (pi h^3).
 """
 
 import numpy as np
+if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
+    np.trapz = np.trapezoid
 from numba import njit
 
 # Support radius of the cubic spline in units of h, and its square.

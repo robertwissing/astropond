@@ -172,7 +172,7 @@ def test_kernel_matched_target_hmode():
     with pytest.raises(ValueError):
         KernelMatchedDensity(base, hmode='hybrid', m=m)     # needs rho_edge
     # hybrid: target-h where the point read >= rho_edge, particle-h below
-    re = float(base.rho0(np.array([[0.8, 0.0, 0.0]])))
+    re = float(base.rho0(np.array([[0.8, 0.0, 0.0]])).item())  # (1,) array -> scalar (numpy>=2.0 rejects float() on non-0-d)
     kmh = KernelMatchedDensity(base, hmode='hybrid', m=m, nsmooth=ns,
                                rho_edge=re)
     inner = pos[np.linalg.norm(pos, axis=1) < 0.5]     # read >= re

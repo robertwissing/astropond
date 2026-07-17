@@ -236,7 +236,7 @@ def writetipsyVecaux(X,label,file_string,binary=1,endian=1):
             np.savetxt(fB,B);
             fB.close()
         else:
-            B=B.byteswap().newbyteorder()
+            B=B.byteswap().view(B.dtype.newbyteorder())
             bnpart=bnpart.byteswap()
             bnpart.tofile(fB)
             B.tofile(fB)
@@ -377,9 +377,9 @@ def getgridall(listOfFiles,replace=0):
             
 def fixendian(arr,endian=1):
     if(arr.dtype.byteorder == "=" or arr.dtype.byteorder == "<" and endian==1):
-        arr=arr.byteswap().newbyteorder()
+        arr=arr.byteswap().view(arr.dtype.newbyteorder())
     elif(arr.dtype.byteorder == ">" and endian==0):
-        arr=arr.byteswap().newbyteorder()
+        arr=arr.byteswap().view(arr.dtype.newbyteorder())
     return arr
 
 def convertfromcodeunits(D2,dKpcUnit,dMsolUnit,Tin,vin,Bin):

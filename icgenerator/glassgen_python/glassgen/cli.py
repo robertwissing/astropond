@@ -167,20 +167,37 @@ def main(argv=None):
                          '"auto" (default) = on for an --open box, off for a '
                          'filled periodic box (byte-identical to no envelope); '
                          '"on"/"off" force it.')
-    ap.add_argument('--bg-c', dest='bg_c', type=int, default=0,
-                    help='envelope: particles per resolved kernel setting '
-                         'rho_edge (the cumulative faint-tail cut); 0 = use '
-                         '--nsmooth (-s). Larger c -> higher rho_edge -> more '
-                         'of the faint edge treated as background.')
-    ap.add_argument('--bg-k', dest='bg_k', type=float, default=2.0,
-                    help='envelope: background coarseness vs the gas edge; '
-                         'rho_floor = rho_edge/k**3, background spacing '
-                         'Delta_bg = k*(m/rho_edge)**(1/3) (default 2.0)')
+    ap.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+                    help='envelope: resolvability contour count - INTEGRAL: '
+                         'rho_edge = where the cumulative faint-end mass '
+                         'first exceeds nedge*m (the whole discarded tail in '
+                         'particle masses, NOT a per-kernel count); 0 = use '
+                         '--nsmooth (-s). --bg-c is a legacy alias.')
+    ap.add_argument('--nframe', dest='n_frame', type=float, default=None,
+                    help='envelope (M20): floor backability - expected '
+                         'particles per edge kernel at the profile floor '
+                         '(rho_frame = rho_edge*nframe/nsmooth, i.e. '
+                         'k = (nsmooth/nframe)**(1/6); default 16 ~ k1.26). '
+                         'Exclusive with the legacy --bg-k.')
+    ap.add_argument('--nl0', dest='nl0', type=float, default=None,
+                    help='envelope (M20): scaffold launch resolvability '
+                         'N_L(0) - the near-gas e-fold length in kernel '
+                         'supports; tail_reach is solved per build (default '
+                         '1.35; avoid ~1, the metastable resonance band)')
+    ap.add_argument('--bg-k', dest='bg_k', type=float, default=None,
+                    help='LEGACY: backing coarseness k directly (rho_frame = '
+                         'rho_edge/k**6, Delta_bg = k*(m/rho_edge)**(1/3)); '
+                         'bypasses --nframe. The uniform/analytic path '
+                         'defaults to k=2 (untouched by M20).')
+    ap.add_argument('--tail-reach', dest='tail_reach', type=float,
+                    default=None, metavar='S',
+                    help='LEGACY: explicit vacuum-profile steepness TR '
+                         '(bypasses the --nl0 solve); table targets only')
     ap.add_argument('--scaffold', default='exp', choices=('exp', 'cubic'),
-                    help="envelope vacuum scaffold: 'exp' (default, taper + "
-                         "background lattice) or 'cubic' (resolvability "
-                         "profile at --alpha, lattice retired for mass-"
-                         "weighted sampling; --bg-k does not apply)")
+                    help="envelope vacuum scaffold: 'exp' (default: strictly-"
+                         "decreasing rho_edge->rho_frame profile + sampled "
+                         "backing) or 'cubic' (falsified M14 arm, kept as "
+                         "documented-dead; --bg-k does not apply)")
     ap.add_argument('--open-pad', dest='open_pad', type=float, default=0.1,
                     help='envelope: vacuum margin (fraction of the gas bbox per '
                          'side) of the synthesised periodic frame for an --open '
@@ -270,6 +287,7 @@ def main(argv=None):
         res = build_from_table(
             density, args.count, box=box, nsmooth=args.nsmooth,
             bg_c=args.bg_c, bg_k=args.bg_k, envelope=args.envelope,
+            n_frame=args.n_frame, nl0=args.nl0, tail_reach=args.tail_reach,
             scaffold=args.scaffold,
             cascade=args.progressive, open_pad=args.open_pad, verbose=True,
             coarse_target=ct, alpha=args.alpha, inter_iter=args.inter_iter,
@@ -337,11 +355,16 @@ def main(argv=None):
             # table-native: rho_edge/shell/background straight off the leaf set
             env = build_table_envelope(density, float(mass.sum()), len(pos),
                                        box=box, c=bg_c, k=args.bg_k,
+                                       n_frame=args.n_frame, nl0=args.nl0,
+                                       tail_reach=args.tail_reach,
                                        scaffold=args.scaffold,
                                        alpha=args.alpha)
         else:
+            # uniform/analytic path: untouched by M20 - keeps the legacy k=2
             env = build_uniform_envelope(density, pos, float(mass.sum()),
-                                         len(pos), c=bg_c, k=args.bg_k,
+                                         len(pos), c=bg_c,
+                                         k=(2.0 if args.bg_k is None
+                                            else args.bg_k),
                                          scaffold=args.scaffold,
                                          alpha=args.alpha)
         print(f'envelope: m={env["m"]:.3e} rho_edge={env["rho_edge"]:.3e} '

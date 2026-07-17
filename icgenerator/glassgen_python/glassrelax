@@ -1,17 +1,32 @@
 #!/bin/bash
-# glassrelax: glass-relax a tipsy pre-IC with the Python icgenerator.
-#
-# usage: glassrelax <pre-IC.NNNNN> [glassgen.cli options...]
-#
-#   glassrelax sedov32_randselect1.0beta0.0ublast10.0.00000
-#   glassrelax pre.00000 --table dens_xdr --direction r_sph -n 2000 -oi 400
-#
-# Defaults derived from the input name (overridden by passing the flag
-# yourself):
-#   --param <input minus .NNNNN>.param   (when that file exists)
-#   -o      <input minus .NNNNN>_glass   (final output: ..._glass_IC)
-# Everything else (-s, -n, -oi, --table, --direction, --flavour, --rhopow,
-# --icr0, ...) is passed straight to glassgen.cli; run with --help to list.
+# Wrapper used for relaxing a distribution of particles to a glass following an arbitrary density profile.
+# glassrelax has two input modes, a pre-IC can be given to it and relaxed given a certain density profile (glassrelax tipsyfile )
+# or a random distribution of N particles  is sampled from the density table given, and is relaxed toward a certain density profile (--table X.npz --count N).
+# The density profile is given by a table (1D,2D or 3D), where it's extent and coordinate system is 
+# given in the table header. The density profile can also be given by an analytical function (see which profiles in density_from_param), which requires a pre-IC and .param file 
+# The box size and periodicity is given by the *.param file if present otherwise it can be specified by --box LX LY LZ or by --open if it is an open boundary.
+# The --open option generates a free-surface build: internal padded frame + vacuum scaffold + temporary background particles, culled after the relax.
+# If no input.param (with the relevant IC profile keys) or table is given, then it will default to uniform density.
+# Currently only gas will be relaxed (dark and star particles pass through to the output unchanged.)
+
+# The default input param and output if not given is:
+# Mode 1, ./glassrelax input
+# --param <input minus .NNNNN>.param 
+# -o      <input minus .NNNNN>_glass 
+
+# For Mode 2, ./glassrelax --count N --table x.npz -o myoutput needs to be given.
+
+# nsmooth default -s 64
+
+# If you want to diagnose/see output of relaxation then use 
+# -oi for output snapshot interval, 
+# --plot for final density-error/residual-force figure and
+# --history-plot for a final time plot of the step size, density error and force error (most useful).
+
+# The remaining input flags can be seen with --help (and expert flags given by --help-extra)
+# They mainly include flags related to quality, stopping criterion, envelope(open build), cascade(multi-grid relaxaation) and general relaxation parameters.
+
+
 set -euo pipefail
 
 pkgroot=$(cd "$(dirname "$0")" && pwd)
@@ -21,6 +36,14 @@ if [[ $# -lt 1 || $1 == -h || $1 == --help ]]; then
     echo
     PYTHONPATH=$pkgroot python -m glassgen.cli --help
     exit 0
+fi
+
+if [[ $1 == -* ]]; then
+    # this is to distinguish between the two input modes discussed above, 
+    # If IC file it is given directly like glassrelax input , if it instead starts 
+    # with flag - then we assume it is a --count table relax
+    exec env PYTHONPATH=$pkgroot${PYTHONPATH:+:$PYTHONPATH} \
+        python -m glassgen.cli "$@"
 fi
 
 infile=$1; shift

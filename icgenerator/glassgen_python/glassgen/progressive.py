@@ -599,13 +599,14 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
 
 
 def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
-                     bg_c=None, bg_k=2.0, bg_tail=False, envelope='auto',
+                     bg_c=None, bg_k=None, envelope='auto',
                      cascade=True, seed=0, open_pad=0.1, kernel_match=True,
                      filler_field_hook=None, shell_start='local',
                      decay_cells=2.0, scaffold='exp', alpha=None,
                      decay_spacing=None, decay_local=False,
-                     bg_mode='lattice', km_hmode='particle', km_hscale=1.0,
-                     flat_floor=False, tail_reach=6.0,
+                     km_hmode='particle', km_hscale=1.0,
+                     flat_floor=False, tail_reach=None,
+                     n_frame=None, nl0=None,
                      verbose=False, **relax_kw):
     """THE glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10).
 
@@ -633,11 +634,12 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         explicit exterior pressure-support scaffold) vs 'edge' (start
         capped at the global rho_edge, the pre-M12 scheme); decay length =
         ``decay_cells`` x the gas-edge cell size.
-    scaffold, alpha : 'exp' (default, the M12 taper + lattice) or 'cubic'
-        (the 2026-07-13 resolvability scaffold - one marginal profile,
-        lattice retired for mass-weighted sampling; see
-        :func:`envelope.build_table_envelope`). ``alpha`` defaults to
-        envelope.ALPHA_DEFAULT (= auto_coarse_count's cascade constant).
+    scaffold, alpha : 'exp' (default, the M12/M18 profile) or 'cubic'
+        (the 2026-07-13 resolvability scaffold, FALSIFIED - kept for the
+        record; see :func:`envelope.build_table_envelope`). ``alpha``
+        defaults to envelope.ALPHA_DEFAULT (= auto_coarse_count's cascade
+        constant). The background is always sampled backing (the closure
+        as sole sampler; lattice/bg_tail retired 2026-07-16, C1).
     gas_mass : the mass contract. Defaults to the table integral sum(rho*V);
         pass the input snapshot's exact gas mass when reconstructing.
     relax_kw : forwarded to :func:`relax_progressive` - its named cascade
@@ -663,16 +665,21 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         env = build_table_envelope(table, gas_mass, count, box=box,
                                    c=(bg_c or nsmooth), k=bg_k, seed=seed,
                                    nsmooth=nsmooth, pad_frac=open_pad,
-                                   bg_tail=bg_tail, shell_start=shell_start,
+                                   shell_start=shell_start,
                                    decay_cells=decay_cells,
                                    scaffold=scaffold, alpha=alpha,
                                    decay_spacing=decay_spacing,
                                    decay_local=decay_local,
-                                   bg_mode=bg_mode,
                                    flat_floor=flat_floor,
-                                   tail_reach=tail_reach)
+                                   tail_reach=tail_reach,
+                                   n_frame=n_frame, nl0=nl0)
         if envelope == 'auto' and len(env['bg_pos']) == 0 and box is not None:
             env = None                       # filled periodic box: no vacuum
+        if env is not None and verbose:
+            print(f"[progressive] envelope: bg_k {env['bg_k']:.3f} "
+                  f"tail_reach {env['tail_reach']:.2f}"
+                  + (f" nl0 {env['nl0']:.2f} p {env['profile_p']:.2f}"
+                     if 'nl0' in env else ''), flush=True)
     if env is None and box is None:
         raise ValueError("an open-box table build needs the envelope "
                          "(envelope='off' requires a periodic box)")
@@ -718,10 +725,7 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
                     delta_bg=env['delta_bg'], m=env['m'],
                     scaffold=env.get('scaffold', 'exp'),
                     alpha=env.get('alpha'),
-                    bg_mode=env.get('bg_mode', 'lattice'),
                     decay_spacing=env.get('decay_spacing'),
                     decay_local=env.get('decay_local', False))
-        if 'n_bg_tail' in env:
-            info['n_bg_tail'] = env['n_bg_tail']
     res.table_build = info
     return res

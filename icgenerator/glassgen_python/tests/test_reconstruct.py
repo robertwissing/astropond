@@ -855,3 +855,25 @@ def test_grade_2to1_balances_thin_slab_capture():
     m0 = float((v0 * amr0.volumes()).sum())
     m1 = float((v1 * amr1.volumes()).sum())
     assert abs(m1 - m0) < 1e-12
+
+
+def test_count_overlay_m20_lockstep_with_builder():
+    # M20: the overlay MUST resolve the same (k, tail_reach, nl0) as the
+    # builder - the CLEANUP_PLAN C1a lockstep rule - or glasstable renders
+    # a different target than the one the relax sees.
+    import warnings as _w
+
+    from glassgen import envelope as E
+    pos, mass, box = _ball()
+    table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
+                                        empty='zero', base_npx=8, max_level=6)
+    n = 2 * len(pos)
+    with _w.catch_warnings():
+        _w.simplefilter('ignore')
+        _, info = reconstruct.apply_count_overlay(table, n, c=64)
+        env = E.build_table_envelope(table, E.table_mass(table), n,
+                                     box=box, c=64)
+    assert np.isclose(env['bg_k'], info['bg_k'], rtol=1e-12)
+    assert np.isclose(env['tail_reach'], info['tail_reach'], rtol=1e-9)
+    assert np.isclose(env['nl0'], info['nl0'], rtol=1e-9)
+    assert np.isclose(env['profile_p'], info['profile_p'], rtol=1e-9)

@@ -601,12 +601,9 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
 def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
                      bg_c=None, bg_k=None, envelope='auto',
                      cascade=True, seed=0, open_pad=0.1, kernel_match=True,
-                     filler_field_hook=None, shell_start='local',
-                     decay_cells=2.0, scaffold='exp', alpha=None,
-                     decay_spacing=None, decay_local=False,
+                     filler_field_hook=None, alpha=None,
                      km_hmode='particle', km_hscale=1.0,
-                     flat_floor=False, tail_reach=None,
-                     n_frame=None, nl0=None,
+                     tail_reach=None, n_frame=None, nl0=None, bg_over=0.0,
                      verbose=False, **relax_kw):
     """THE glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10).
 
@@ -628,18 +625,11 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         pseudo-pressure ratio -> 1 instead of blowing the feature open.
         Resolved regions are unaffected to second order. False = the point
         read (pre-M4 behaviour).
-    shell_start, decay_cells : vacuum-taper shape, forwarded to
-        :func:`envelope.build_table_envelope` - 'local' (default since
-        2026-07-13: start at the nearest occupied cell's own value - the
-        explicit exterior pressure-support scaffold) vs 'edge' (start
-        capped at the global rho_edge, the pre-M12 scheme); decay length =
-        ``decay_cells`` x the gas-edge cell size.
-    scaffold, alpha : 'exp' (default, the M12/M18 profile) or 'cubic'
-        (the 2026-07-13 resolvability scaffold, FALSIFIED - kept for the
-        record; see :func:`envelope.build_table_envelope`). ``alpha``
-        defaults to envelope.ALPHA_DEFAULT (= auto_coarse_count's cascade
-        constant). The background is always sampled backing (the closure
-        as sole sampler; lattice/bg_tail retired 2026-07-16, C1).
+    alpha : the cascade resolvability tolerance (auto_coarse_count);
+        defaults to envelope.ALPHA_DEFAULT. The vacuum fill is the M18
+        no-floor profile (taper family retired C2, cubic scaffold deleted
+        C3, 2026-07-17); the background is always sampled backing (the
+        closure as sole sampler; lattice/bg_tail retired 2026-07-16, C1).
     gas_mass : the mass contract. Defaults to the table integral sum(rho*V);
         pass the input snapshot's exact gas mass when reconstructing.
     relax_kw : forwarded to :func:`relax_progressive` - its named cascade
@@ -665,14 +655,9 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         env = build_table_envelope(table, gas_mass, count, box=box,
                                    c=(bg_c or nsmooth), k=bg_k, seed=seed,
                                    nsmooth=nsmooth, pad_frac=open_pad,
-                                   shell_start=shell_start,
-                                   decay_cells=decay_cells,
-                                   scaffold=scaffold, alpha=alpha,
-                                   decay_spacing=decay_spacing,
-                                   decay_local=decay_local,
-                                   flat_floor=flat_floor,
                                    tail_reach=tail_reach,
-                                   n_frame=n_frame, nl0=nl0)
+                                   n_frame=n_frame, nl0=nl0,
+                                   bg_over=bg_over)
         if envelope == 'auto' and len(env['bg_pos']) == 0 and box is not None:
             env = None                       # filled periodic box: no vacuum
         if env is not None and verbose:
@@ -723,9 +708,7 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         info.update(rho_edge=env['rho_edge'],
                     rho_frame=env.get('rho_frame'),
                     delta_bg=env['delta_bg'], m=env['m'],
-                    scaffold=env.get('scaffold', 'exp'),
-                    alpha=env.get('alpha'),
-                    decay_spacing=env.get('decay_spacing'),
-                    decay_local=env.get('decay_local', False))
+                    tail_reach=env.get('tail_reach'),
+                    nl0=env.get('nl0'))
     res.table_build = info
     return res

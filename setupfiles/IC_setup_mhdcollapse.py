@@ -68,7 +68,7 @@ class setup_mhdcollapse(object):
     rhoout = 1.0
     Rin = 0.015
     Rtab = 1.0
-    R = 1.0  # written into the densitytable_xdr header
+    R = 1.0  # legacy xdr-header field (npz tables carry their axes instead)
 
     def __init__(self):
         pass
@@ -141,8 +141,9 @@ class setup_mhdcollapse(object):
                         + np.trapz((self.getrho_vec(rq) - self.rhoout)
                                    * 4.0*np.pi*rq**2, rq))
              print("table-integrated total mass ", totmass)
-             # 1D radial density table for the glass relaxer
-             # (glassgen: --table densitytable_xdr --direction r_sph)
+             # 1D radial density table for the glass relaxer, self-describing
+             # npz: the r_sph mapping travels in the table header
+             # (glassgen: --table densitytable.npz)
              ntab = 10000
              dimtab = 1
              self.Rtab = np.sqrt(self.dxbound**2 + self.dybound**2
@@ -150,9 +151,8 @@ class setup_mhdcollapse(object):
              self.R = self.Rtab
              gridtab, rhotab = denstable.generate_density_table(
                  self, n=ntab, dim=dimtab)
-             denstable.write_density_table_xdr(
-                 self, "densitytable_xdr", gridtab, rhotab,
-                 n=ntab, dim=dimtab)
+             denstable.write_density_table_npz(
+                 "densitytable.npz", gridtab, rhotab, mapping='r_sph')
          else:
              totmass = (self.rhoout*self.dxbound*self.dybound*self.dzbound + (self.rhoin-self.rhoout)*4/3*np.pi*self.Rin**3)
          self.mass = [totmass/self.npart]*self.npart

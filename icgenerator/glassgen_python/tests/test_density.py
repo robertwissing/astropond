@@ -42,6 +42,78 @@ def test_xdr_roundtrip_2d(tmp_path):
     assert np.allclose(tab.values, vals, atol=1e-5)
 
 
+def test_npz_roundtrip_1d_carries_mapping(tmp_path):
+    # C6: the .npz is self-describing - the mapping travels in the header
+    x = np.linspace(0, 2.0, 50)
+    tab = TableDensity((x,), 1.0 + np.exp(-x), mapping='r_cyl')
+    path = str(tmp_path / 'tab1d.npz')
+    tab.save(path)
+    tab2 = TableDensity.load(path)
+    assert tab2.dim == 1 and tab2.mapping == 'r_cyl'
+    pos = np.random.default_rng(0).normal(size=(200, 3))
+    assert np.allclose(tab2.rho0(pos), tab.rho0(pos))
+
+
+def test_npz_roundtrip_2d_carries_mapping_pair(tmp_path):
+    x = np.linspace(-1, 1, 16)
+    tab = TableDensity((x, x), np.add.outer(x ** 2, x), mapping=('r_cyl', 'z'))
+    path = str(tmp_path / 'tab2d.npz')
+    tab.save(path)
+    tab2 = TableDensity.load(path)
+    assert tab2.dim == 2 and tab2.mapping == ('r_cyl', 'z')
+    pos = np.random.default_rng(1).uniform(-1, 1, size=(200, 3))
+    assert np.allclose(tab2.rho0(pos), tab.rho0(pos))
+
+
+def test_npz_legacy_3d_without_mapping_loads(tmp_path):
+    # pre-C6 3D saves have no mapping key: (x,y,z)-indexed, must keep loading
+    x = np.linspace(-1, 1, 8)
+    vals = np.random.default_rng(2).random((8, 8, 8))
+    path = str(tmp_path / 'tab3d.npz')
+    np.savez(path, ax0=x, ax1=x, ax2=x, values=vals)
+    tab = TableDensity.load(path)
+    assert tab.dim == 3 and tab.mapping is None
+
+
+def test_npz_mapped_without_mapping_key_raises(tmp_path):
+    x = np.linspace(0, 1, 8)
+    path = str(tmp_path / 'bad1d.npz')
+    np.savez(path, ax0=x, values=np.ones(8))
+    with pytest.raises(ValueError, match='mapping'):
+        TableDensity.load(path)
+
+
+def test_xdr_converter_one_shot(tmp_path):
+    # python -m glassgen.density: xdr in -> self-describing .npz out; the
+    # --direction given at conversion is the mapping the loaded table uses
+    from glassgen import density as D
+    n = 40
+    x = np.linspace(0, 2.0, n)
+    rho = 1.0 + np.exp(-x)
+    xdr = str(tmp_path / 'densitytable_xdr')
+    write_xdr_table(xdr, 1, n, 2.0, (x,), rho)
+    out = str(tmp_path / 'converted.npz')
+    D.main([xdr, out, '--direction', 'r_sph'])
+    tab = TableDensity.load(out)
+    assert tab.dim == 1 and tab.mapping == 'r_sph'
+    ref = TableDensity.from_xdr(xdr, mapping='r_sph')
+    pos = np.random.default_rng(3).normal(size=(100, 3))
+    assert np.allclose(tab.rho0(pos), ref.rho0(pos))
+
+
+def test_load_table_dispatches_mapped_npz(tmp_path):
+    # reconstruct.load_table sniffs the unified container: a mapped 1D grid
+    # comes back as TableDensity with its header mapping intact
+    from glassgen.reconstruct import describe_table, load_table
+    x = np.linspace(0, 2.0, 30)
+    tab = TableDensity((x,), 1.0 + x, mapping='r_sph')
+    path = str(tmp_path / 'tab.npz')
+    tab.save(path)
+    tab2 = load_table(path)
+    assert isinstance(tab2, TableDensity) and tab2.mapping == 'r_sph'
+    assert 'r_sph' in describe_table(tab2)
+
+
 def test_linear_table_interp_is_exact():
     x = np.linspace(0, 1, 11)
     tab = TableDensity((x,), 2.0 + 3.0 * x, mapping='x')

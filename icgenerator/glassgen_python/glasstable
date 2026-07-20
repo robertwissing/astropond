@@ -19,8 +19,8 @@
 # When given a snapshot (not a .npz), the box is taken from
 # <input minus .NNNNN>.param if present (like glassresample); pass --param,
 # --box LX LY LZ or --open to override. Everything else (--grid,
-# --grid-npx, --capture-method, --bg-c, --bg-k, -s, ...) is passed to
-# glassgen.reconstruct; run with --help to list.
+# --grid-npx, --capture-method, --nedge, --nframe, --nl0, -s, ...) is
+# passed to glassgen.reconstruct; run with --help to list.
 set -euo pipefail
 
 pkgroot=$(cd "$(dirname "$0")" && pwd)

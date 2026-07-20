@@ -5,11 +5,34 @@ The C gdicgen reads the density profile it relaxes toward straight from the
 same reading so the Python backend (cli.py) and the benchmark get an identical
 target without a separate density table - profiles 1/2/3 (uniform / step /
 tanh). Profile >= 4 (disk / accdisk) is not ported and needs a density table
-(TableDensity.from_xdr); see PLAN.md "Future tasks".
+(--table TABLE.npz; see glassgen.density); see PLAN.md "Future tasks".
 """
+import argparse
+import sys
+
 import numpy as np
 
 from .density import DensityField
+
+
+def expert_help(argv=None):
+    """Hidden expert tier shared by the three production CLIs (CLEANUP_PLAN
+    C4): returns `hide`, a help-text wrapper for rarely-used-but-working
+    flags. Wrapped flags stay fully parseable but are omitted from --help
+    unless --help-extra is on the command line; each parser also adds its own
+
+        ap.add_argument('--help-extra', action='help', help=...)
+
+    so `--help-extra` prints the complete surface (argparse's help action
+    fires after the whole parser is built, by which point every hide() call
+    already returned the real text)."""
+    args = sys.argv[1:] if argv is None else list(argv)
+    show = '--help-extra' in args
+
+    def hide(text):
+        return text if show else argparse.SUPPRESS
+
+    return hide
 
 
 def read_param(path):
@@ -58,9 +81,10 @@ def target_rho0(p):
             r = pos[:, d - 6]
         if prof >= 4:
             raise NotImplementedError(
-                f'density profile {prof} (disk/accdisk) is not ported - pass a '
-                'density table (--table densitytable_xdr) or use the C backend; '
-                'see PLAN.md "Future tasks".')
+                f'density profile {prof} (disk/accdisk) is not ported - pass '
+                'a density table (--table TABLE.npz; convert a legacy '
+                'densitytable_xdr with python -m glassgen.density) or use '
+                'the C backend; see PLAN.md "Future tasks".')
         if prof == 1:
             return np.full(len(pos), outer)
         if prof == 2:

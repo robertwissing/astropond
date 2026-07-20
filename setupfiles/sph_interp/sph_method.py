@@ -823,6 +823,124 @@ def interpolate_voronoi_scatter(particles, grid, values=None, hmin=None):
     return _scatter_to_fields(names, M, MA, V), M
 
 
+def scatter_to_points(pos, h, mass, values, gen, gen_vol=None, hmin=None,
+                      box=None, periodic=(False, False, False)):
+    """Conservative content scatter onto bare receiver POINTS (no mesh).
+
+    The particle-receiver twin of `interpolate_voronoi_scatter`: the same
+    numba deposit (per-donor shares w_ij*V_j normalized to 1 over the
+    receivers each donor's kernel reaches, nearest-receiver fallback so a
+    donor that reaches nobody still lands whole), but the receivers are
+    caller-supplied points with caller-supplied effective volumes and no
+    tessellation is built. Returns raw CONSERVED CONTENT, not averages:
+
+        recv_mass[j]     = sum_i share_ij * m_i          (== sum m_i exactly)
+        content[name][j] = sum_i share_ij * m_i * A_i    (== sum m_i A_i)
+
+    (`interpolate_voronoi_scatter`'s mass-weighted cell average is
+    content/recv_mass; a conservative IC transfer divides content by the
+    OUTPUT particle mass instead — RECONSTRUCT_PLAN M22 / plan item 10.)
+
+    pos, h, mass : donors (h = SPH smoothing length, support = RADKERNEL*h).
+    values       : dict name -> (N,) or (N,ncomp) donor fields.
+    gen          : (Ngen,3) receiver points.
+    gen_vol      : effective receiver volumes (the Monte-Carlo integration
+                   element, e.g. local-spacing^3); only RATIOS matter for
+                   the shares. Default: all equal.
+    hmin         : kernel floor so a sub-spacing donor still reaches a
+                   receiver (default: half the median receiver NN spacing).
+    box/periodic : periodic axes are handled by ghosting receivers within
+                   the maximum kernel reach of the wrapped faces and folding
+                   ghost content back onto the parents (the deposit itself
+                   is non-periodic, absolute coordinates). `box` is the
+                   period per axis; the domain frame is the donor bbox min.
+    """
+    from scipy.spatial import cKDTree
+    pos = np.ascontiguousarray(pos, dtype=np.float64).reshape(-1, 3)
+    gen = np.ascontiguousarray(gen, dtype=np.float64).reshape(-1, 3)
+    h = np.asarray(h, dtype=np.float64).ravel()
+    mass = np.asarray(mass, dtype=np.float64).ravel()
+    ngen = len(gen)
+    if gen_vol is None:
+        gen_vol = np.ones(ngen)
+    gen_vol = np.asarray(gen_vol, dtype=np.float64).ravel()
+
+    # flatten the value dict into (N, K) columns (cf. Particles.value_array)
+    names, cols, K = [], [], 0
+    for name, arr in values.items():
+        arr = np.asarray(arr, dtype=np.float64)
+        nc = 1 if arr.ndim == 1 else arr.shape[1]
+        names.append((name, K, nc))
+        cols.append(arr.reshape(len(arr), nc))
+        K += nc
+    vals = (np.concatenate(cols, axis=1) if cols
+            else np.zeros((len(pos), 0)))
+
+    if hmin is None:
+        if ngen > 1:
+            d1 = cKDTree(gen).query(gen, k=2, workers=-1)[0][:, 1]
+            hmin = 0.5 * float(np.median(d1))
+        else:
+            hmin = 0.0
+
+    # periodic axes: ghost receivers within the max kernel reach of the
+    # wrapped faces; fold the ghost deposits back onto their parents below.
+    per = ((periodic,) * 3 if np.isscalar(periodic) else tuple(periodic))
+    ggen, gvol, parent = gen, gen_vol, None
+    if box is not None and any(per):
+        box = np.asarray(box, dtype=np.float64).reshape(3)
+        lo = pos.min(0)
+        reach = RADKERNEL * max(float(np.max(h)) if len(h) else 0.0,
+                                float(hmin))
+        extra, evol, epar = [], [], []
+        for sx in ((-1, 0, 1) if per[0] else (0,)):
+            for sy in ((-1, 0, 1) if per[1] else (0,)):
+                for sz in ((-1, 0, 1) if per[2] else (0,)):
+                    if sx == sy == sz == 0:
+                        continue
+                    g = gen + np.array([sx, sy, sz], dtype=np.float64) * box
+                    keep = np.all((g >= lo - reach)
+                                  & (g <= lo + box + reach), axis=1)
+                    if keep.any():
+                        extra.append(g[keep])
+                        evol.append(gen_vol[keep])
+                        epar.append(np.nonzero(keep)[0])
+        if extra:
+            ggen = np.vstack([gen] + extra)
+            gvol = np.concatenate([gen_vol] + evol)
+            parent = np.concatenate([np.arange(ngen)] + epar)
+
+    NB = 64
+    blo, bw, bstart, border, _ = generator_buckets(ggen, nb=NB)
+    nearest = cKDTree(ggen).query(pos, k=1, workers=-1)[1].ravel().astype(
+        np.int64)
+    nthreads = numba.get_num_threads()
+    ntot = len(ggen)
+    mass_local = np.zeros((nthreads, ntot), dtype=np.float64)
+    massA_local = np.zeros((nthreads, ntot, K), dtype=np.float64)
+    _deposit_voronoi_scatter(np.ascontiguousarray(pos[:, 0]),
+                             np.ascontiguousarray(pos[:, 1]),
+                             np.ascontiguousarray(pos[:, 2]),
+                             h, mass, vals,
+                             np.ascontiguousarray(ggen[:, 0]),
+                             np.ascontiguousarray(ggen[:, 1]),
+                             np.ascontiguousarray(ggen[:, 2]),
+                             gvol, NB, blo, bw, bstart, border,
+                             nearest, float(hmin), mass_local, massA_local)
+    M = mass_local.sum(axis=0)
+    MA = massA_local.sum(axis=0)
+    if parent is not None:
+        Mc = np.zeros(ngen)
+        MAc = np.zeros((ngen, K))
+        np.add.at(Mc, parent, M)
+        np.add.at(MAc, parent, MA)
+        M, MA = Mc, MAc
+    content = {}
+    for name, k0, nc in names:
+        content[name] = MA[:, k0] if nc == 1 else MA[:, k0:k0 + nc]
+    return content, M
+
+
 # --------------------------------------------------------------------------- #
 #  2D projection (direct, no 3D cube): column / average / rhocolumn / slice
 # --------------------------------------------------------------------------- #

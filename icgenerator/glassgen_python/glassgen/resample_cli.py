@@ -29,8 +29,9 @@ neighbour count, so it is carried through unscaled.
 --count N, decoupled from the input count. A thin wrapper around the
 glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10): capture
 the input gas density on a raw AMR table (sph_interp), sample + envelope +
-progressive relax in glassgen (build_from_table), then gather the fields
-(vel/u/B/...) from the input at the final positions - the output has no
+progressive relax in glassgen (build_from_table), then conservatively
+scatter the fields (vel/u/...) from the input onto the final positions
+(M22: interior totals exact, truncation budgeted) - the output has no
 history to inherit. Positions are rebuilt from scratch, so this is for
 ICs / quasi-equilibrium snapshots, not mid-run states with strong coherent
 flows. Only the gas is processed; dark/star (and their aux slices) pass
@@ -142,6 +143,9 @@ def main(argv=None):
         description='split/merge particle types of a tipsy snapshot '
                     '(particle fields + all aux files); types not selected '
                     'pass through unchanged')
+    ap.add_argument('--help-extra', action='help',
+                    help='show the full help, including any hidden expert '
+                         'options')
     ap.add_argument('-I', dest='infile', required=True, help='input tipsy')
     ap.add_argument('-o', dest='out', default=None,
                     help='output prefix (writes ${out}.00000 + aux). '
@@ -200,7 +204,8 @@ def main(argv=None):
         'rebuild the gas at --count N: capture the input gas density on a '
         'raw AMR table, then run the glassgen table builder (sample + '
         'N-aware envelope + progressive relax + cull/renorm to M_gas) and '
-        'gather the fields from the input at the final positions.')
+        'conservatively scatter the fields from the input onto the '
+        'final positions (M22).')
     rec.add_argument('--grid-npx', type=int, default=None,
                      help='AMR BASE grid cells per axis (default ~N^(1/3)/8, '
                           'power of two - refinement supplies locality). '
@@ -216,38 +221,27 @@ def main(argv=None):
                           'deficit at the gas edge as the relax\'s own '
                           'density estimate, so the edge biases cancel '
                           'instead of driving a persistent edge force')
-    rec.add_argument('--relax-iters', type=int, default=None,
-                     help='fixed relax iteration budget. Default: run to '
-                          'the icr0 < 1e-3 quality stop, capped at 4800 '
-                          'iterations (a from-scratch build runs the full '
-                          'glassgen anneal)')
-    rec.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+    rec.add_argument('--icr0-stop', dest='icr0_stop', type=float,
+                     default=None, metavar='X',
+                     help='median-smoothed icr0 stop (max step as a fraction '
+                          'of h) for the relax - the quality dial: 3e-3 '
+                          '(default) fast/good, ~1e-3 tight; capped at 4800 '
+                          'iterations either way')
+    rec.add_argument('--nedge', dest='bg_c', type=int, default=0,
                      help='envelope: resolvability contour count (INTEGRAL: '
                           'rho_edge = where the cumulative faint-end mass '
-                          'first exceeds nedge*m; 0 = use --nsmooth/-s). '
-                          '--bg-c is a legacy alias')
+                          'first exceeds nedge*m; 0 = use --nsmooth/-s)')
     rec.add_argument('--nframe', dest='n_frame', type=float, default=None,
                      help='M20: floor backability - expected particles per '
                           'edge kernel at the profile floor (rho_frame = '
-                          'rho_edge*nframe/nsmooth; default 16 ~ k1.26). '
-                          'Exclusive with legacy --bg-k')
+                          'rho_edge*nframe/nsmooth; default 16 ~ k1.26)')
     rec.add_argument('--nl0', dest='nl0', type=float, default=None,
                      help='M20: scaffold launch resolvability N_L(0) in '
                           'kernel supports; tail_reach solved per build '
                           '(default 1.35; avoid ~1, the resonance band)')
-    rec.add_argument('--bg-k', dest='bg_k', type=float, default=None,
-                     help='LEGACY: backing coarseness k directly (rho_frame '
-                          '= rho_edge/k**6); bypasses --nframe')
-    rec.add_argument('--scaffold', default='exp',
-                     choices=('exp', 'cubic'),
-                     help="vacuum scaffold: 'exp' (default: monotone "
-                          "rho_edge->rho_frame profile + sampled backing) "
-                          "or 'cubic' (falsified M14 arm; --bg-k does not "
-                          "apply)")
     rec.add_argument('--alpha', type=float, default=None,
-                     help='resolvability constant for --scaffold cubic '
-                          '(default 2.0, the cascade auto_coarse_count '
-                          'constant)')
+                     help='cascade resolvability tolerance '
+                          '(auto_coarse_count; default 2.0)')
     rec.add_argument('--no-cascade', dest='cascade', action='store_false',
                      help='disable the multi-resolution cascade and relax '
                           'the placed gas+background ensemble in a single '
@@ -283,11 +277,13 @@ def main(argv=None):
         for val, name in ((args.count, '--count'),
                           (args.grid_npx, '--grid-npx'),
                           (args.capture_method, '--capture-method'),
-                          (args.relax_iters, '--relax-iters')):
+                          (args.icr0_stop, '--icr0-stop')):
             if val is not None:
                 ap.error(f'{name} requires --op reconstruct')
     if args.capture_method is None:
         args.capture_method = 'petkova'
+    if args.icr0_stop is None:
+        args.icr0_stop = 3e-3
     if args.orient is None:
         args.orient = 'jr96'
 
@@ -345,14 +341,13 @@ def main(argv=None):
     # say up front what will run and with which settings - the phases below
     # (capture / pairing / relax) can each take minutes on ~1e6 particles
     if args.op == 'reconstruct':
-        budget = ('icr0 < 1e-3, max 4800 iters' if args.relax_iters is None
-                  else f'fixed {args.relax_iters} iters')
+        budget = f'icr0 < {args.icr0_stop:g}, max 4800 iters'
         print(f'plan: reconstruct gas -> {args.count} particles (raw AMR '
               f'capture, {args.capture_method} deposit'
               + (f', {args.grid_npx} cells/axis' if args.grid_npx else '')
               + ' -> glassgen table build: envelope '
               f'{"cascade" if args.cascade else "single relax"}, {budget}, '
-              'field gather at the final positions); '
+              'conservative field scatter at the final positions); '
               f'box {boxdesc}; nsmooth {args.nsmooth}', flush=True)
     else:
         arrow = ('x%d' if args.op == 'split' else '1/%d') % factor
@@ -401,13 +396,10 @@ def main(argv=None):
             del sel
             # a from-scratch draw is a COLD start - the builder runs the
             # regular glassgen glass build (anneal ladder / cascade), not the
-            # split/merge confined heal. max_iter default 4800; icr0_stop
-            # usually finishes it earlier.
-            if args.relax_iters is None:
-                rkw = dict(icr0_stop=1e-3, max_iter=4800)
-            else:
-                rkw = dict(icr0_stop=0.0, max_iter=args.relax_iters)
-            rkw.update(callback_every=10)
+            # split/merge confined heal. max_iter 4800; icr0_stop usually
+            # finishes it earlier.
+            rkw = dict(icr0_stop=args.icr0_stop, max_iter=4800,
+                       callback_every=10)
             print(f'reconstruct: {n_in} gas -> {args.count} target '
                   f'(capture -> glassgen build_from_table, envelope '
                   f'{"cascade" if args.cascade else "single relax"})...',
@@ -416,9 +408,9 @@ def main(argv=None):
             pos2, mass2, aux2, _isf, ea = reconstruct.reconstruct_resample(
                 pos, mass, args.count, aux, box=box, nsmooth=args.nsmooth,
                 method=args.capture_method, base_npx=args.grid_npx,
-                bg_c=args.bg_c, bg_k=args.bg_k,
+                bg_c=args.bg_c,
                 n_frame=args.n_frame, nl0=args.nl0, cascade=args.cascade,
-                scaffold=args.scaffold, alpha=args.alpha,
+                alpha=args.alpha,
                 relax_kw=rkw,
                 progress=lambda s: print(
                     f'  iter {s.it}: denserr {s.dens_err:.4f} icr0 '

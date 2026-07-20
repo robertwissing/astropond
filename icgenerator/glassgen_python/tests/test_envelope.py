@@ -277,30 +277,25 @@ def test_fill_empty_no_floor_shelf_strictly_decreasing():
     centres[:, 0] = d
     vals = np.zeros(len(d))
     vals[0] = 10.0
-    common = dict(sizes=np.full(len(d), 0.05), floor=1e-3,
-                  tail_scale=0.7, tail_floor=1.25e-4)
+    common = dict(floor=1e-3, tail_scale=0.7, tail_floor=1.25e-4)
     noflr = E._fill_empty(vals.copy(), 'decay', centres, None,
-                          flat_floor=False, tail_reach=6.0, **common)
-    shelf = E._fill_empty(vals.copy(), 'decay', centres, None,
-                          flat_floor=True, **common)
+                          tail_reach=6.0, **common)
     ray = noflr[1:]                                # the bad cells, ordered by d
     assert (np.diff(ray) < 0).all()               # STRICTLY decreasing, no plateau
     assert ray[0] < 10.0 and ray[0] > common['tail_floor']
     assert np.isclose(ray[-1], common['tail_floor'], rtol=1e-6)   # reaches it @corner
     assert (ray >= common['tail_floor'] * (1 - 1e-9)).all()
-    # de-flatten is a real change: differs from the default shelf fill
-    assert not np.allclose(noflr[1:], shelf[1:])
 
 
 def test_fill_empty_no_floor_needs_tail():
-    # flat_floor=False is meaningless without the frame corner (tail_scale) and
-    # its floor (tail_floor) - the profile has nowhere to decay to.
+    # 'decay' is meaningless without the frame corner (tail_scale) and its
+    # floor (tail_floor) - the profile has nowhere to decay to. (The only
+    # fill since the taper family retired, CLEANUP_PLAN C2.)
     import pytest
     centres = np.array([[0.0, 0, 0], [0.1, 0, 0]])
     vals = np.array([10.0, 0.0])
     with pytest.raises(ValueError, match='tail_scale'):
-        E._fill_empty(vals.copy(), 'decay', centres, None,
-                      sizes=np.full(2, 0.05), floor=1e-3, flat_floor=False)
+        E._fill_empty(vals.copy(), 'decay', centres, None, floor=1e-3)
 
 
 def test_fill_empty_tail_reach_steepens_midfield():
@@ -312,12 +307,11 @@ def test_fill_empty_tail_reach_steepens_midfield():
     centres[:, 0] = d
     vals = np.zeros(len(d))
     vals[0] = 10.0
-    common = dict(sizes=np.full(len(d), 0.05), floor=1e-3,
-                  tail_scale=0.7, tail_floor=1.25e-4)
+    common = dict(floor=1e-3, tail_scale=0.7, tail_floor=1.25e-4)
     shallow = E._fill_empty(vals.copy(), 'decay', centres, None,
-                            flat_floor=False, tail_reach=3.0, **common)[1:]
+                            tail_reach=3.0, **common)[1:]
     steep = E._fill_empty(vals.copy(), 'decay', centres, None,
-                          flat_floor=False, tail_reach=12.0, **common)[1:]
+                          tail_reach=12.0, **common)[1:]
     assert np.isclose(steep[-1], shallow[-1], rtol=1e-6)   # same corner value
     mid = slice(5, 30)
     assert (steep[mid] < shallow[mid]).all()               # steeper drains more
@@ -401,157 +395,7 @@ def test_frame_open_box_cap_delta_grows_cap():
     assert np.isclose(box1[0], box0[0])          # span-driven axes unchanged
 
 
-# --------------------------------------------------------------------------- #
-#  Cubic resolvability scaffold (2026-07-13 redesign): one marginal profile
-#  rho(s) = rho0*(1 + s/(3*alpha*h0))^-3 from the occupied surface to the
-#  frame corner, lattice retired for mass-weighted scaffold sampling
-# --------------------------------------------------------------------------- #
-
-def test_fill_cubic_profile_and_max_raw():
-    # a line of unit cells along +x: cell 0 occupied at rho0=8, the rest
-    # vacuum except cell 4 which holds real faint structure ABOVE the taper
-    # (taper at s=4 is (0.5 + 4/6)^-3 ~ 0.63 < 0.8 < rho_edge). The fill
-    # must follow (rho0^(-1/3) + s/(3*alpha*m^(1/3)))^-3 exactly and max()
-    # must keep the real value.
-    centres = np.column_stack([np.arange(5.0), np.zeros(5), np.zeros(5)])
-    vals = np.array([8.0, 0.0, 0.0, 0.0, 0.8])
-    m, alpha, re = 1.0, 2.0, 1.0
-    out = E._fill_cubic(vals.copy(), centres, None, m, alpha, re)
-    scale = 3.0 * alpha * m ** (1.0 / 3.0)          # = 6
-    s = np.array([1.0, 2.0, 3.0, 4.0])
-    expect = (8.0 ** (-1.0 / 3.0) + s / scale) ** -3.0
-    assert out[0] == 8.0                            # occupied untouched
-    np.testing.assert_allclose(out[1:4], expect[:3], rtol=1e-12)
-    assert out[4] == 0.8                            # raw beats the taper
-    assert expect[3] < 0.8
-    # u-linearity: rho^(-1/3) grows linearly with distance, slope 1/scale
-    u = out[1:4] ** (-1.0 / 3.0)
-    np.testing.assert_allclose(np.diff(u), [1.0 / scale, 1.0 / scale],
-                               rtol=1e-12)
-    # monotone decreasing along the ray (up to the real-structure bump)
-    assert out[1] > out[2] > out[3] > 0.0
-
-
-def test_fill_cubic_steeper_near_bright_launch():
-    # resolvability self-adjustment: from a BRIGHT launch the taper drops a
-    # fixed factor over 3*alpha*h0 with h0 = (m/rho0)^(1/3) - so the descent
-    # is steeper (in absolute length) than from a faint launch
-    m, alpha, re = 1.0, 2.0, 1.0
-    for rho0 in (8.0, 1000.0):
-        centres = np.column_stack([np.arange(2.0), np.zeros(2), np.zeros(2)])
-        vals = np.array([rho0, 0.0])
-        out = E._fill_cubic(vals.copy(), centres, None, m, alpha, re)
-        h0 = (m / rho0) ** (1.0 / 3.0)
-        # value at s=1 in units of the launch: (1 + 1/(3*alpha*h0))^-3
-        np.testing.assert_allclose(
-            out[1] / rho0, (1.0 + 1.0 / (3.0 * alpha * h0)) ** -3.0,
-            rtol=1e-12)
-    # and the FAR field is universal: launch-independent (3*alpha)^3*m/s^3
-    s = 1e3
-    for rho0 in (8.0, 1000.0):
-        v = (rho0 ** (-1.0 / 3.0) + s / (3.0 * alpha)) ** -3.0
-        np.testing.assert_allclose(v, (3.0 * alpha / s) ** 3.0, rtol=2e-2)
-
-
-def test_cubic_tail_u_linear_continuation():
-    # outside the domain the continuation needs only the boundary value and
-    # the excess distance (u-linear): continuous at the face, exact profile
-    shell = lambda p: np.full(len(p), 8.0)            # noqa: E731
-    scale = 6.0
-    tail = E._CubicTail(shell, -0.5 * np.ones(3), 0.5 * np.ones(3), scale)
-    d = np.array([0.0, 0.3, 1.0, 5.0])
-    q = np.column_stack([0.5 + d, np.zeros(4), np.zeros(4)])
-    v = tail.rho0(q)
-    expect = (8.0 ** (-1.0 / 3.0) + d / scale) ** -3.0
-    np.testing.assert_allclose(v, expect, rtol=1e-12)
-    assert v[0] == 8.0                                # continuous at the face
-
-
-def test_build_table_envelope_cubic_ball():
-    # the cubic arm end-to-end on the gas ball: closure-exact mass-weighted
-    # background (no lattice), monotone home-pointing padded target, keys
-    t = _ball_table()
-    gm = E.table_mass(t)
-    # k pinned to the historical 2.0: the cubic arm (falsified, documented-
-    # dead) predates the M20 n_frame default (k~1.26), whose shallower floor
-    # moves the closure's bg mass outward and breaks the concentration check
-    env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
-                                 scaffold='cubic')
-    assert env['scaffold'] == 'cubic'
-    assert env['alpha'] == E.ALPHA_DEFAULT
-    # occupancy unchanged by the scaffold choice
-    assert env['occupancy'].rho0(np.zeros((1, 3)))[0] == 1.0
-    assert env['occupancy'].rho0(np.full((1, 3), 0.45))[0] == 0.0
-    # background: pure mass-weighted sampling at particle mass m, count from
-    # the closure - the ensemble carries the target's whole integral
-    assert len(env['bg_pos']) > 0
-    assert np.allclose(env['bg_mass'], env['m'])
-    carried = env['gas_mass'] + env['bg_mass'].sum()
-    assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
-    # all background sites are vacuum cells (sampled from the scaffold)
-    assert (env['occupancy'].rho0(env['bg_pos']) < 0.5).all()
-    # backing tracks the target: the near-surface annulus is denser than the
-    # deep vacuum (the k15/ladder cusp lever, now by construction)
-    r_bg = np.linalg.norm(env['bg_pos'], axis=1)
-    n_in = ((r_bg > 0.25) & (r_bg < 0.35)).sum()
-    n_out = ((r_bg > 0.45) & (r_bg < 0.55)).sum()
-    v_in = 0.35 ** 3 - 0.25 ** 3
-    v_out = 0.55 ** 3 - 0.45 ** 3
-    assert n_in / v_in > 2.0 * n_out / v_out
-    # padded target: exact in the gas, strictly decreasing along an outward
-    # ray through the taper, in-domain vacuum and beyond the domain (the
-    # _CubicTail region), positive everywhere - never flat.
-    # Radii re-aimed 2026-07-16 (taper_len retired, CLEANUP_PLAN C1a): same
-    # frame shrink as the exp arm (cubic's own carried-skirt taper_len is
-    # gone too) - probes must sit inside the 0.6 frame half-extent; see
-    # test_vacuum_tail_monotone_home_pointing for the cell-aliasing note.
-    assert np.isclose(env['density'].rho0(np.zeros((1, 3)))[0], 10.0)
-    radii = np.array([0.30, 0.40, 0.49, 0.58])
-    v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
-    assert (np.diff(v) < 0).all()
-    assert v.min() > 0.0
-    # rho_frame is the DERIVED frame-corner value of the profile: the far
-    # target stays at or above it inside the frame
-    assert v[-1] >= env['rho_frame'] * (1 - 1e-9)
-
-
-def test_cubic_scaffold_validation():
-    import pytest
-    t = _ball_table()
-    gm = E.table_mass(t)
-    with pytest.raises(ValueError):                  # unknown scaffold
-        E.build_table_envelope(t, gm, 5000, scaffold='quartic')
-
-
-def test_build_uniform_envelope_cubic():
-    # the glassgen-native (analytic target) path: same closure contract
-    from glassgen.density import CallableDensity
-
-    def rho(p):
-        r = np.linalg.norm(np.asarray(p, dtype=np.float64), axis=1)
-        return np.where(r < 0.25, 10.0, 0.0)
-
-    rng = np.random.default_rng(1)
-    pos = rng.uniform(-0.25, 0.25, (3000, 3))
-    pos = pos[np.linalg.norm(pos, axis=1) < 0.25]
-    gm = 10.0 * 4.0 / 3.0 * np.pi * 0.25 ** 3
-    env = E.build_uniform_envelope(CallableDensity(rho), pos, gm, 3000,
-                                   c=64, scaffold='cubic')
-    assert env['scaffold'] == 'cubic'
-    assert len(env['bg_pos']) > 0
-    assert np.allclose(env['bg_mass'], env['m'])
-    carried = env['gas_mass'] + env['bg_mass'].sum()
-    assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
-    # padded target monotone along an outward ray, bottoming out at the
-    # rho_frame floor (this toy's frame is small - the M6 guidance tail
-    # reaches the floor within the probe range, like the exp arm)
-    radii = np.array([0.30, 0.40, 0.60, 0.90])
-    v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
-    assert (np.diff(v) <= 0).all() and v[0] > v[1]
-    assert v.min() >= env['rho_frame'] * (1 - 1e-9)
-
-
-def test_eta_lambda_and_sampled_backing():
+def test_sampled_backing_and_retired_kwargs():
     # the post-cubic pivot: decay_spacing (lambda in output-spacing units,
     # pinned to the legacy flat_floor=True taper it shapes - inert on the
     # M18 no-floor profile) + sampled backing, the closure as the sole
@@ -560,9 +404,7 @@ def test_eta_lambda_and_sampled_backing():
     # mass m in vacuum.
     t = _ball_table()
     gm = E.table_mass(t)
-    env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
-                                 decay_spacing=1.0, flat_floor=True)
-    assert env['decay_spacing'] == 1.0
+    env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0)
     assert len(env['bg_pos']) > 0
     assert np.allclose(env['bg_mass'], env['m'])
     carried = env['gas_mass'] + env['bg_mass'].sum()
@@ -588,56 +430,36 @@ def test_eta_lambda_and_sampled_backing():
         E.build_table_envelope(t, gm, 5000, box=None, bg_mode='sample')
     with pytest.raises(TypeError):
         E.build_table_envelope(t, gm, 5000, box=None, bg_tail=True)
+    # ... and so is the taper family (C2)
+    for kw in (dict(flat_floor=True), dict(shell_start='edge'),
+               dict(decay_spacing=1.0), dict(decay_cells=4.0),
+               dict(decay_local=True)):
+        with pytest.raises(TypeError):
+            E.build_table_envelope(t, gm, 5000, box=None, **kw)
 
 
-def _two_brightness_table(n=32):
-    # bright ball (r<0.12, rho=10) + faint annulus (0.3<r<0.45, rho=0.05):
-    # the annulus carries the faint-end mass so rho_edge lands at 0.05,
-    # ORDERS below the bright surface - the local-vs-global lambda split
-    from glassgen.density import TableDensity
-    ax = (np.arange(n) + 0.5) / n - 0.5
-    x, y, z = np.meshgrid(ax, ax, ax, indexing='ij')
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    vals = np.where(r < 0.12, 10.0, np.where((r > 0.3) & (r < 0.45),
-                                             0.05, 0.0))
-    return TableDensity((ax, ax, ax), vals)
-
-
-def test_decay_local_shrinks_bright_skirt():
-    # M16 sink fix: with lambda evaluated at the LAUNCH cell's own density
-    # the skirt above the bright surface collapses (~(rho_edge/rho_local)
-    # ^(1/3) shorter), while rho_edge-level launches are unchanged - the
-    # global-lambda near-flat shelf above bright surfaces was the mass
-    # sink the cusp drained into (table_res_probe vertical panel).
-    t = _two_brightness_table()
+def test_bg_over_oversubscribes_closure():
+    # M21 (2026-07-18): bg_over oversubscribes the mass-contract closure by
+    # bg_over*n_final extra fillers (ensemble mass ABOVE M_target), aimed at
+    # cancelling the systematic post-cull count undershoot (renorm f > 1).
+    # Default 0 = the exact contract, byte-identical behaviour.
+    t = _ball_table()
     gm = E.table_mass(t)
-    # flat_floor=True pins the legacy taper the eta/local lambda shapes
-    # (inert on the M18 no-floor profile); backing is always sampled (C1)
-    kw = dict(box=None, c=64, k=2.0, decay_spacing=1.0, flat_floor=True)
-    envg = E.build_table_envelope(t, gm, 2000, **kw)
-    envl = E.build_table_envelope(t, gm, 2000, decay_local=True, **kw)
-    assert envl['decay_local'] and not envg['decay_local']
-    assert envl['rho_edge'] == envg['rho_edge'] < 0.06   # annulus sets it
-    # probe the vacuum gap just outside the bright surface: local decays
-    # much faster from the same (uncapped local-start) launch
-    pts = np.array([[0.18, 0.0, 0.0], [0.22, 0.0, 0.0]])
-    vg = envg['density'].rho0(pts)
-    vl = envl['density'].rho0(pts)
-    assert (vl < 0.2 * vg).all()
-    # both stay relax-safe: monotone outward, floored at rho_frame
-    radii = np.array([0.16, 0.20, 0.26])
-    for env in (envg, envl):
-        v = env['density'].rho0(np.stack([radii, np.zeros(3),
-                                          np.zeros(3)], 1))
-        assert (np.diff(v) <= 1e-12).all()
-        assert v.min() >= env['rho_frame'] * (1 - 1e-9)
-    # smaller demanded skirt mass -> the closure needs fewer (never more)
-    # backing particles
-    assert len(envl['bg_pos']) <= len(envg['bg_pos'])
-    # guard: decay_local needs the eta taper
-    import pytest
-    with pytest.raises(ValueError):
-        E.build_table_envelope(t, gm, 2000, box=None, decay_local=True)
+    env0 = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0)
+    env1 = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0,
+                                  bg_over=0.1)
+    assert env0['bg_over'] == 0.0
+    assert env1['bg_over'] == 0.1
+    # exactly bg_over*N extra fillers beyond the exact contract
+    assert len(env1['bg_pos']) == len(env0['bg_pos']) + round(0.1 * 5000)
+    # the extras are ordinary backing: mass m, vacuum-only, same shell draw
+    assert np.allclose(env1['bg_mass'], env1['m'])
+    assert (env1['occupancy'].rho0(env1['bg_pos']) < 0.5).all()
+    # the target field itself is untouched (bg_over is ensemble-side only)
+    probe = np.stack([np.array([0.30, 0.40, 0.49, 0.58]),
+                      np.zeros(4), np.zeros(4)], 1)
+    assert np.allclose(env1['density'].rho0(probe),
+                       env0['density'].rho0(probe))
 
 
 # --------------------------------------------------------------------------- #

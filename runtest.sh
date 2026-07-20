@@ -105,7 +105,9 @@ fmt() {
 # self-density correction; writes ${glassfile}_IC directly). The target density
 # is read AUTOMATICALLY from the pre-IC .param (dICdens* profiles 1/2/3 =
 # uniform/step/tanh). For a disk/accdisk profile (>=4) add a density table to
-# GLASSMODE (e.g. "--table densitytable_xdr --direction r_sph").
+# GLASSMODE (e.g. "--table densitytable.npz" - the coordinate mapping lives
+# in the self-describing table header; convert a legacy densitytable_xdr
+# once with `python -m glassgen.density`).
 #
 # Extra glassgen.cli options appended to the default run, e.g.
 #   "--no-progressive"  single full-resolution relax (no cascade)
@@ -565,9 +567,9 @@ setup_evrard() {
     runname_extra=""
     # evrard's density is dICdensprofile=8 (1/r cusp), which the Python glassgen
     # backend cannot evaluate analytically -> relax against the radial density
-    # table the rand pre-IC writes (test_cases/evrard/densitytable_xdr, the glass
-    # step's cwd). dICdensdir=4 = spherical radius, so index by r_sph.
-    GLASSMODE="--table densitytable_xdr --direction r_sph"
+    # table the rand pre-IC writes (test_cases/evrard/densitytable.npz, the glass
+    # step's cwd). Self-describing table: the r_sph mapping is in its header.
+    GLASSMODE="--table densitytable.npz"
 }
 
 # Function for alfven setup with generic parameters

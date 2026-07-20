@@ -5,12 +5,21 @@ Coordinate mappings follow the C direction codes in pkdUpdateDensity
 A 1D table/callable is evaluated at the mapped coordinate; a 2D table at a
 pair of mapped coordinates; a 3D table at (x, y, z) directly.
 
-TableDensity reads/writes the densitytable_xdr format used by the C
-icgenerator and setupfiles/IC_denstable.py: a 3-line ascii header
-(dim, n, R) followed by XDR float arrays (each prefixed by a u32 length):
-one length-n array per axis, then the flattened (C-order) density grid.
-The reader is implemented with numpy big-endian dtypes rather than xdrlib
-(removed in Python 3.13).
+THE table format is .npz and SELF-DESCRIBING (CLEANUP_PLAN C6, 2026-07-17):
+a TableDensity saves as axes + values + its coordinate mapping in the
+header, so a loaded table knows its own dimensionality, extent and
+coordinate system - no --direction flag at the point of use. AMR tables
+(amrtable.AMRTable) share the .npz container with their own block layout;
+reconstruct.load_table() sniffs and loads either.
+
+The densitytable_xdr format of the C icgenerator (3-line ascii header
+dim/n/R, then XDR float arrays, each prefixed by a u32 length) is LEGACY:
+`from_xdr` remains only as the reader for the one-shot converter
+
+    python -m glassgen.density old_densitytable_xdr new_table.npz \
+        --direction r_sph
+
+(numpy big-endian dtypes rather than xdrlib, removed in Python 3.13).
 """
 import numpy as np
 from numba import njit, prange
@@ -141,8 +150,45 @@ class TableDensity(DensityField):
         else:
             self.mapping = None  # 3D tables are indexed by (x, y, z)
 
+    def save(self, path):
+        """Write the self-describing .npz: ax0..ax{dim-1} + values + the
+        coordinate mapping (1D/2D; a 3D table is indexed by (x,y,z) and
+        carries none). Loads back via TableDensity.load / load_table."""
+        meta = {'values': self.values}
+        for i, a in enumerate(self.axes):
+            meta[f'ax{i}'] = a
+        if self.dim == 1:
+            meta['mapping'] = np.array([self.mapping])
+        elif self.dim == 2:
+            meta['mapping'] = np.array(list(self.mapping))
+        np.savez(path, **meta)
+
+    @classmethod
+    def load(cls, path):
+        """Load a TableDensity .npz written by save(). Dimensionality comes
+        from the values array; 1D/2D tables carry their mapping in the
+        header (legacy 3D saves without one load fine - 3D is (x,y,z))."""
+        with np.load(path) as d:
+            values = d['values']
+            dim = values.ndim
+            axes = tuple(d[f'ax{i}'] for i in range(dim))
+            if 'mapping' in d.files:
+                maps = [str(s) for s in d['mapping']]
+                mapping = maps[0] if dim == 1 else tuple(maps)
+            elif dim == 3:
+                mapping = None
+            else:
+                raise ValueError(
+                    f'{path}: a {dim}D table needs its coordinate mapping in '
+                    'the header - re-save it, or convert the original xdr '
+                    'with python -m glassgen.density')
+        return cls(axes, values, mapping=mapping)
+
     @classmethod
     def from_xdr(cls, filename, mapping='r_sph'):
+        """LEGACY reader for the C generator's densitytable_xdr format -
+        kept for the one-shot converter (python -m glassgen.density); the
+        tools consume self-describing .npz tables only."""
         with open(filename, 'rb') as f:
             dim = int(f.readline())
             n = int(f.readline())
@@ -352,3 +398,44 @@ class KernelMatchedDensity(DensityField):
                            dtype=np.float64).reshape(-1, k)
             out[sl] = v @ self.weights
         return out
+
+
+def main(argv=None):
+    """One-shot converter: legacy densitytable_xdr -> self-describing .npz.
+
+        python -m glassgen.density densitytable_xdr table.npz --direction r_sph
+
+    The coordinate mapping is baked into the .npz header (this is the ONLY
+    place --direction still exists); the tools then take --table table.npz
+    with no direction flag (CLEANUP_PLAN C6)."""
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser(
+        description='convert a legacy C-generator densitytable_xdr into the '
+                    'self-describing .npz density-table format (the mapping '
+                    'is stored in the table header)')
+    ap.add_argument('xdr', help='input densitytable_xdr file')
+    ap.add_argument('out', help='output .npz path')
+    ap.add_argument('--direction', nargs='+', default=['r_sph'],
+                    choices=MAPPINGS,
+                    help='coordinate mapping the table is indexed by: one '
+                         'value for a 1D table, two for a 2D table '
+                         '(default r_sph); ignored for 3D tables, which '
+                         'are indexed by (x, y, z)')
+    args = ap.parse_args(argv)
+    mapping = (args.direction[0] if len(args.direction) == 1
+               else tuple(args.direction))
+    try:
+        t = TableDensity.from_xdr(args.xdr, mapping=mapping)
+    except ValueError as e:
+        sys.exit(f'{args.xdr}: {e}')
+    # np.savez appends .npz itself when missing - name it up front instead
+    out = args.out if args.out.endswith('.npz') else args.out + '.npz'
+    t.save(out)
+    desc = 'x'.join(str(len(a)) for a in t.axes)
+    print(f'wrote {out}: {t.dim}D table {desc}'
+          + (f', mapping {t.mapping}' if t.mapping else ' (x,y,z indexed)'))
+
+
+if __name__ == '__main__':
+    main()

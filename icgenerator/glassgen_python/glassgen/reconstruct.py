@@ -109,10 +109,27 @@ def particle_density(pos, mass, box=None, nsmooth=64):
     return rho, h
 
 
+def _capture_fill_kw(empty, vals, boxarr, pos, floor_frac):
+    """Tail anchors for a capture-time 'decay' fill (C2): the no-floor
+    profile runs from the nearest occupied value down to the floor_frac
+    floor at the domain corner. Other fill modes need nothing."""
+    if empty != 'decay':
+        return {}
+    v = np.asarray(vals, dtype=np.float64).ravel()
+    pv = v[v > 0.0]
+    if pv.size == 0:
+        return {}
+    fl = floor_frac * float(np.median(pv))
+    span = (np.asarray(boxarr, dtype=np.float64) if boxarr is not None
+            else np.asarray(pos.max(0) - pos.min(0), dtype=np.float64))
+    return dict(floor=fl, tail_scale=0.5 * float(np.max(span)),
+                tail_floor=fl)
+
+
 def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     method='petkova', base_npx=None, max_level=16,
                     part_per_cell=8, npx=None, empty='decay',
-                    decay_cells=2.0, floor_frac=1e-3, interp='vertex',
+                    floor_frac=1e-3, interp='vertex',
                     contour_n=None, contour_band=8.0, contour_beta=0.5,
                     contour_passes=2, grade=True):
     """Capture the particle density field on a 3D grid, relax-ready.
@@ -154,26 +171,21 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     can never match -> a persistent irreducible relax force
                     that stalls the step controller (observed on the
                     isolated-galaxy IC, denserr floor ~0.24).
-                'decay' (default) - fill each empty cell with its nearest
-                    occupied value DECAYED toward a floor,
-                    rho0 = max(floor, rho_edge * exp(-d / lambda)), where
-                    d is the periodic-aware distance to that occupied cell
-                    and lambda = decay_cells * (the empty cell's own
-                    width). This is the accretion-disk pkdUpdateDensity
-                    trick (gasoline, ICdensprofile>=4): the low-density
-                    region is a smooth taper from the resolved edge down to
-                    a floor, not a constant, so a sparse particle one cell
-                    out feels a target near its actual density and the
-                    irreducible edge force vanishes. floor = floor_frac x
-                    median(occupied) bounds the rho/rho0 dynamic range away
-                    from the rho0=0 singularity.
+                'decay' (default) - fill each empty cell with the no-floor
+                    profile (the C2-surviving fill, see
+                    :func:`envelope._fill_empty`): a strictly-decreasing
+                    ramp from the nearest occupied value down to the
+                    floor_frac floor at the domain corner, so a sparse
+                    particle one cell out feels a target near its actual
+                    density with a home-pointing gradient everywhere.
+                    (The legacy exp taper this mode used pre-2026-07-17
+                    was retired with the taper family, CLEANUP_PLAN C2.)
                 'min'  - floor at the smallest positive cell value (can be
                     a ~1e-12-of-peak kernel tail on a galaxy table: keeps
                     positivity but not the dynamic range).
-                'zero' - keep zeros (table is then NOT relax-safe).
-    decay_cells : 'decay' fill length in units of the empty cell's width
-                (lambda = decay_cells x cell width). Larger -> the edge
-                density reaches further into the vacuum before tapering.
+                'zero' - keep zeros (table is then NOT relax-safe; the
+                    production reconstruct captures RAW and applies the
+                    N-aware overlay separately).
     floor_frac : 'decay'/vacuum floor as a fraction of the median occupied
                 density (bounds the dynamic range; keeps rho0 > 0).
     interp    : AMR readout mode: 'vertex' (default since 2026-07-13, user
@@ -202,12 +214,10 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
         ax = tgt.centres()
         cx, cy, cz = np.meshgrid(*ax, indexing='ij')
         centres = np.stack([cx, cy, cz], axis=-1).reshape(-1, 3)
-        cell_len = float(np.cbrt(np.prod(
-            [np.diff(a).mean() if len(a) > 1 else 1.0 for a in ax])))
-        sizes = np.full(len(centres), cell_len)
         vals = _fill_empty(vals.reshape(-1), empty, centres, boxarr,
-                           sizes=sizes, decay_cells=decay_cells,
-                           floor_frac=floor_frac).reshape(vals.shape)
+                           floor_frac=floor_frac,
+                           **_capture_fill_kw(empty, vals, boxarr, pos,
+                                              floor_frac)).reshape(vals.shape)
         return TableDensity(ax, vals)
 
     if grid != 'amr':
@@ -223,10 +233,10 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
     amr, vals_raw = _capture_amr_grid(si, parts, n, method, base_npx,
                                       max_level, part_per_cell,
                                       contour=contour, grade=grade)
-    vols = amr.volumes()
     vals = _fill_empty(vals_raw, empty, amr.centres(), boxarr,
-                       sizes=np.cbrt(vols), decay_cells=decay_cells,
-                       floor_frac=floor_frac)
+                       floor_frac=floor_frac,
+                       **_capture_fill_kw(empty, vals_raw, boxarr, pos,
+                                          floor_frac))
     return AMRTable.from_grid(amr, vals, interp=interp)
 
 
@@ -439,32 +449,34 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          bg_c=None, bg_k=None, kernel_match=True,
                          contour_refine=True, contour_band=8.0,
                          contour_beta=0.5, target_interp='vertex',
-                         grade=True, shell_start='local', decay_cells=2.0,
-                         scaffold='exp', alpha=None, decay_spacing=None,
-                         decay_local=False,
-                         flat_floor=False, tail_reach=None,
-                         n_frame=None, nl0=None,
+                         grade=True,
+                         alpha=None,
+                         tail_reach=None, n_frame=None, nl0=None,
+                         bg_over=0.0,
                          km_hmode='particle', km_hscale=1.0, verbose=False):
     """The `glassresample --op reconstruct` engine - a THIN WRAPPER around
     the glassgen table builder (decided 2026-07-10): capture the input gas
     density (exact raw AMR table), hand it to
     :func:`glassgen.progressive.build_from_table` (sample `count` positions
     from the table + N-aware envelope + progressive relax + spatial cull /
-    renorm to the input gas mass), then gather per-survivor fields from the
-    input at the FINAL positions.
+    renorm to the input gas mass), then conservatively SCATTER per-survivor
+    fields from the input onto the FINAL positions (scatter_fields, M22).
 
       pos_in, mass_in : the INPUT gas.
       count           : target gas particle count (may be < or > the input).
-      fields          : dict name -> (Nin,)/(Nin,3) input gas fields, gathered
-                        onto the survivors (the glass has no history to inherit).
+      fields          : dict name -> (Nin,)/(Nin,3) input gas fields,
+                        scattered conservatively onto the survivors (the
+                        glass has no history to inherit; totals conserved
+                        exactly over the resolved region, truncation budget
+                        + residuals in audit['fields']).
       cascade         : False -> single full-res relax of the placed ensemble
                         (the --no-progressive fallback), same envelope + cull.
       bg_c, bg_k      : envelope knobs (rho_edge cut count; two-rung ladder
                         rho_frame = rho_edge/k**6). The background is always
                         sampled backing (mass-contract closure; the lattice
                         and bg_tail were retired 2026-07-16, CLEANUP_PLAN C1).
-      scaffold, alpha : 'exp' (M12/M18 profile) or 'cubic' (2026-07-13
-                        resolvability scaffold, FALSIFIED - kept for the
+      alpha : the cascade resolvability tolerance (auto_coarse_count;
+                        the cubic scaffold that shared it was DELETED
                         record; alpha = the shared cascade constant, 2.0).
       contour_refine  : M10 contour-resolving capture (default ON): refine
                         cells straddling the rho_edge(count) band so the
@@ -511,16 +523,28 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     # built flat regardless (build_table_envelope); this sets the OCCUPIED
     # BASE readout the relax fills.
     table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
-    # per-survivor fields: gather from the input at the FINAL positions
+    # per-survivor fields: conservative scatter from the input onto the
+    # FINAL positions (M22). The truncation split needs rho_edge BEFORE the
+    # build - computed here in LOCKSTEP with build_table_envelope (same m,
+    # same c, same k resolve on the same cells).
     t0 = _time.perf_counter()
     src_rho, _ = particle_density(pos_in, mass_in, box=box, nsmooth=nsmooth)
     timings['src_rho'] = _time.perf_counter() - t0
+    _, sizes_e, _, vals_e = table_cells(table)
+    rho_edge_pre, _ = edge_floor_spacing(
+        np.asarray(vals_e, dtype=np.float64), sizes_e.prod(1),
+        M_gas / int(count), c=(bg_c or nsmooth),
+        k=resolve_bg_k(bg_k, n_frame, nsmooth=(bg_c or nsmooth)))
+    field_audit = {}
 
     def _hook(final_pos):
         t = _time.perf_counter()
-        out = gather_fields(final_pos, pos_in, mass_in, src_rho, fields,
-                            box=box, nsmooth=nsmooth)
-        timings['gather'] = _time.perf_counter() - t
+        out, fa = scatter_fields(final_pos, M_gas / max(len(final_pos), 1),
+                                 pos_in, mass_in, src_rho, fields,
+                                 rho_edge=rho_edge_pre, box=box,
+                                 nsmooth=nsmooth)
+        field_audit.update(fa)
+        timings['scatter'] = _time.perf_counter() - t
         return out
 
     rkw = dict(relax_kw or {})
@@ -531,12 +555,9 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                            nsmooth=nsmooth, bg_c=bg_c, bg_k=bg_k,
                            envelope='on', cascade=cascade, seed=seed,
                            open_pad=pad_frac, kernel_match=kernel_match,
-                           shell_start=shell_start, decay_cells=decay_cells,
-                           scaffold=scaffold, alpha=alpha,
-                           decay_spacing=decay_spacing,
-                           decay_local=decay_local,
-                           flat_floor=flat_floor, tail_reach=tail_reach,
-                           n_frame=n_frame, nl0=nl0,
+                           alpha=alpha,
+                           tail_reach=tail_reach,
+                           n_frame=n_frame, nl0=nl0, bg_over=bg_over,
                            km_hmode=km_hmode, km_hscale=km_hscale,
                            filler_field_hook=_hook, verbose=verbose, **rkw)
     timings['build'] = _time.perf_counter() - t0
@@ -549,7 +570,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
               if k in ('rho_edge', 'rho_frame', 'delta_bg', 'm',
                        'scaffold', 'alpha')},
              relax_iters=int(res.niter), relax_stop=str(res.stop_reason),
-             timings=timings,
+             timings=timings, fields=dict(field_audit),
              levels=[dict(name=lv.get('name'), n=lv.get('n'),
                           niter=lv.get('niter'), wall=lv.get('wall'))
                      for lv in getattr(res, 'levels', [])])
@@ -598,38 +619,167 @@ def gather_fields(qpos, src_pos, src_mass, src_rho, fields, box=None,
     return out
 
 
+def scatter_fields(qpos, m_out, src_pos, src_mass, src_rho, fields,
+                   rho_edge=None, box=None, nsmooth=64):
+    """Conservative donor-normalized SCATTER of input fields onto the
+    survivors - THE default field transfer (RECONSTRUCT_PLAN M22,
+    2026-07-19; replaces the Shepard gather above, which is kept for
+    comparison/tests).
+
+    Every INPUT particle in the resolved region (src_rho >= rho_edge)
+    donates its conserved content m_i*A_i to the receivers its kernel
+    reaches (sph_interp.sph_method.scatter_to_points: per-donor shares
+    sum to 1, nearest-receiver fallback so every donor lands), and each
+    receiver takes the MASS-WEIGHTED AVERAGE: A_j = content_j/recv_mass_j.
+
+    Division convention (A/B'd on the galaxy, 2026-07-19, RECONSTRUCT_PLAN
+    M22): dividing by a UNIFORM mass share instead makes the written
+    totals exact but writes A_j = r_j*Abar_j with r = the received/uniform
+    mass ratio (spread [0,3.8] at 20k) - measured KE +31%, coverage noise
+    injected into the dynamics. The average keeps every particle's value
+    the smoothed local input field (a constant field is reproduced
+    EXACTLY, fill included); the written-IC totals then drift by the
+    DELIVERED-GEOMETRY difference (the reconstructed disk is thicker, so
+    equal-mass particles sample more hot off-plane gas: E_th +17% here,
+    +19% under the legacy gather - a representation limit, NOT transfer
+    error; closing it uniformly was measured at x0.85 on every u and
+    rejected). The audit reports TWO tiers: resid_* = the scatter's own
+    content conservation (machine zeros - nothing is lost in transfer)
+    and drift_*/ke_*/lz_* = written-IC totals vs the interior input
+    (geometry diagnostics - watch them like the wing excess). Donors
+    below rho_edge are NOT scattered: their content is the explicit
+    truncation budget (deliberately unrepresented, never smeared onto the
+    resolved region).
+
+    Returns (out, audit): out maps name -> (Nq,)/(Nq,ncomp) intensive
+    values; audit holds the truncation budget (trunc_*), per-field
+    conservation residuals (should be ~1e-16), the KE deficit from
+    velocity smoothing (ke_*, when a 3-vector 'vel' field is present,
+    with L_z in/out about the interior COM) and the received/output mass
+    ratio statistics (recv_ratio_*)."""
+    from scipy.spatial import cKDTree
+    _import_sph_interp()
+    from sph_interp.sph_method import scatter_to_points
+    qpos = np.ascontiguousarray(qpos, dtype=np.float64).reshape(-1, 3)
+    src_pos = np.ascontiguousarray(src_pos, dtype=np.float64).reshape(-1, 3)
+    src_mass = np.asarray(src_mass, dtype=np.float64).ravel()
+    src_rho = np.asarray(src_rho, dtype=np.float64).ravel()
+    m_out = float(m_out)
+    interior = (src_rho >= float(rho_edge)) if rho_edge is not None \
+        else np.ones(len(src_pos), dtype=bool)
+    # donor kernel: 2h = the SPH support holding nsmooth neighbours
+    h_src = 0.5 * (3.0 * nsmooth * src_mass
+                   / (4.0 * np.pi * np.maximum(src_rho, 1e-300))) ** (1. / 3.)
+    # receiver integration element: local spacing cubed (+ the kernel floor
+    # scatter_to_points wants, from the same NN pass)
+    if len(qpos) > 1:
+        d1 = cKDTree(qpos).query(qpos, k=2, workers=-1)[0][:, 1]
+        gen_vol, hmin = d1 ** 3, 0.5 * float(np.median(d1))
+    else:
+        gen_vol, hmin = None, None
+    fin = {k: np.asarray(v, dtype=np.float64)[interior]
+           for k, v in fields.items()}
+    content, recv_mass = scatter_to_points(
+        src_pos[interior], h_src[interior], src_mass[interior], fin,
+        qpos, gen_vol=gen_vol, hmin=hmin, box=box,
+        periodic=(box is not None,) * 3)
+    m_sc = float(src_mass[interior].sum()) / max(len(qpos), 1)
+    starved = recv_mass == 0.0                    # nobody reached them
+    rs = np.where(starved, 1.0, recv_mass)
+    out = {k: (v / rs[:, None] if v.ndim == 2 else v / rs)
+           for k, v in content.items()}
+
+    audit = dict(n_donor=int(interior.sum()),
+                 n_trunc=int((~interior).sum()),
+                 n_starved=int(starved.sum()),
+                 trunc_mass=float(src_mass[~interior].sum()),
+                 m_scatter=m_sc,
+                 mass_renorm_trunc=float(m_out / m_sc),
+                 recv_ratio_min=float(np.min(recv_mass / m_sc)),
+                 recv_ratio_med=float(np.median(recv_mass / m_sc)),
+                 recv_ratio_max=float(np.max(recv_mass / m_sc)))
+    # residuals from the raw scatter content (the machine-zero invariant;
+    # the starved-receiver fill below is continuity, not content)
+    for k, arr in fields.items():
+        arr2 = np.asarray(arr, dtype=np.float64).reshape(len(src_pos), -1)
+        c_in = src_mass[interior, None] * arr2[interior]
+        t_in = c_in.sum(0)
+        t_out = content[k].reshape(len(qpos), -1).sum(0)
+        t_tr = (src_mass[~interior, None] * arr2[~interior]).sum(0)
+        scale = np.abs(t_in) + np.abs(c_in).sum(0)
+        audit[f'resid_{k}'] = float(np.max(np.abs(t_out - t_in)
+                                           / np.maximum(scale, 1e-300)))
+        audit[f'trunc_{k}'] = [float(x) for x in t_tr]
+        w_out = (m_out * out[k].reshape(len(qpos), -1)).sum(0)
+        audit[f'drift_{k}'] = float(np.max(np.abs(w_out - t_in)
+                                           / np.maximum(scale, 1e-300)))
+    for k, arr in fields.items():
+        arr = np.asarray(arr, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[1] == 3:      # a velocity: KE + L_z
+            ke_in = 0.5 * (src_mass[interior]
+                           * (arr[interior] ** 2).sum(1)).sum()
+            ke_out = 0.5 * m_out * (out[k] ** 2).sum()
+            com = np.average(src_pos[interior], axis=0,
+                             weights=src_mass[interior])
+            q = src_pos[interior] - com
+            lz_in = (src_mass[interior] * (q[:, 0] * arr[interior][:, 1]
+                                           - q[:, 1] * arr[interior][:, 0])
+                     ).sum()
+            qq = qpos - com
+            lz_out = m_out * (qq[:, 0] * out[k][:, 1]
+                              - qq[:, 1] * out[k][:, 0]).sum()
+            audit[f'ke_in_{k}'] = float(ke_in)
+            audit[f'ke_out_{k}'] = float(ke_out)
+            audit[f'lz_in_{k}'] = float(lz_in)
+            audit[f'lz_out_{k}'] = float(lz_out)
+    # starved receivers (typically 0 at production relax quality): no donor
+    # kernel reached them and they were nobody's nearest - leaving zeros
+    # would punch pressure/velocity holes in the IC, so fill their INTENSIVE
+    # values from the nearest interior donor (pure continuity; the audit
+    # above deliberately excludes this content, and n_starved reports it).
+    if starved.any() and interior.any():
+        nn = cKDTree(src_pos[interior]).query(qpos[starved], k=1,
+                                              workers=-1)[1]
+        for k, arr in fields.items():
+            arr = np.asarray(arr, dtype=np.float64)
+            out[k][starved] = arr[interior][nn]
+    return out, audit
+
+
 def _pow2(x, lo=4):
     return max(lo, 2 ** int(round(np.log2(max(x, 1.0)))))
 
 
 def save_table(table, path):
-    """Save a captured table (AMRTable or 3D uniform TableDensity) as .npz.
-    Both formats load back through load_table() without sph_interp."""
+    """Save a density table (AMRTable, or TableDensity of any dim) as the
+    self-describing .npz (CLEANUP_PLAN C6): AMR keeps its block layout,
+    uniform/mapped tables carry axes + values + mapping in the header.
+    Both load back through load_table() without sph_interp."""
     if isinstance(table, AMRTable):
         table.save(path)
     elif isinstance(table, TableDensity):
-        if table.dim != 3:
-            raise ValueError(f'expected a 3D table, got dim={table.dim}')
-        np.savez(path, ax0=table.axes[0], ax1=table.axes[1],
-                 ax2=table.axes[2], values=table.values)
+        table.save(path)
     else:
         raise TypeError(f'cannot save table of type {type(table).__name__}')
 
 
 def load_table(path):
-    """Load a table written by save_table() (or AMRTable.save): sniffs the
-    .npz keys - AMR block layout -> AMRTable, axes+values -> TableDensity."""
+    """Load a .npz density table: sniffs the keys - AMR block layout ->
+    AMRTable; values (+axes, and the 1D/2D coordinate mapping in the
+    header) -> TableDensity. Legacy 3D saves without a mapping key load
+    fine (3D is (x,y,z)-indexed)."""
     with np.load(path) as d:
         files = set(d.files)
         if 'keys' in files:
             pass                        # AMR layout: reload via the class
         elif 'values' in files:
-            return TableDensity((d['ax0'], d['ax1'], d['ax2']), d['values'])
+            pass                        # TableDensity layout
         else:
             raise ValueError(
                 f'{path}: not a density table (.npz needs either the '
-                'AMRTable block layout or ax0/ax1/ax2 + values)')
-    return AMRTable.load(path)
+                'AMRTable block layout or ax0.. + values [+ mapping])')
+        amr = 'keys' in files
+    return AMRTable.load(path) if amr else TableDensity.load(path)
 
 
 def describe_table(table):
@@ -640,7 +790,10 @@ def describe_table(table):
                 f'base {"x".join(str(d) for d in table.dims[0])}, '
                 f'{table.interp} readout')
     if isinstance(table, TableDensity):
-        return 'uniform ' + 'x'.join(str(len(a)) for a in table.axes)
+        desc = 'uniform ' + 'x'.join(str(len(a)) for a in table.axes)
+        if table.mapping is not None:
+            desc += f', mapping {table.mapping}'
+        return desc
     return type(table).__name__
 
 
@@ -653,42 +806,26 @@ def _grid_rho(res, volumes, method):
     return np.asarray(res.data['rho'], dtype=np.float64)
 
 
-def apply_count_overlay(table, count, c=64, k=None, decay_cells=2.0,
-                        shell_start='local', scaffold='exp', alpha=None,
-                        decay_spacing=None, decay_local=False,
-                        flat_floor=False, tail_reach=None,
-                        n_frame=None, nl0=None):
+def apply_count_overlay(table, count, c=64, k=None,
+                        tail_reach=None, n_frame=None, nl0=None):
     """The N-aware envelope fill on a captured table: returns
     ``(filled_table, info)`` - a NEW table (the input is untouched). Uses the
     SAME rho_edge scheme as the glassgen builder
     (:func:`envelope.edge_floor_spacing` + the decay ``_fill_empty`` with
     ``floor=rho_edge``): from ``m = M_gas / count``, every cell below
-    ``rho_edge`` is emptied and refilled - with ``flat_floor=False`` (the M18
-    default) as ONE strictly-decreasing profile down to ``rho_frame =
-    rho_edge/k**6`` at the frame edge (frame sized by the same M2 rule the
-    builder uses; rho_floor retired, two-rung ladder); cells above keep their
-    exact values. Different N -> different overlay on the
-    SAME exact table (larger N -> lower rho_edge/floor). This is the density
-    target the relax sees at that count (the leaf-set view of the builder's
-    PaddedDensity shell; the analytic outside-domain tail continuation is
-    not representable in the leaf set and is omitted here).
-
-    ``decay_spacing`` (eta) / ``decay_local`` mirror
-    :func:`envelope.build_table_envelope` exactly: eta puts the taper
-    lambda in OUTPUT-spacing units (``lambda = eta*(m/rho_edge)**(1/3)``,
-    N-invariant reach, overrides ``decay_cells``); ``decay_local``
-    evaluates it at the launch cell's own density (floored at rho_edge,
-    the M16 skirt). The builder's background (sampled backing) changes
-    PARTICLES, not the density target, so it has no counterpart here.
-
-    ``flat_floor=False`` (+ ``tail_reach`` steepness, plan M18 2026-07-14)
-    retires the flat rho_floor shelf: the 'decay' fill becomes ONE
-    strictly-decreasing profile down to rho_frame at the frame corner
-    (mirrors :func:`envelope.build_table_envelope`), so glasstable renders
-    the true de-flattened target. Default True = unchanged."""
-    if decay_local and decay_spacing is None:
-        raise ValueError('decay_local needs decay_spacing (the eta taper); '
-                         'the decay_cells taper is capture-cell based')
+    ``rho_edge`` is emptied and refilled as ONE strictly-decreasing profile
+    down to ``rho_frame = rho_edge/k**6`` at the frame edge (frame sized by
+    the same M2 rule the builder uses; steepness from the M20 nl0 solve or
+    a legacy explicit ``tail_reach``); cells above keep their exact values.
+    Different N -> different overlay on the SAME exact table (larger N ->
+    lower rho_edge/frame). This is the density target the relax sees at
+    that count (the leaf-set view of the builder's PaddedDensity shell;
+    the analytic outside-domain tail continuation is not representable in
+    the leaf set and is omitted here). The builder's background (sampled
+    backing) changes PARTICLES, not the density target, so it has no
+    counterpart here. (The legacy taper family - flat_floor shelf,
+    shell_start, decay_cells/decay_spacing/decay_local - retired
+    2026-07-17, CLEANUP_PLAN C2.)"""
     centres, sizes, _, vals = table_cells(table)
     vals = np.asarray(vals, dtype=np.float64)
     vols = sizes.prod(1)
@@ -717,63 +854,25 @@ def apply_count_overlay(table, count, c=64, k=None, decay_cells=2.0,
     # target and the relaxed target disagree on the profile.
     nl0_eff = p_eff = None
     tail_scale = 0.5 * float(np.max(frame_extent))
-    if flat_floor:
-        tail_reach = 6.0 if tail_reach is None else float(tail_reach)
-    else:
-        spacing_edge = (m / re) ** (1.0 / 3.0)
-        if tail_reach is None:
-            tail_reach = solve_tail_reach(
-                tail_scale, spacing_edge,
-                NL0_DEFAULT if nl0 is None else float(nl0), k, nsmooth=c)
-        elif nl0 is not None:
-            warnings.warn('explicit tail_reach overrides nl0 (legacy path)')
-        if scaffold == 'exp':
-            nl0_eff, p_eff = check_scaffold_resolvability(
-                tail_scale, spacing_edge, tail_reach, k, nsmooth=c)
-    if shell_start not in ('edge', 'local'):
-        raise ValueError(f"unknown shell_start {shell_start!r} "
-                         "(use 'edge' or 'local')")
-    if scaffold not in ('exp', 'cubic'):
-        raise ValueError(f"unknown scaffold {scaffold!r} "
-                         "(use 'exp' or 'cubic')")
-    if scaffold == 'cubic':
-        from .envelope import ALPHA_DEFAULT, _fill_cubic
-        if alpha is None:
-            alpha = ALPHA_DEFAULT
-        filled = _fill_cubic(vals.copy(), centres, fbox, m, alpha, re,
-                             fold=k ** 3,
-                             tail_scale=0.5 * float(np.max(frame_extent)),
-                             tail_floor=rho_frame)
-        n_emptied = int((vals < re).sum())
-    else:
-        # taper length, matching build_table_envelope exactly: eta puts
-        # lambda in OUTPUT-spacing units (N-invariant), overriding the
-        # capture-cell decay_cells; decay_local takes lambda from each launch
-        # cell's OWN density (floored at rho_edge, the M16 skirt).
-        if decay_spacing is not None:
-            if decay_local:
-                fill_sizes = decay_spacing * (
-                    m / np.maximum(vals, re)) ** (1.0 / 3.0)
-            else:
-                fill_sizes = np.full(len(vals),
-                                     decay_spacing * (m / re) ** (1.0 / 3.0))
-            fill_dc = 1.0
-        else:
-            fill_sizes = np.cbrt(vols)
-            fill_dc = decay_cells
-        filled = _fill_empty(vals.copy(), 'decay', centres, fbox,
-                             sizes=fill_sizes, decay_cells=fill_dc,
-                             floor=re,
-                             cap=(re if shell_start == 'edge' else None),
-                             tail_scale=tail_scale,
-                             tail_floor=rho_frame,
-                             flat_floor=flat_floor,
-                             tail_reach=tail_reach)
-        n_emptied = int((vals < re).sum())
+    spacing_edge = (m / re) ** (1.0 / 3.0)
+    if tail_reach is None:
+        tail_reach = solve_tail_reach(
+            tail_scale, spacing_edge,
+            NL0_DEFAULT if nl0 is None else float(nl0), k, nsmooth=c)
+    elif nl0 is not None:
+        warnings.warn('explicit tail_reach overrides nl0 (legacy path)')
+    nl0_eff, p_eff = check_scaffold_resolvability(
+        tail_scale, spacing_edge, tail_reach, k, nsmooth=c)
+    filled = _fill_empty(vals.copy(), 'decay', centres, fbox,
+                         floor=re, cap=None,
+                         tail_scale=tail_scale,
+                         tail_floor=rho_frame,
+                         tail_reach=tail_reach)
+    n_emptied = int((vals < re).sum())
     occ = float((vals >= re).mean())
     info = dict(m=m, rho_edge=re, rho_frame=rho_frame,
-                delta_bg=delta_bg, occ_frac=occ, scaffold=scaffold,
-                flat_floor=flat_floor, tail_reach=tail_reach, bg_k=k,
+                delta_bg=delta_bg, occ_frac=occ,
+                tail_reach=tail_reach, bg_k=k,
                 n_emptied=n_emptied, n_cells=len(vals))
     if nl0_eff is not None:               # M20: launch N_L + exponent
         info['nl0'] = nl0_eff
@@ -856,6 +955,9 @@ def main(argv=None):
                     'would relax against. Render: one gas particle per cell, '
                     'pos=centre, mass=rho*V, rho col=table density, temp '
                     'col=AMR level.')
+    ap.add_argument('--help-extra', action='help',
+                    help='show the full help, including the hidden expert '
+                         'options')
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument('--table', metavar='FILE.npz',
                      help='precomputed raw table (a ${out}_raw.npz from an '
@@ -876,11 +978,11 @@ def main(argv=None):
     ap.add_argument('--count', type=int, default=None,
                     help='target gas particle count N for the envelope-filled '
                          'table (m=M_gas/N -> rho_edge from the cumulative '
-                         'faint tail at bg-c*m; cells below rho_edge refilled '
+                         'faint tail at nedge*m; cells below rho_edge refilled '
                          'with the strictly-decreasing rho_edge->rho_frame '
-                         'profile, rho_frame=rho_edge/bg-k**6). Default: the '
-                         'snapshot gas count; required with --table unless '
-                         '--raw-only')
+                         'profile, rho_frame=rho_edge*nframe/nsmooth). '
+                         'Default: the snapshot gas count; required with '
+                         '--table unless --raw-only')
     ap.add_argument('--raw-only', dest='raw_only', action='store_true',
                     help='write only the raw table + render (no envelope pair)')
     ap.add_argument('--no-contour-refine', dest='contour_refine',
@@ -904,75 +1006,22 @@ def main(argv=None):
                          '(DEFAULT since 2026-07-13)')
     ap.add_argument('--no-grade', dest='grade', action='store_false',
                     help='ungraded capture (pre-M11 leaf set)')
-    ap.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+    ap.add_argument('--nedge', dest='bg_c', type=int, default=0,
                     help='envelope: resolvability contour count (INTEGRAL: '
                          'rho_edge = where the cumulative faint-end mass '
                          'first exceeds nedge*m - the whole discarded tail '
                          'in particle masses, NOT a per-kernel count; 0 = '
-                         'use --nsmooth/-s). --bg-c is a legacy alias')
+                         'use --nsmooth/-s)')
     ap.add_argument('--nframe', dest='n_frame', type=float, default=None,
                     help='M20: floor backability - expected particles per '
                          'edge kernel at the profile floor (rho_frame = '
                          'rho_edge*nframe/nsmooth, k=(nsmooth/nframe)^(1/6); '
-                         'default 16 ~ k1.26). Exclusive with legacy --bg-k')
+                         'default 16 ~ k1.26)')
     ap.add_argument('--nl0', dest='nl0', type=float, default=None,
                     help='M20: scaffold launch resolvability N_L(0) - the '
                          'near-gas e-fold length in kernel supports; '
                          'tail_reach is solved per build (default 1.35; '
                          'avoid ~1, the metastable resonance band)')
-    ap.add_argument('--bg-k', dest='bg_k', type=float, default=None,
-                    help='LEGACY: backing coarseness k directly (rho_frame '
-                         '= rho_edge/k**6); bypasses --nframe')
-    ap.add_argument('--shell-start', dest='shell_start', default='local',
-                    choices=('edge', 'local'),
-                    help="LEGACY (shapes only the --floor-shelf fill; inert "
-                         "on the default no-floor profile). vacuum-taper "
-                         "start: 'local' (default) = the nearest occupied "
-                         "cell's own value; 'edge' = capped at the global "
-                         "rho_edge (the pre-M12 scheme)")
-    ap.add_argument('--scaffold', default='exp', choices=('exp', 'cubic'),
-                    help="vacuum scaffold: 'exp' (default) or 'cubic' "
-                         "(resolvability profile; --bg-k/--shell-start "
-                         "do not apply)")
-    ap.add_argument('--alpha', type=float, default=None,
-                    help='resolvability constant for --scaffold cubic '
-                         '(default 2.0)')
-    ap.add_argument('--decay-cells', dest='decay_cells', type=float,
-                    default=2.0,
-                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
-                         "default no-floor profile). vacuum-taper reach in "
-                         "units of the empty cell's own width (lambda = "
-                         'decay_cells x cell width; default 2.0)')
-    ap.add_argument('--decay-spacing', dest='decay_spacing', type=float,
-                    default=None, metavar='ETA',
-                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
-                         'default no-floor profile). vacuum-taper reach ETA '
-                         'in OUTPUT-spacing units (lambda = '
-                         'ETA*(m/rho_edge)**(1/3); overrides --decay-cells)')
-    ap.add_argument('--decay-local', dest='decay_local', action='store_true',
-                    help='LEGACY (--floor-shelf fill only; NO-OP on the '
-                         "default no-floor profile). evaluate the ETA taper "
-                         "at the launch cell's own density (floored at "
-                         'rho_edge, the M16 skirt); requires --decay-spacing')
-    ap.add_argument('--no-floor-shelf', dest='flat_floor',
-                    action='store_false', default=False,
-                    help='retire the flat rho_floor shelf (plan M18 - now the '
-                         'DEFAULT): the vacuum fill is ONE strictly-decreasing '
-                         'profile down to rho_frame at the frame corner - '
-                         'no mid-field plateau (parking lot), so anneal-'
-                         'kicked strays keep a home-pointing gradient. '
-                         '(kept as a back-compat no-op alias)')
-    ap.add_argument('--floor-shelf', dest='flat_floor',
-                    action='store_true',
-                    help='LEGACY: restore the old flat rho_floor shelf fill '
-                         '(pre-M18). NB the two-rung floor=rho_edge trigger '
-                         'makes this path untested - diagnostics only')
-    ap.add_argument('--tail-reach', dest='tail_reach', type=float,
-                    default=None, metavar='S',
-                    help='LEGACY: explicit no-floor profile steepness TR '
-                         '(r_scale = tail_scale/S; bypasses the --nl0 '
-                         'solve). Default: solved from --nl0. Ignored with '
-                         'the shelf on')
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument('--param', help='gasoline .param file for the box')
     grp.add_argument('--box', nargs=3, type=float,
@@ -987,6 +1036,10 @@ def main(argv=None):
                 ap.error(f'{name} only applies when capturing with -I')
         # no snapshot -> no count default: without --count just render it raw
         table = load_table(args.table)
+        if getattr(table, 'dim', 3) != 3:
+            sys.exit(f'{args.table}: glasstable renders/overlays 3D tables; '
+                     f'this is a {table.dim}D mapped table - relax against '
+                     'it directly (glassrelax --table)')
         print(f'loaded {args.table} ({describe_table(table)})', flush=True)
         out = args.out or re.sub(r'(_raw)?\.npz$', '', args.table)
         _export_table(table, f'{out}_raw', 'raw table')
@@ -1033,19 +1086,14 @@ def main(argv=None):
         return
     # N-aware envelope pair: the target the glassgen builder relaxes against
     filled, info = apply_count_overlay(
-        table, args.count, c=(args.bg_c or args.nsmooth), k=args.bg_k,
-        shell_start=args.shell_start, scaffold=args.scaffold,
-        alpha=args.alpha, decay_cells=args.decay_cells,
-        decay_spacing=args.decay_spacing, decay_local=args.decay_local,
-        flat_floor=args.flat_floor, tail_reach=args.tail_reach,
+        table, args.count, c=(args.bg_c or args.nsmooth),
         n_frame=args.n_frame, nl0=args.nl0)
-    floor_mode = ('floor-shelf' if info['flat_floor']
-                  else f'no-floor-shelf(reach={info["tail_reach"]:g})')
+    floor_mode = f'no-floor(reach={info["tail_reach"]:g})'
     print(f'count={args.count}: m={info["m"]:.3e} '
           f'rho_edge={info["rho_edge"]:.3e} rho_frame={info["rho_frame"]:.3e} '
           f'delta_bg={info["delta_bg"]:.3g} occ(cells>=rho_edge)='
           f'{info["occ_frac"]:.3f} emptied {info["n_emptied"]}/'
-          f'{info["n_cells"]} cells ({info["scaffold"]} scaffold, {floor_mode})',
+          f'{info["n_cells"]} cells ({floor_mode})',
           flush=True)
     save_table(filled, f'{out}_n{args.count}.npz')
     print(f'wrote {out}_n{args.count}.npz', flush=True)

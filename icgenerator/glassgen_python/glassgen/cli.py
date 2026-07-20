@@ -4,11 +4,15 @@ runtest.sh (tipsy pre-IC + density table in -> relaxed tipsy glass out).
 Example, mirroring runtest.sh ICCONFIG:
     PYTHONPATH=icgenerator/glassgen_python python -m glassgen.cli \
         -o datafiles/myglass -I datafiles/pre.00000 -s 64 -n 4800 -oi 4800 \
-        --param datafiles/pre.param --table densitytable_xdr --direction r_sph
+        --param datafiles/pre.param --table densitytable.npz
 
-Without --table the target density is uniform (total gas mass / box
-volume). Output: ${out}_IC (tipsy, gas positions/density/hsmooth updated,
-velocities zeroed) and ${out}.NNNNN snapshots every -oi iterations.
+--table takes the self-describing .npz density-table format (AMR block
+layout, or a 1D/2D/3D grid whose coordinate mapping/extent live in the
+table header - CLEANUP_PLAN C6); convert a legacy C-generator
+densitytable_xdr once with `python -m glassgen.density`. Without --table
+the target density is uniform (total gas mass / box volume). Output:
+${out}_IC (tipsy, gas positions/density/hsmooth updated, velocities
+zeroed) and ${out}.NNNNN snapshots every -oi iterations.
 """
 import argparse
 import os
@@ -20,8 +24,9 @@ _SETUPFILES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            '..', '..', '..', 'setupfiles')
 sys.path.insert(0, _SETUPFILES)
 
-from .density import MAPPINGS, CallableDensity, TableDensity
-from .params import box_from_param, density_from_param, read_param
+from .density import CallableDensity
+from .params import (box_from_param, density_from_param, expert_help,
+                     read_param)
 from .relax import relax
 
 
@@ -78,8 +83,12 @@ def _print_stages(res):
 
 
 def main(argv=None):
+    hide = expert_help(argv)
     ap = argparse.ArgumentParser(
         description='glassgen: glass-relaxation IC generator')
+    ap.add_argument('--help-extra', action='help',
+                    help='show the full help, including the hidden expert '
+                         'options (relax internals, legacy compat)')
     ap.add_argument('-o', dest='out', required=True,
                     help='output prefix (writes ${out}_IC)')
     ap.add_argument('-I', dest='infile', default=None,
@@ -94,35 +103,44 @@ def main(argv=None):
     ap.add_argument('-s', dest='nsmooth', type=int, default=64)
     ap.add_argument('-n', dest='max_iter', type=int, default=4800)
     ap.add_argument('-oi', dest='oi', type=int, default=0,
-                    help='snapshot output interval (0 = none)')
+                    help=hide('snapshot output interval (0 = none)'))
     ap.add_argument('--table', default=None,
-                    help='target density table: a densitytable_xdr file (1D/2D/'
-                         '3D, indexed by --direction) OR a 3D AMR table .npz '
-                         '(glasstable/glassresample --save-table) targeted '
-                         'directly. Default: uniform density')
-    ap.add_argument('--direction', default='r_sph', choices=MAPPINGS,
-                    help='coordinate a 1D table is indexed by')
-    ap.add_argument('--flavour', default='gdforce')
+                    help='target density table (.npz, self-describing): an '
+                         'AMR table (glasstable/glassresample) or a 1D/2D/3D '
+                         'grid whose coordinate mapping lives in the table '
+                         'header. Convert a legacy densitytable_xdr once '
+                         'with `python -m glassgen.density`. Default: '
+                         'uniform density')
+    ap.add_argument('--flavour', default='gdforce',
+                    help=hide('pseudo-pressure prefactor flavour (registry '
+                              'glassgen.flavours; default gdforce)'))
     ap.add_argument('--rhopow', type=float, default=2.0, help='ICrhopow')
-    ap.add_argument('--icr0', type=float, default=1.0, help='ICR0')
-    ap.add_argument('--icrloop0', type=float, default=0.5, help='ICRLOOP0')
-    ap.add_argument('--icr0rate', type=float, default=1.5, help='ICR0Rate')
+    ap.add_argument('--icr0', type=float, default=1.0, help=hide('ICR0'))
+    ap.add_argument('--icrloop0', type=float, default=0.5,
+                    help=hide('ICRLOOP0'))
+    ap.add_argument('--icr0rate', type=float, default=1.5,
+                    help=hide('ICR0Rate'))
     ap.add_argument('--margin', type=int, default=8,
-                    help='extra kNN candidates kept per particle; larger '
-                         'values widen the Verlet skin (fewer rebuilds) at '
-                         'slightly higher per-iteration cost')
+                    help=hide('extra kNN candidates kept per particle; larger '
+                              'values widen the Verlet skin (fewer rebuilds) '
+                              'at slightly higher per-iteration cost'))
     ap.add_argument('--one-sided', action='store_true',
-                    help='SPH-EXA-style transpose-free force walk: faster, '
-                         'pair forces no longer exactly antisymmetric')
+                    help=hide('SPH-EXA-style transpose-free force walk: '
+                              'faster, pair forces no longer exactly '
+                              'antisymmetric'))
     ap.add_argument('--h-mode', dest='hmode', default='knn',
                     choices=('knn', 'measured', 'target'),
-                    help='smoothing length for the force kernel + move step: '
-                         'knn (default), measured (=(m*hfact3/rho_sph)^1/3, '
-                         'the C density-based h), or target '
-                         '(=(m*hfact3/rho0)^1/3, noise-free analytic h)')
+                    help=hide('smoothing length for the force kernel + move '
+                              'step: knn (default), measured '
+                              '(=(m*hfact3/rho_sph)^1/3, the C density-based '
+                              'h), or target (=(m*hfact3/rho0)^1/3, '
+                              'noise-free analytic h). measured/target lost '
+                              'the M17 A/B on every metric - knn is the '
+                              'production mode'))
     ap.add_argument('--nsmoothmin', type=int, default=32,
-                    help='floor on density-based h: never gather fewer than '
-                         '~nsmoothmin real neighbours (measured/target only)')
+                    help=hide('floor on density-based h: never gather fewer '
+                              'than ~nsmoothmin real neighbours '
+                              '(measured/target only)'))
     ap.add_argument('--no-progressive', dest='progressive',
                     action='store_false',
                     help='disable the DEFAULT multi-resolution path and run a '
@@ -137,18 +155,17 @@ def main(argv=None):
                          'The merge factor is floor_pow2(N_full/target); '
                          'factor 1 => no merge / direct relax (default auto)')
     ap.add_argument('--alpha', type=float, default=4.0,
-                    help='resolvability tolerance: the auto coarse count '
-                         'bound AND (with --scaffold cubic) the vacuum-'
-                         'scaffold reach (default 4.0)')
+                    help='cascade resolvability tolerance: the auto coarse '
+                         'count bound (default 4.0)')
     ap.add_argument('--nx-full', dest='nx_full', type=int, default=0,
-                    help='full target resolution (default: round(N**(1/3)) '
-                         'from the input)')
+                    help=hide('full target resolution (default: '
+                              'round(N**(1/3)) from the input)'))
     ap.add_argument('--inter-iter', dest='inter_iter', type=int, default=10,
-                    help='icgen iterations after each intermediate x2 split in '
-                         'the progressive cascade (default 10)')
+                    help=hide('icgen iterations after each intermediate x2 '
+                              'split in the progressive cascade (default 10)'))
     ap.add_argument('--momentum', type=float, default=0.5,
-                    help='heavy-ball coefficient on the post-split confined '
-                         'stages (default 0.5; 0 = off)')
+                    help=hide('heavy-ball coefficient on the post-split '
+                              'confined stages (default 0.5; 0 = off)'))
     ap.add_argument('--icr0-stop', dest='icr0_stop', type=float, default=3e-3,
                     help='median-smoothed icr0 stop (max step as a fraction of '
                          'h) - the quality dial: 3e-3 fast/good, ~1e-3 tight. '
@@ -157,47 +174,34 @@ def main(argv=None):
                     help='fixed polish-iteration budget on the fine stage '
                          '(0 = off; composes with --icr0-stop)')
     ap.add_argument('--no-self-bias', dest='self_bias', action='store_false',
-                    help='disable the Wendland C2 self-density bias correction '
-                         '(Wzero10); density then uses the bare W0 self term')
+                    help=hide('disable the Wendland C2 self-density bias '
+                              'correction (Wzero10); density then uses the '
+                              'bare W0 self term'))
     ap.add_argument('--envelope', choices=('auto', 'on', 'off'), default='auto',
-                    help='free-surface / open-box vacuum padding (see '
-                         'RECONSTRUCT_PLAN.md): pad the vacuum side of the '
-                         'gas with a mass-consistent background so edge kernels '
-                         'fill, relax the union, then cull the background. '
-                         '"auto" (default) = on for an --open box, off for a '
-                         'filled periodic box (byte-identical to no envelope); '
-                         '"on"/"off" force it.')
-    ap.add_argument('--nedge', '--bg-c', dest='bg_c', type=int, default=0,
+                    help=hide('free-surface / open-box vacuum padding (see '
+                              'RECONSTRUCT_PLAN.md): pad the vacuum side of '
+                              'the gas with a mass-consistent background so '
+                              'edge kernels fill, relax the union, then cull '
+                              'the background. "auto" (default) = on for an '
+                              '--open box, off for a filled periodic box '
+                              '(byte-identical to no envelope); "on" forces '
+                              'it for a periodic box that contains vacuum'))
+    ap.add_argument('--nedge', dest='bg_c', type=int, default=0,
                     help='envelope: resolvability contour count - INTEGRAL: '
                          'rho_edge = where the cumulative faint-end mass '
                          'first exceeds nedge*m (the whole discarded tail in '
                          'particle masses, NOT a per-kernel count); 0 = use '
-                         '--nsmooth (-s). --bg-c is a legacy alias.')
+                         '--nsmooth (-s)')
     ap.add_argument('--nframe', dest='n_frame', type=float, default=None,
                     help='envelope (M20): floor backability - expected '
                          'particles per edge kernel at the profile floor '
                          '(rho_frame = rho_edge*nframe/nsmooth, i.e. '
-                         'k = (nsmooth/nframe)**(1/6); default 16 ~ k1.26). '
-                         'Exclusive with the legacy --bg-k.')
+                         'k = (nsmooth/nframe)**(1/6); default 16 ~ k1.26)')
     ap.add_argument('--nl0', dest='nl0', type=float, default=None,
                     help='envelope (M20): scaffold launch resolvability '
                          'N_L(0) - the near-gas e-fold length in kernel '
                          'supports; tail_reach is solved per build (default '
                          '1.35; avoid ~1, the metastable resonance band)')
-    ap.add_argument('--bg-k', dest='bg_k', type=float, default=None,
-                    help='LEGACY: backing coarseness k directly (rho_frame = '
-                         'rho_edge/k**6, Delta_bg = k*(m/rho_edge)**(1/3)); '
-                         'bypasses --nframe. The uniform/analytic path '
-                         'defaults to k=2 (untouched by M20).')
-    ap.add_argument('--tail-reach', dest='tail_reach', type=float,
-                    default=None, metavar='S',
-                    help='LEGACY: explicit vacuum-profile steepness TR '
-                         '(bypasses the --nl0 solve); table targets only')
-    ap.add_argument('--scaffold', default='exp', choices=('exp', 'cubic'),
-                    help="envelope vacuum scaffold: 'exp' (default: strictly-"
-                         "decreasing rho_edge->rho_frame profile + sampled "
-                         "backing) or 'cubic' (falsified M14 arm, kept as "
-                         "documented-dead; --bg-k does not apply)")
     ap.add_argument('--open-pad', dest='open_pad', type=float, default=0.1,
                     help='envelope: vacuum margin (fraction of the gas bbox per '
                          'side) of the synthesised periodic frame for an --open '
@@ -254,15 +258,19 @@ def main(argv=None):
         box = box_from_param(param_dict)
 
     if args.table:
-        if args.table.endswith('.npz'):
-            # a 3D AMR density table (glasstable/glassresample --save-table):
-            # target the captured field directly (reconstruct-in-place).
-            from .amrtable import AMRTable
-            density = AMRTable.load(args.table)
-            print(f'loaded AMR density table {args.table} '
-                  f'({density.ncell} leaves)', flush=True)
-        else:
-            density = TableDensity.from_xdr(args.table, mapping=args.direction)
+        if not args.table.endswith('.npz'):
+            sys.exit(f'{args.table}: --table takes the self-describing .npz '
+                     'density-table format. Convert a legacy '
+                     'densitytable_xdr once with:\n'
+                     f'  python -m glassgen.density {args.table} '
+                     'table.npz --direction r_sph')
+        # self-describing .npz: AMR block layout (glasstable/glassresample
+        # --save-table, targeted directly = reconstruct-in-place) or a
+        # uniform/mapped grid carrying its own coordinate mapping
+        from .reconstruct import describe_table, load_table
+        density = load_table(args.table)
+        print(f'loaded density table {args.table} '
+              f'({describe_table(density)})', flush=True)
     elif param_dict is not None:
         # read the density profile straight from the .param (profiles 1/2/3),
         # exactly as the C gdicgen does - no density table needed for these.
@@ -278,6 +286,10 @@ def main(argv=None):
         # ---- THE table builder (no input particles): sample --count from the
         # table, N-aware envelope, progressive relax, cull + renorm - the same
         # path glassresample --op reconstruct drives. -------------------------
+        if getattr(density, 'dim', 3) != 3:
+            sys.exit(f'--count samples cells from a 3D table; {args.table} '
+                     f'is a {density.dim}D mapped table - relax a pre-IC '
+                     'against it with -I instead')
         from .progressive import build_from_table
         ct = args.coarse_target
         ct = ct if ct == 'auto' else int(ct)
@@ -286,9 +298,8 @@ def main(argv=None):
               f'{"on" if args.progressive else "off"})', flush=True)
         res = build_from_table(
             density, args.count, box=box, nsmooth=args.nsmooth,
-            bg_c=args.bg_c, bg_k=args.bg_k, envelope=args.envelope,
-            n_frame=args.n_frame, nl0=args.nl0, tail_reach=args.tail_reach,
-            scaffold=args.scaffold,
+            bg_c=args.bg_c, envelope=args.envelope,
+            n_frame=args.n_frame, nl0=args.nl0,
             cascade=args.progressive, open_pad=args.open_pad, verbose=True,
             coarse_target=ct, alpha=args.alpha, inter_iter=args.inter_iter,
             max_iter=args.max_iter, momentum=args.momentum,
@@ -354,19 +365,12 @@ def main(argv=None):
         if isinstance(density, AMRTable):
             # table-native: rho_edge/shell/background straight off the leaf set
             env = build_table_envelope(density, float(mass.sum()), len(pos),
-                                       box=box, c=bg_c, k=args.bg_k,
-                                       n_frame=args.n_frame, nl0=args.nl0,
-                                       tail_reach=args.tail_reach,
-                                       scaffold=args.scaffold,
-                                       alpha=args.alpha)
+                                       box=box, c=bg_c,
+                                       n_frame=args.n_frame, nl0=args.nl0)
         else:
             # uniform/analytic path: untouched by M20 - keeps the legacy k=2
             env = build_uniform_envelope(density, pos, float(mass.sum()),
-                                         len(pos), c=bg_c,
-                                         k=(2.0 if args.bg_k is None
-                                            else args.bg_k),
-                                         scaffold=args.scaffold,
-                                         alpha=args.alpha)
+                                         len(pos), c=bg_c, k=2.0)
         print(f'envelope: m={env["m"]:.3e} rho_edge={env["rho_edge"]:.3e} '
               f'rho_frame={env["rho_frame"]:.3e} delta_bg={env["delta_bg"]:.3e} '
               f'background N={len(env["bg_pos"])}', flush=True)

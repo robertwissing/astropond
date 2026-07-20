@@ -224,88 +224,34 @@ def test_count_overlay_matches_builder_scheme():
     assert info2['rho_edge'] <= info['rho_edge']
 
 
-def test_count_overlay_eta_taper():
-    # the eta (decay_spacing) taper must ACTUALLY reshape the fill, not just
-    # be accepted: it overrides the capture-cell decay_cells with a length in
-    # output-spacing units, so the sub-floor cells differ from the default
-    # taper (a bug once left eta/decay_local threaded only into the M6-tail
-    # frame, leaving _fill_empty on the old decay_cells path - an exact no-op)
+def test_count_overlay_no_floor_profile():
+    # The C2-surviving fill: the overlay's sub-edge cells become ONE
+    # strictly-decreasing profile toward rho_frame (no plateau), resolved
+    # cells keep exact values, tail_reach reshapes the fill, and the
+    # retired taper-family kwargs really are gone (TypeError).
+    import pytest
     pos, mass, box = _ball()
     table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
                                         empty='zero', base_npx=8, max_level=6)
     raw = table.vals.copy()
-    # eta / decay_local reshape the EXP taper (flat_floor=True); the M18
-    # default (flat_floor=False) profile is shaped by tail_reach, not eta
-    base, info = reconstruct.apply_count_overlay(table, 2 * len(pos), c=64,
-                                                 flat_floor=True)
-    eta, _ = reconstruct.apply_count_overlay(
-        table, 2 * len(pos), c=64, decay_spacing=5.0, flat_floor=True)
-    assert np.array_equal(table.vals, raw)                # input untouched
-    keep = raw >= info['rho_edge']
-    assert np.array_equal(eta.vals[keep], raw[keep])      # exact where resolved
-    assert (eta.vals[~keep] >= info['rho_frame'] * (1 - 1e-12)).all()
-    # eta reshapes the sub-floor taper away from the decay_cells default
-    assert not np.allclose(eta.vals[~keep], base.vals[~keep])
-
-
-def test_count_overlay_decay_local_reshapes_fill():
-    # decay_local (the M16 launch-cell skirt) shortens lambda where a vacuum
-    # cell's nearest occupied cell is BRIGHT (rho >> rho_edge), so on a table
-    # with real dynamic range it must differ from the global-eta fill - the
-    # regression guard for the "reachable but inert" bug
-    pos, mass, box = _ball()
-    table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
-                                        empty='zero', base_npx=8, max_level=6)
-    glob, info = reconstruct.apply_count_overlay(
-        table, 2 * len(pos), c=64, decay_spacing=5.0, decay_local=False,
-        flat_floor=True)
-    loc, info_l = reconstruct.apply_count_overlay(
-        table, 2 * len(pos), c=64, decay_spacing=5.0, decay_local=True,
-        flat_floor=True)
-    keep = table.vals >= info['rho_edge']
-    assert (loc.vals[~keep] >= info_l['rho_frame'] * (1 - 1e-12)).all()
-    # local launches from brighter cells -> shorter reach -> different fill
-    assert not np.allclose(loc.vals[~keep], glob.vals[~keep])
-
-
-def test_count_overlay_decay_local_needs_spacing():
-    # the M16 skirt is defined against the eta taper; without decay_spacing
-    # there is no output-spacing length to launch from, so it must refuse
-    pos, mass, box = _ball()
-    table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
-                                        empty='zero', base_npx=8, max_level=6)
-    with pytest.raises(ValueError, match='decay_spacing'):
-        reconstruct.apply_count_overlay(table, 2 * len(pos), c=64,
-                                        decay_local=True)
-
-
-def test_count_overlay_no_floor_shelf():
-    # M18: no-floor-shelf (flat_floor=False, now the DEFAULT) removes the plateau
-    # from the overlay's sub-edge fill - values decay toward rho_frame instead
-    # of parking at rho_floor. Regression guard that the flag is threaded to
-    # _fill_empty (not inert) and the steepness knob reshapes it.
-    pos, mass, box = _ball()
-    table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
-                                        empty='zero', base_npx=8, max_level=6)
-    raw = table.vals.copy()
-    shelf, info = reconstruct.apply_count_overlay(table, 2 * len(pos), c=64,
-                                                  flat_floor=True)   # legacy
-    noflr, info_n = reconstruct.apply_count_overlay(
-        table, 2 * len(pos), c=64)                                   # M18 default
+    noflr, info_n = reconstruct.apply_count_overlay(table, 2 * len(pos), c=64)
     assert np.array_equal(table.vals, raw)                 # input untouched
-    assert info['flat_floor'] is True and info_n['flat_floor'] is False
-    keep = raw >= info['rho_edge']
+    keep = raw >= info_n['rho_edge']
     assert np.array_equal(noflr.vals[keep], raw[keep])     # exact where resolved
     sub = ~keep
     assert sub.any()
     assert (noflr.vals[sub] >= info_n['rho_frame'] * (1 - 1e-12)).all()
-    # the flag actually reshapes the sub-floor fill (not a no-op)
-    assert not np.allclose(noflr.vals[sub], shelf.vals[sub])
-    # steepness knob reshapes it further
+    # steepness knob reshapes the fill (legacy explicit tail_reach)
     steep, info_s = reconstruct.apply_count_overlay(
-        table, 2 * len(pos), c=64, flat_floor=False, tail_reach=12.0)
+        table, 2 * len(pos), c=64, tail_reach=12.0)
     assert info_s['tail_reach'] == 12.0
     assert not np.allclose(steep.vals[sub], noflr.vals[sub])
+    # the taper family is really retired (C2)
+    for kw in (dict(flat_floor=True), dict(shell_start='edge'),
+               dict(decay_spacing=5.0), dict(decay_cells=4.0),
+               dict(decay_local=True)):
+        with pytest.raises(TypeError):
+            reconstruct.apply_count_overlay(table, 2 * len(pos), c=64, **kw)
 
 
 
@@ -349,63 +295,15 @@ def test_padded_table_density_fused_matches_generic():
 
 
 @needs_sph_interp
-def test_padded_cubic_fused_matches_generic():
-    # the cubic scaffold (2026-07-13 redesign) through the fused readout:
-    # PaddedTableDensity with cubic_scale must equal the generic composition
-    # (PaddedDensity over the _CubicTail-wrapped shell) everywhere in the
-    # frame, on the linear AND vertex interps, point and stencil reads
-    from glassgen import envelope as E
-    pos, mass, _ = _ball()
-    amr, vals_raw = reconstruct.capture_amr_raw(pos, mass, box=None)
-    rng = np.random.default_rng(5)
-    for interp in ('limited', 'vertex'):
-        table = AMRTable.from_grid(amr, vals_raw, interp=interp)
-        env = E.build_table_envelope(table, float(mass.sum()), 4000,
-                                     box=None, scaffold='cubic')
-        padded = env['density']
-        assert isinstance(padded, E.PaddedTableDensity)
-        assert padded.cap is None                    # local start, uncapped
-        generic = E.PaddedDensity(padded.base, padded.occupancy,
-                                  padded.shell, cap=None)
-        q = rng.uniform(-1.0, 1.0, (30000, 3)) * 0.5 * env['frame_box']
-        np.testing.assert_allclose(padded.rho0(q), generic.rho0(q),
-                                   rtol=1e-10, atol=0.0)
-        from glassgen.density import KernelMatchedDensity
-        h = rng.uniform(0.01, 0.2, len(q))
-        a = KernelMatchedDensity(padded).rho0_h(q, h)
-        b = KernelMatchedDensity(generic).rho0_h(q, h)
-        np.testing.assert_allclose(a, b, rtol=1e-10, atol=0.0)
-
-
-def test_count_overlay_cubic():
-    # the glasstable render of the cubic scaffold: occupied cells exact,
-    # every scaffold cell >= its raw value (max(raw, taper)) and positive
-    pos, mass, box = _ball()
-    table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
-                                        empty='zero', base_npx=8, max_level=6)
-    raw = table.vals.copy()
-    filled, info = reconstruct.apply_count_overlay(table, 2 * len(pos), c=64,
-                                                   scaffold='cubic')
-    assert info['scaffold'] == 'cubic'
-    assert np.array_equal(table.vals, raw)                # input untouched
-    occ = raw >= info['rho_edge']
-    assert np.array_equal(filled.vals[occ], raw[occ])     # exact where gas
-    low = filled.vals[~occ]
-    assert (low > 0.0).all()
-    assert (low >= np.clip(raw[~occ], 0.0, None) - 1e-300).all()
-
-
 @needs_sph_interp
-def test_local_shell_start_continues_bright_surface():
-    # shell_start='local' (2026-07-13): next to a surface much brighter than
-    # the global rho_edge, the vacuum taper starts at the LOCAL edge value
-    # (continuous support scaffold) instead of being capped at rho_edge - and
-    # the fused readout still equals the generic composition. Occupancy /
-    # rho_edge / floor / frame are unchanged between the two modes.
+def test_local_launch_continues_bright_surface():
+    # The fill LAUNCHES from the nearest occupied cell's own value (the M12
+    # 'local' scheme, the only behaviour since C2): next to a surface much
+    # brighter than the global rho_edge the vacuum scaffold reads far above
+    # rho_edge (continuous support), and the fused readout still equals the
+    # generic composition on the cap=None path.
     from glassgen import envelope as E
     rng = np.random.default_rng(2)
-    # a razor-thin bright slab + a faint halo: rho_edge lands in the halo,
-    # decades below the slab's local surface density (the galaxy geometry)
     n, nh = 8000, 800
     pos = np.column_stack([rng.uniform(-1, 1, n), rng.uniform(-1, 1, n),
                            rng.normal(0, 0.01, n)])
@@ -413,32 +311,17 @@ def test_local_shell_start_continues_bright_surface():
     mass = np.full(n + nh, 1.0 / (n + nh))
     amr, vals_raw = reconstruct.capture_amr_raw(pos, mass, box=None,
                                                 nsmooth=32, grade=True)
-    # 'flat' reads: the local>=capped fill property is a CELL-VALUE
-    # statement - minmod slopes over the two different shell value sets
-    # can locally invert pointwise reads (surfaced when 'limited' replaced
-    # the retired 'linear' as the from_grid default, 2026-07-13)
     table = AMRTable.from_grid(amr, vals_raw, interp='flat')
-    kw = dict(box=None, c=32)
-    env_e = E.build_table_envelope(table, 1.0, 20000, shell_start='edge',
-                                   **kw)
-    env_l = E.build_table_envelope(table, 1.0, 20000, shell_start='local',
-                                   **kw)
-    for key in ('rho_edge', 'rho_frame', 'm'):
-        assert env_l[key] == env_e[key]
-    re = env_e['rho_edge']
-    # probe just outside the slab surface (vacuum side, above the midplane):
-    # the local shell must read >> rho_edge, the edge shell <= rho_edge
+    env_l = E.build_table_envelope(table, 1.0, 20000, box=None, c=32)
+    re = env_l['rho_edge']
     q = np.column_stack([np.zeros(9), np.zeros(9),
                          np.linspace(0.05, 0.45, 9)])
-    occ = E._eval(env_e['occupancy'], q)
+    occ = E._eval(env_l['occupancy'], q)
     vac = occ < 0.5
     assert vac.any()
-    v_e = env_e['density'].rho0(q)[vac]
     v_l = env_l['density'].rho0(q)[vac]
-    assert (v_e <= re * (1 + 1e-12)).all()          # capped arm
     assert v_l.max() > 10.0 * re                    # local support scaffold
-    assert (v_l >= v_e * (1 - 1e-12)).all()         # never below the capped
-    # fused == generic on the LOCAL arm too (cap=None path)
+    # fused == generic (cap=None path)
     padded = env_l['density']
     assert isinstance(padded, E.PaddedTableDensity)
     assert padded.cap is None
@@ -473,14 +356,21 @@ def test_reconstruct_resample_cascade_conserves_mass_and_fields():
         posf, massf, auxf, isf, a = reconstruct.reconstruct_resample(
             pos, mass, count, fields, box=box, nsmooth=64,
             relax_kw=dict(icr0_stop=2e-2, max_iter=80), seed=1,
-            contour_refine=False, grade=False, shell_start='edge',
-            flat_floor=True)   # pins the pre-M12 shelf envelope (0.8x floor)
+            contour_refine=False, grade=False)
         # exact mass conservation + equal-mass glass
         assert abs(massf.sum() - mass.sum()) < 1e-9
         assert np.allclose(massf, massf[0])
-        # fields gathered onto the survivors (u ~ 2 everywhere it sampled gas)
+        # fields SCATTERED onto the survivors (M22): content is conserved
+        # exactly w.r.t. the interior donors, so a constant u=2 has a
+        # machine-exact MEAN; pointwise it absorbs the local received/
+        # uniform mass ratio (loose band - this ball is barely relaxed).
         assert all(len(v) == len(posf) for v in auxf.values())
-        assert np.allclose(auxf['u'], 2.0, atol=1e-6)
+        fa = a['fields']
+        # content tier: nothing is lost in transfer (machine zeros)
+        assert fa['resid_u'] < 1e-12 and fa['resid_vel'] < 1e-12
+        # mass-weighted-average division: a constant field is reproduced
+        # EXACTLY, starved-receiver fill included (M22 A/B verdict)
+        assert np.allclose(auxf['u'], 2.0, atol=1e-9)
         assert not isf.any()                      # survivors are gas, bg culled
         # survivors are the compact ball, count near the target
         d = np.linalg.norm(posf, axis=1)
@@ -495,7 +385,61 @@ def test_reconstruct_resample_cascade_conserves_mass_and_fields():
 
 
 @needs_sph_interp
-def test_capture_cubic_cells_on_noncubic_domain():
+def test_scatter_fields_conserves_and_truncates():
+    # M22: donor-normalized scatter - interior content conserved to machine
+    # precision for every field; excluded donors are the truncation budget.
+    rng = np.random.default_rng(3)
+    src = rng.random((4000, 3))
+    m = rng.random(4000) * 1e-3 + 1e-3
+    rho = np.where(src[:, 0] < 0.5, 2.0, 0.5)      # interior = left half
+    fields = dict(vel=rng.standard_normal((4000, 3)),
+                  u=rng.random(4000) + 0.5,
+                  metals=rng.random(4000) * 0.02)
+    qpos = rng.random((300, 3)) * np.array([0.5, 1.0, 1.0])
+    out, fa = reconstruct.scatter_fields(qpos, 1.0, src, m, rho, fields,
+                                         rho_edge=1.0, nsmooth=32)
+    inside = rho >= 1.0
+    m_sc = m[inside].sum() / len(qpos)
+    assert abs(fa['m_scatter'] - m_sc) < 1e-15
+    # content tier: the scatter itself loses nothing (machine zeros);
+    # the written-IC totals are the drift_* GEOMETRY diagnostics
+    for k in fields:
+        assert fa[f'resid_{k}'] < 1e-12
+        assert f'drift_{k}' in fa
+    # intensive values are within the donor field's range (mass-weighted
+    # averages + nearest-donor fill can never extrapolate)
+    assert out['u'].min() >= fields['u'][inside].min() - 1e-12
+    assert out['u'].max() <= fields['u'][inside].max() + 1e-12
+    # truncation budget = the excluded donors' content, exactly
+    assert np.allclose(fa['trunc_vel'],
+                       (m[~inside, None] * fields['vel'][~inside]).sum(0))
+    assert abs(fa['trunc_mass'] - m[~inside].sum()) < 1e-15
+    # the KE/Lz geometry diagnostics are reported (M22 item 3: measure,
+    # then decide - no inequality asserted)
+    assert fa['ke_in_vel'] > 0.0 and fa['ke_out_vel'] > 0.0
+
+
+@needs_sph_interp
+def test_scatter_to_points_periodic_fold():
+    # a donor at the box face deposits across the wrap onto the ghosted
+    # receiver and the fold returns the content to the parent - exactly.
+    reconstruct._import_sph_interp()
+    from sph_interp.sph_method import scatter_to_points
+    rng = np.random.default_rng(5)
+    src = np.column_stack([np.full(200, 0.02),
+                           rng.random(200), rng.random(200)])
+    m = np.full(200, 1.0 / 200)
+    h = np.full(200, 0.05)                          # reach 2h = 0.1
+    gen = np.array([[0.98, 0.5, 0.5], [0.5, 0.5, 0.5]])
+    vals = dict(u=np.full(200, 3.0))
+    content, recv = scatter_to_points(
+        src, h, m, vals, gen, hmin=1e-3,
+        box=np.ones(3), periodic=(True, True, True))
+    assert abs(recv.sum() - 1.0) < 1e-12            # all mass lands
+    assert abs(content['u'].sum() - 3.0) < 1e-11    # all content lands
+    # the wrapped receiver (dist 0.04 through the face) gets it, not the
+    # in-box-distant one (0.48 > kernel reach, only reachable by fallback)
+    assert recv[0] > 0.99 and recv[1] < 1e-12
     # M3: a scalar base_npx on a non-cubic domain must yield ~CUBIC cells
     # (per-axis base counts scaled to the aspect), not cells whose aspect
     # tracks the domain (the 8:1 galaxy capture)
@@ -597,8 +541,7 @@ def test_occupancy_flat_ignores_level_jump_bleed():
     # shell_start='edge': this test pins the CAPPED composition ("never
     # above rho_edge in vacuum"); the 'local' default serves the local
     # scaffold there instead (by design - still the shell, never the ramp)
-    env = build_table_envelope(t, M, 8192, box=None, c=64, k=2.0,
-                               shell_start='edge')
+    env = build_table_envelope(t, M, 8192, box=None, c=64, k=2.0)
     # the (retired) trilinear base readout DOES ramp above rho_edge inside
     # the empty neighbour cell (the hazard is real in this fixture) - flip
     # the attribute ONLY for this standalone read: the envelope structures
@@ -611,16 +554,13 @@ def test_occupancy_flat_ignores_level_jump_bleed():
     t.interp = 'limited'
     # ... but the flat occupancy classifies ALL of it as vacuum,
     assert (env['occupancy'].rho0(q) < 0.5).all()
-    # and the padded target there is the capped shell, never the base ramp
-    assert env['density'].rho0(q).max() <= env['rho_edge'] * (1 + 1e-9)
-    # 'local' (default): still the SHELL (a monotone taper from the hot
-    # cell's own value), never the trilinear base ramp - the padded read
-    # must equal the shell composition exactly
-    env_l = build_table_envelope(t, M, 8192, box=None, c=64, k=2.0)
+    # and the padded target there is the SHELL (the local-launch fill from
+    # the hot cell's own value), never the trilinear base ramp - the padded
+    # read must equal the shell composition exactly
     from glassgen.envelope import PaddedDensity
-    gen = PaddedDensity(env_l['density'].base, env_l['occupancy'],
-                        env_l['density'].shell, cap=None)
-    np.testing.assert_allclose(env_l['density'].rho0(q), gen.rho0(q),
+    gen = PaddedDensity(env['density'].base, env['occupancy'],
+                        env['density'].shell, cap=None)
+    np.testing.assert_allclose(env['density'].rho0(q), gen.rho0(q),
                                rtol=1e-10, atol=0.0)
 
 
@@ -724,17 +664,9 @@ def test_envelope_mass_contract_closure():
     amr, vals_raw = reconstruct.capture_amr_raw(pos, mass, box=None,
                                                 nsmooth=32)
     table = AMRTable.from_grid(amr, vals_raw)
-    for ss in ('local', 'edge'):
-        env = E.build_table_envelope(table, 1.0, 10000, box=None, c=32,
-                                     shell_start=ss)
-        carried = env['gas_mass'] + env['bg_mass'].sum()
-        assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9), ss
-        # the local scaffold needs MORE backing than the capped one
-    env_l = E.build_table_envelope(table, 1.0, 10000, box=None, c=32,
-                                   shell_start='local')
-    env_e = E.build_table_envelope(table, 1.0, 10000, box=None, c=32,
-                                   shell_start='edge')
-    assert len(env_l['bg_pos']) >= len(env_e['bg_pos'])
+    env = E.build_table_envelope(table, 1.0, 10000, box=None, c=32)
+    carried = env['gas_mass'] + env['bg_mass'].sum()
+    assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
 
 
 def test_rho_edge_particles_mass_integral():

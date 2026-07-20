@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+setupfiles/IC_setup_mti.py#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Created on Fri Apr 27 14:57:12 2018
@@ -123,7 +123,10 @@ class setup_mti(object):
         dimtab=1
         self.Rtab = np.sqrt(self.dxbound*self.dxbound+self.dybound*self.dybound+self.dzbound*self.dzbound)
         gridtab, rhotab = denstable.generate_density_table(self,n=ntab,dim=dimtab)
-        denstable.write_density_table_xdr(self,"densitytable_xdr",gridtab,rhotab,n=ntab,dim=dimtab)
+        # self-describing npz; this profile is stratified in HEIGHT
+        # (dICdensdir=3), so the table is indexed by |z|, not radius
+        # (glassgen: --table densitytable.npz)
+        denstable.write_density_table_npz("densitytable.npz",gridtab,rhotab,mapping='z')
         self.mass = [totmass/self.npart]*self.npart
         
         if vm==1:

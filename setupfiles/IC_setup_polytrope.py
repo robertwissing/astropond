@@ -154,7 +154,9 @@ class setup_polytrope(object):
              dimtab=1
              self.Rtab = np.sqrt(self.dxbound*self.dxbound+self.dybound*self.dybound+self.dzbound*self.dzbound)
              gridtab, rhotab = denstable.generate_density_table(self,n=ntab,dim=dimtab)
-             denstable.write_density_table_xdr(self,"densitytable_xdr",gridtab,rhotab,n=ntab,dim=dimtab)
+             # self-describing npz: r_sph mapping in the table header
+             # (glassgen: --table densitytable.npz)
+             denstable.write_density_table_npz("densitytable.npz",gridtab,rhotab,mapping='r_sph')
          else:
              totmass = self.M
              

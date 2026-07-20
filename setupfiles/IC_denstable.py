@@ -6,7 +6,6 @@ Created on Tue Jun 24 11:30:33 2025
 @author: robertwi
 """
 
-import xdrlib
 import numpy as np
 
 
@@ -45,7 +44,40 @@ def generate_density_table(D, dim=1, n=1000):
 
 
 
+def write_density_table_npz(filename, grid, densities, mapping='r_sph'):
+    """Write the SELF-DESCRIBING .npz density table (the glassgen format,
+    CLEANUP_PLAN C6): ax0..ax{dim-1} + values + the coordinate mapping in
+    the header (1D/2D; a 3D table is (x,y,z)-indexed and carries none).
+    Consumed directly by glassgen/glassrelax --table TABLE.npz - no
+    --direction flag at the point of use. Layout owned by
+    glassgen.density.TableDensity.save/load - keep in sync.
+
+    mapping: one of ('x','y','z','r_sph','r_cyl','signed_x') for a 1D
+    table, or a pair of them for a 2D table."""
+    densities = np.asarray(densities, dtype=np.float64)
+    grid = tuple(np.asarray(a, dtype=np.float64) for a in grid)
+    if densities.ndim != len(grid):
+        raise ValueError(f'{len(grid)} axes but values has '
+                         f'ndim {densities.ndim}')
+    meta = {'values': densities}
+    for i, a in enumerate(grid):
+        meta[f'ax{i}'] = a
+    if densities.ndim == 1:
+        meta['mapping'] = np.array([mapping])
+    elif densities.ndim == 2:
+        if not (isinstance(mapping, (tuple, list)) and len(mapping) == 2):
+            raise ValueError("2D table needs a pair of mappings, "
+                             "e.g. ('r_cyl','z')")
+        meta['mapping'] = np.array(list(mapping))
+    out = filename if filename.endswith('.npz') else filename + '.npz'
+    np.savez(out, **meta)
+    return out
+
+
 def write_density_table_xdr(D, filename, grid, densities , dim=1, n=1000):
+    # LEGACY (C-generator format; superseded by write_density_table_npz -
+    # xdrlib itself was removed in Python 3.13)
+    import xdrlib
 
     with open(filename, 'wb') as f:
         # Write header: dimension, points per dim, domain size
@@ -88,6 +120,7 @@ def read_density_table_xdr(filename):
         densities : ndarray
             Density values with shape (n,) for 1D, (n,n) for 2D, or (n,n,n) for 3D
     """
+    import xdrlib     # LEGACY - removed in Python 3.13
     with open(filename, 'rb') as f:
         # Read header
         header_lines = []
@@ -129,6 +162,7 @@ def read_density_table_xdr(filename):
         return dim, n, R, tuple(grid), densities
 
 def read_density_table_xdr(filename):
+    import xdrlib     # LEGACY - removed in Python 3.13
     with open(filename, 'rb') as f:
         # Read header
         dim = int(f.readline().decode().strip())

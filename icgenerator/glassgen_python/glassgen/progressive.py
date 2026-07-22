@@ -209,6 +209,10 @@ def default_levels(nx_full, nx_coarse, coarse_kw=None, fine_kw=None,
         lvl = dict(name='full', split_factor=1,
                    icr0_stop=icr0_stop, polish_iter=polish_iter)
         lvl.update(coarse_defaults)
+        # the single level IS the final relax: honour an explicit momentum=
+        # (was silently dropped - coarse_defaults carries none); coarse_kw
+        # still wins if it set momentum itself.
+        lvl.setdefault('momentum', momentum)
         return [lvl]
     factor = _nearest_pow2((nx_full / nx_coarse) ** 3)
     coarse = dict(name='coarse', split_factor=1)
@@ -284,6 +288,11 @@ def cascade_levels(nx_full=None, nx_coarse=None, *, factor=None, inter_iter=10,
         lvl = dict(name='full', split_factor=1,
                    icr0_stop=icr0_stop, polish_iter=polish_iter)
         lvl.update(coarse_defaults)
+        # the single level IS the final relax: honour an explicit momentum=
+        # (was silently dropped, so envelope builds - merge factor 1 on sharp
+        # fields - could never receive momentum from ANY caller, including
+        # the glassgen CLI's --momentum 0.5 default); coarse_kw still wins.
+        lvl.setdefault('momentum', momentum)
         return [lvl]
     k = int(round(np.log2(total)))
     coarse = dict(name='coarse', split_factor=1)

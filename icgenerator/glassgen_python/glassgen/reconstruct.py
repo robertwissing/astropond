@@ -35,7 +35,7 @@ import warnings
 
 import numpy as np
 
-from .amrtable import AMRTable          # re-exported (moved out of this module)
+from .amrtable import (AMRStateTable, AMRTable)  # re-exported compatibility
 from .density import TableDensity
 from .envelope import (NL0_DEFAULT, _fill_empty, _pad_periodic_box,
                        _with_values, check_scaffold_resolvability,
@@ -131,7 +131,8 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     part_per_cell=8, npx=None, empty='decay',
                     floor_frac=1e-3, interp='vertex',
                     contour_n=None, contour_band=8.0, contour_beta=0.5,
-                    contour_passes=2, grade=True):
+                    contour_passes=2, grade=True, open_padding=None,
+                    open_pad_fraction=0.1):
     """Capture the particle density field on a 3D grid, relax-ready.
 
     pos, mass : the particles whose density defines the target (capture the
@@ -192,8 +193,22 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                 decision - conforming corner trilinear, continuous across
                 level jumps, tracks sub-cell gradients; fused, costs ~
                 linear), 'linear', 'flat' or 'limited' (see AMRTable).
+    open_padding : for an open capture, optionally enlarge the raw table using
+                ``full_pad`` (max 2h), ``rho_edge_pad`` (2*h_edge,in), or
+                ``constant_pad`` (0.1 of the longest particle span per side).
+                The input-particle definition is independent of the requested
+                output glass count. None preserves the historical particle
+                bounding box used internally by reconstruct/glassrelax.
     """
     si, parts, n, boxarr = _build_parts(pos, mass, box, nsmooth)
+    domain_lo = domain_hi = None
+    domain_audit = None
+    if boxarr is not None and open_padding is not None:
+        raise ValueError('open_padding only applies when box=None')
+    if boxarr is None and open_padding is not None:
+        domain_lo, domain_hi, domain_audit = si.open_domain_bounds(
+            parts.pos, parts.mass, parts.rho, parts.h, mode=open_padding,
+            nsmooth=nsmooth, constant_fraction=open_pad_fraction)
 
     if grid == 'uniform':
         if npx is None:
@@ -201,14 +216,17 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
         if np.isscalar(npx):
             # ~cubic cells on a non-cubic domain (plan task M3, as in the AMR
             # path): the requested count applies to the longest axis.
-            span = (boxarr if boxarr is not None
-                    else np.asarray(pos.max(0) - pos.min(0), dtype=np.float64))
+            span = (boxarr if boxarr is not None else
+                    (domain_hi - domain_lo if domain_lo is not None else
+                     np.asarray(pos.max(0) - pos.min(0), dtype=np.float64)))
             cell = float(span.max()) / int(npx)
             npx = tuple(max(1, int(round(span[i] / cell))) for i in range(3))
         if boxarr is not None:
             tgt = si.UniformGrid.centered(boxarr, npx)
         else:
-            tgt = si.UniformGrid(lo=pos.min(0), hi=pos.max(0), npx=npx)
+            lo = pos.min(0) if domain_lo is None else domain_lo
+            hi = pos.max(0) if domain_hi is None else domain_hi
+            tgt = si.UniformGrid(lo=lo, hi=hi, npx=npx)
         res = si.interpolate(parts, tgt, method=method, values=['rho'])
         vals = _grid_rho(res, tgt.cell_volume, method)
         ax = tgt.centres()
@@ -218,7 +236,13 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                            floor_frac=floor_frac,
                            **_capture_fill_kw(empty, vals, boxarr, pos,
                                               floor_frac)).reshape(vals.shape)
-        return TableDensity(ax, vals)
+        table = TableDensity(ax, vals)
+        table.capture_domain_audit = domain_audit
+        if domain_audit is not None:
+            table.capture_particle_lo = domain_audit['particle_lo'].copy()
+            table.capture_particle_hi = domain_audit['particle_hi'].copy()
+            table.capture_padding_mode = domain_audit['mode']
+        return table
 
     if grid != 'amr':
         raise ValueError(f"unknown grid {grid!r} (use 'amr' or 'uniform')")
@@ -232,12 +256,20 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                        passes=contour_passes, c=nsmooth)
     amr, vals_raw = _capture_amr_grid(si, parts, n, method, base_npx,
                                       max_level, part_per_cell,
-                                      contour=contour, grade=grade)
+                                      contour=contour, grade=grade,
+                                      domain_lo=domain_lo,
+                                      domain_hi=domain_hi)
     vals = _fill_empty(vals_raw, empty, amr.centres(), boxarr,
                        floor_frac=floor_frac,
                        **_capture_fill_kw(empty, vals_raw, boxarr, pos,
                                           floor_frac))
-    return AMRTable.from_grid(amr, vals, interp=interp)
+    table = AMRTable.from_grid(amr, vals, interp=interp)
+    table.capture_domain_audit = domain_audit
+    if domain_audit is not None:
+        table.capture_particle_lo = domain_audit['particle_lo'].copy()
+        table.capture_particle_hi = domain_audit['particle_hi'].copy()
+        table.capture_padding_mode = domain_audit['mode']
+    return table
 
 
 def _build_parts(pos, mass, box, nsmooth):
@@ -273,7 +305,7 @@ def rho_edge_particles(rho, mass, m_out, c=64):
 
 def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
                       max_level=16, part_per_cell=8, contour=None,
-                      grade=False):
+                      grade=False, domain_lo=None, domain_hi=None):
     """Build the AMR grid and deposit the per-leaf density BEFORE any
     empty-cell fill. Returns (AMRGrid, vals_raw) - vals_raw is the raw
     deposited cell density (0 in empty cells); the N-aware envelope
@@ -317,9 +349,11 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
         # N-particle kernel cannot represent) while x/y stayed marginal, the
         # linear-readout gradients direction-biased, and the envelope decay
         # length (cbrt(vol)) a mix of both scales.
-        span = (np.asarray(parts.box, dtype=np.float64).reshape(3)
-                if parts.box is not None
-                else parts.pos.max(0) - parts.pos.min(0))
+        span = (np.asarray(domain_hi) - np.asarray(domain_lo)
+                if domain_lo is not None else
+                (np.asarray(parts.box, dtype=np.float64).reshape(3)
+                 if parts.box is not None
+                 else parts.pos.max(0) - parts.pos.min(0)))
         cell = float(span.max()) / int(base_npx)
         base_npx = tuple(max(1, int(round(span[i] / cell))) for i in range(3))
     crit = si.refine_count(part_per_cell)
@@ -329,7 +363,7 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
         crit = si.refine_any(crit, si.refine_band(rho_lo, rho_hi, m_out,
                                                   beta=beta))
     amr = si.AMRGrid.build(parts, base_npx=base_npx, max_level=max_level,
-                           criterion=crit)
+                           criterion=crit, lo=domain_lo, hi=domain_hi)
     res = si.interpolate(parts, amr, method=method, values=['rho'])
     vals_raw = _grid_rho(res, amr.volumes(), method)
     if contour is not None:
@@ -413,7 +447,8 @@ def _refine_regions_criterion(centres, halfs, floors, amr, floor_leaf_vals):
 def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
                     base_npx=None, max_level=16, part_per_cell=8,
                     contour_n=None, contour_band=8.0, contour_beta=0.5,
-                    contour_passes=2, grade=True):
+                    contour_passes=2, grade=True,
+                    close_open_mass=True):
     """Raw AMR capture: the space-filling leaf set + per-leaf density BEFORE
     any empty-cell fill (unlike capture_density, which returns a finished,
     filled table). `AMRTable.from_grid(amr, vals_raw)` makes it the EXACT
@@ -427,7 +462,15 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
     pure part_per_cell capture (pre-M10 behaviour).
 
     grade : 2:1-balance the finished leaf set + redeposit (see
-    :func:`_capture_amr_grid`)."""
+    :func:`_capture_amr_grid`).
+
+    close_open_mass : an open particle-bounding-box mesh truncates the compact
+    kernels of extremal particles. Preserve the validated raw geometry and
+    envelope interaction, but apply one audited uniform normalisation to the
+    final density leaves so ``sum(rho*V) == sum(mass)``. The factor is normally
+    tiny (``1.000033`` for the M22 galaxy). Set False only for a historical
+    boundary-truncation control.
+    """
     si, parts, n, _ = _build_parts(pos, mass, box, nsmooth)
     contour = None
     if contour_n:
@@ -437,9 +480,182 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
                        rho_hi=re_est * contour_band, m_out=m_out,
                        beta=contour_beta, band=contour_band,
                        passes=contour_passes, c=nsmooth)
-    return _capture_amr_grid(si, parts, n, method=method, base_npx=base_npx,
-                             max_level=max_level, part_per_cell=part_per_cell,
-                             contour=contour, grade=grade)
+    amr, vals_raw = _capture_amr_grid(
+        si, parts, n, method=method, base_npx=base_npx,
+        max_level=max_level, part_per_cell=part_per_cell,
+        contour=contour, grade=grade)
+    source_mass = float(np.sum(np.asarray(mass, dtype=np.float64)))
+    captured_mass = float(np.sum(
+        np.asarray(vals_raw, dtype=np.float64) * amr.volumes()))
+    correction = 1.0
+    apply_closure = bool(
+        box is None and close_open_mass and method == 'petkova')
+    if apply_closure:
+        if not np.isfinite(captured_mass) or captured_mass <= 0.0:
+            raise ValueError('open AMR capture has non-positive/non-finite mass')
+        correction = source_mass / captured_mass
+        vals_raw = np.asarray(vals_raw, dtype=np.float64) * correction
+    final_mass = float(np.sum(vals_raw * amr.volumes()))
+    amr.capture_mass_audit = dict(
+        domain=('particle-bounding-box' if box is None else 'periodic-box'),
+        source_mass=source_mass,
+        deposited_mass_before_closure=captured_mass,
+        relative_error_before_closure=(
+            captured_mass / source_mass - 1.0 if source_mass != 0.0 else None),
+        uniform_closure_factor=correction,
+        final_table_mass=final_mass,
+        relative_error_after_closure=(
+            final_mass / source_mass - 1.0 if source_mass != 0.0 else None),
+        closure_applied=apply_closure)
+    return amr, vals_raw
+
+
+def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
+                      base_npx=None, max_level=16, part_per_cell=8,
+                      contour_n=None, contour_band=8.0, contour_beta=0.5,
+                      contour_passes=2, grade=True, interp='vertex',
+                      store_kinetic=False):
+    """Capture density and conservative field contents on one raw AMR grid.
+
+    Geometry/refinement is completed first using the density-only raw-capture
+    machinery. All scalar/vector field components are then deposited on that
+    final geometry with Petkova's exact mass fractions.  The returned state
+    stores rho*A (not A), so its final point imprint can interpolate numerator
+    and denominator identically before division.
+    """
+    pos = np.ascontiguousarray(pos, dtype=np.float64)
+    mass = np.ascontiguousarray(mass, dtype=np.float64)
+    if pos.shape != (len(mass), 3):
+        raise ValueError('pos must have shape (len(mass), 3)')
+
+    clean = {}
+    for name, values in fields.items():
+        lname = name.lower().removeprefix('aux_')
+        if lname in ('rho', 'smoothlength'):
+            continue                    # output SPH state is reconstructed
+        if (lname == 'b' or lname.startswith('bfield')
+                or lname in ('bx', 'by', 'bz')):
+            raise NotImplementedError(
+                f"magnetic field {name!r} cannot use generic AMR vertex "
+                'transfer; M23 magnetic transfer is explicitly deferred')
+        a = np.asarray(values, dtype=np.float64)
+        if a.ndim not in (1, 2) or a.shape[0] != len(mass):
+            raise ValueError(
+                f"field {name!r} has shape {a.shape}; expected "
+                f"({len(mass)},) or ({len(mass)}, ncomp)")
+        if not np.all(np.isfinite(a)):
+            raise ValueError(f"field {name!r} contains non-finite values")
+        clean[name] = np.ascontiguousarray(a)
+    internal_fields = []
+    if store_kinetic:
+        if 'vel' not in clean or clean['vel'].shape != (len(mass), 3):
+            raise ValueError('store_kinetic requires a (N,3) vel field')
+        clean['__kinetic'] = 0.5 * np.sum(clean['vel'] ** 2, axis=1)
+        internal_fields.append('__kinetic')
+
+    # Build/refine/contour-correct/grade using density only.  This avoids
+    # repeating the expensive physical-field deposit on temporary geometries.
+    si, parts, n, _ = _build_parts(pos, mass, box, nsmooth)
+    contour = None
+    if contour_n:
+        m_out = float(mass.sum()) / int(contour_n)
+        re_est = rho_edge_particles(parts.rho, mass, m_out, c=nsmooth)
+        contour = dict(rho_lo=re_est / contour_band,
+                       rho_hi=re_est * contour_band, m_out=m_out,
+                       beta=contour_beta, band=contour_band,
+                       passes=contour_passes, c=nsmooth)
+    amr, _ = _capture_amr_grid(
+        si, parts, n, method='petkova', base_npx=base_npx,
+        max_level=max_level, part_per_cell=part_per_cell,
+        contour=contour, grade=grade,
+        # An open particle bounding box cuts every extremal particle's SPH
+        # kernel and is therefore not a conservative finite-volume domain.
+        # Tile the union of all compact supports (Wendland support radius 2h)
+        # so the exact Petkova fractions sum to one without any renormalisation.
+        domain_lo=(np.min(pos - 2.0 * parts.h[:, None], axis=0)
+                   if box is None else None),
+        domain_hi=(np.max(pos + 2.0 * parts.h[:, None], axis=0)
+                   if box is None else None))
+
+    flat_values = {}
+    layout = []
+    for fi, (name, values) in enumerate(clean.items()):
+        cols = values[:, None] if values.ndim == 1 else values
+        internal = []
+        for component in range(cols.shape[1]):
+            key = f'm23_{fi}_{component}'
+            flat_values[key] = cols[:, component]
+            internal.append(key)
+        layout.append((name, values.ndim == 1, internal))
+
+    volumes = np.asarray(amr.volumes(), dtype=np.float64)
+    if flat_values:
+        parts.values = flat_values
+        result = si.interpolate(parts, amr, method='petkova',
+                                values=list(flat_values),
+                                conservative_fields=True)
+        cell_mass = np.asarray(result.data['_mass'], dtype=np.float64)
+    else:
+        # A density-only state is valid and remains useful as a portable raw
+        # reconstruction target.
+        result = si.interpolate(parts, amr, method='petkova', values=['rho'])
+        cell_mass = np.asarray(result.data['_mass'], dtype=np.float64)
+    density = AMRTable.from_grid(amr, cell_mass / volumes, interp=interp)
+    if box is None:
+        # The kernel-union domain above is deliberate capture padding, not
+        # physical gas extent: stamp the source particle bbox so the envelope
+        # sizes the relax frame from it instead of the padded table domain.
+        density.capture_particle_lo = pos.min(axis=0)
+        density.capture_particle_hi = pos.max(axis=0)
+        density.capture_padding_mode = 'kernel_union'
+
+    contents = {}
+    field_meta = {}
+    for name, scalar, internal in layout:
+        cols = []
+        for key in internal:
+            content_density = np.asarray(
+                result.data[f'_content_{key}'], dtype=np.float64) / volumes
+            # from_grid applies the geometry's level/key ordering so every
+            # channel aligns exactly with density.vals.
+            cols.append(AMRTable.from_grid(
+                amr, content_density, interp=interp).vals)
+        contents[name] = cols[0] if scalar else np.stack(cols, axis=1)
+        field_meta[name] = dict(components=len(internal),
+                                kind='mass_weighted_intensive')
+
+    state = AMRStateTable(
+        density, contents,
+        metadata=dict(schema='glassgen-amr-state', fields=field_meta,
+                      internal_fields=internal_fields,
+                      capture=dict(method='petkova', nsmooth=int(nsmooth))))
+    source_budget = {'mass': float(mass.sum())}
+    for name, values in clean.items():
+        source_budget[name] = np.sum(
+            mass[:, None] * values, axis=0).tolist() if values.ndim == 2 \
+            else float(np.sum(mass * values))
+    table_budget = state.integrated_contents()
+    table_budget_plain = {
+        k: (v.tolist() if isinstance(v, np.ndarray) else v)
+        for k, v in table_budget.items()}
+    residual = {}
+    for name, source_value in source_budget.items():
+        source_array = np.asarray(source_value, dtype=np.float64)
+        table_array = np.asarray(table_budget_plain[name], dtype=np.float64)
+        diff = table_array - source_array
+        if diff.ndim:
+            relative = [float(d / s) if s != 0.0 else None
+                        for d, s in zip(diff, source_array)]
+            residual[name] = dict(absolute=diff.tolist(), relative=relative)
+        else:
+            residual[name] = dict(
+                absolute=float(diff),
+                relative=(float(diff / source_array)
+                          if source_array != 0.0 else None))
+    state.metadata['source_budget'] = source_budget
+    state.metadata['table_budget'] = table_budget_plain
+    state.metadata['source_to_table_residual'] = residual
+    return state
 
 
 def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
@@ -449,6 +665,9 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          bg_c=None, bg_k=None, kernel_match=True,
                          contour_refine=True, contour_band=8.0,
                          contour_beta=0.5, target_interp='vertex',
+                         field_transfer='scatter', field_interp='vertex',
+                         energy_mode='internal', save_state=None,
+                         momentum_closure=None,
                          grade=True,
                          alpha=None,
                          tail_reach=None, n_frame=None, nl0=None,
@@ -460,15 +679,16 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     :func:`glassgen.progressive.build_from_table` (sample `count` positions
     from the table + N-aware envelope + progressive relax + spatial cull /
     renorm to the input gas mass), then conservatively SCATTER per-survivor
-    fields from the input onto the FINAL positions (scatter_fields, M22).
+    fields onto the FINAL positions. ``field_transfer='scatter'`` retains the
+    M22 particle-to-particle control; ``'table'`` captures conservative field
+    contents on the final raw AMR geometry and imprints numerator/rho ratios
+    after the relax (M23).
 
       pos_in, mass_in : the INPUT gas.
       count           : target gas particle count (may be < or > the input).
       fields          : dict name -> (Nin,)/(Nin,3) input gas fields,
-                        scattered conservatively onto the survivors (the
-                        glass has no history to inherit; totals conserved
-                        exactly over the resolved region, truncation budget
-                        + residuals in audit['fields']).
+                        transferred onto the survivors. In table mode ``rho``
+                        is excluded and recomputed from the output particles.
       cascade         : False -> single full-res relax of the placed ensemble
                         (the --no-progressive fallback), same envelope + cull.
       bg_c, bg_k      : envelope knobs (rho_edge cut count; two-rung ladder
@@ -483,7 +703,8 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                         flat occupancy verdict is not cell-quantized
                         (capture_amr_raw contour_n=count). Ignored when
                         amr_cap is passed (the table is already built).
-      amr_cap         : optional precomputed (amr, vals_raw) to skip capture.
+      amr_cap         : optional precomputed (amr, vals_raw) in scatter mode,
+                        or an AMRStateTable in table mode, to skip capture.
 
     Returns (pos, mass, aux, is_filler, audit); final count is the post-cull
     occupancy, near but not exactly `count`. is_filler is all-False (survivors
@@ -496,9 +717,36 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     from .progressive import build_from_table
     pos_in = np.ascontiguousarray(pos_in, dtype=np.float64)
     mass_in = np.ascontiguousarray(mass_in, dtype=np.float64)
+    if field_transfer not in ('scatter', 'table'):
+        raise ValueError("field_transfer must be 'scatter' or 'table'")
+    if field_interp not in ('flat', 'limited', 'vertex'):
+        raise ValueError("field_interp must be 'flat', 'limited', or 'vertex'")
+    if energy_mode not in ('internal', 'total'):
+        raise ValueError("energy_mode must be 'internal' or 'total'")
+    if momentum_closure is None:
+        momentum_closure = 'boost' if field_transfer == 'table' else 'none'
+    if momentum_closure not in ('none', 'boost'):
+        raise ValueError("momentum_closure must be 'none' or 'boost'")
+    if field_transfer != 'table' and energy_mode != 'internal':
+        raise ValueError("energy_mode='total' requires field_transfer='table'")
+    if field_transfer != 'table' and momentum_closure != 'none':
+        raise ValueError("momentum_closure='boost' requires "
+                         "field_transfer='table'")
+    if field_transfer == 'table' and method != 'petkova':
+        raise ValueError("field_transfer='table' requires method='petkova'")
+    if field_transfer == 'table':
+        for name in fields:
+            lname = name.lower().removeprefix('aux_')
+            if (lname == 'b' or lname.startswith('bfield')
+                    or lname in ('bx', 'by', 'bz')):
+                raise NotImplementedError(
+                    f"magnetic field {name!r} cannot use generic AMR vertex "
+                    'transfer; M23 magnetic transfer is explicitly deferred')
     timings = {}
-    # OPEN IC (box is None): capture in WORLD coordinates on the raw gas bbox
-    # (open kernels, like glasstable) - the periodic frame for the relax is
+    density_capture_audit = None
+    # OPEN IC (box is None): capture in WORLD coordinates. Density-only/M22
+    # uses the raw gas bbox; conservative M23 spans every compact kernel. The
+    # periodic frame for the relax is
     # sized AFTER capture by the envelope (build_table_envelope frame_box:
     # per-axis margins + the kernel-fits-the-box cap), because its Delta_bg
     # needs rho_edge(N) from the table (plan task M2). The old order (frame
@@ -507,45 +755,227 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     # kernels wrapped its box_z 2.6x. relax_progressive frames/unframes, so
     # everything here stays in the IC's own coordinates.
     t0 = _time.perf_counter()
-    if amr_cap is None:
+    state = None
+    if amr_cap is None and field_transfer == 'table':
+        state = capture_amr_state(
+            pos_in, mass_in, fields, box=box, nsmooth=nsmooth,
+            base_npx=base_npx, max_level=max_level,
+            part_per_cell=part_per_cell,
+            contour_n=(count if contour_refine else None),
+            contour_band=contour_band, contour_beta=contour_beta,
+            grade=grade, interp=target_interp,
+            store_kinetic=(energy_mode == 'total'))
+        table = state.density
+    elif amr_cap is None:
         amr, vals_raw = capture_amr_raw(
             pos_in, mass_in, box=box, nsmooth=nsmooth, method=method,
-            base_npx=base_npx, max_level=max_level, part_per_cell=part_per_cell,
+            base_npx=base_npx, max_level=max_level,
+            part_per_cell=part_per_cell,
             contour_n=(count if contour_refine else None),
             contour_band=contour_band, contour_beta=contour_beta, grade=grade)
+        density_capture_audit = getattr(amr, 'capture_mass_audit', None)
+        table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
+    elif field_transfer == 'table':
+        if not isinstance(amr_cap, AMRStateTable):
+            raise TypeError('table field transfer requires amr_cap to be an '
+                            'AMRStateTable')
+        state = amr_cap
+        table = state.density
+        expected = {
+            name for name in fields
+            if name.lower().removeprefix('aux_')
+            not in ('rho', 'smoothlength')}
+        missing = expected.difference(state.fields)
+        if missing:
+            raise ValueError('AMR state is missing requested fields: '
+                             + ', '.join(sorted(missing)))
+        if (energy_mode == 'total'
+                and '__kinetic' not in state.all_fields):
+            raise ValueError("energy_mode='total' needs a state table captured "
+                             'with kinetic-energy content')
     else:
         amr, vals_raw = amr_cap
+        density_capture_audit = getattr(amr, 'capture_mass_audit', None)
+        table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
     timings['capture'] = _time.perf_counter() - t0
     M_gas = float(mass_in.sum())
+    if state is not None:
+        # A reused table must belong to this source snapshot.  Compare the
+        # recorded source mass, not deposited mesh mass: an open capture can
+        # explicitly report kernel content outside its finite raw domain.
+        recorded_mass = state.metadata.get('source_budget', {}).get('mass')
+        if (recorded_mass is not None
+                and not np.isclose(recorded_mass, M_gas,
+                                   rtol=1e-12, atol=0.0)):
+            raise ValueError('AMR state source mass does not match input gas '
+                             f'mass: {recorded_mass:.16g} vs {M_gas:.16g}')
+        if save_state is not None:
+            state.save(save_state)
     # target readout: 'linear' (trilinear) OVERSHOOTS across coarse->fine
     # level jumps (the razor-thin disk vertical-smear defect, 2026-07-12);
     # 'flat' (PWC cell average) has no overshoot. The shell/occupancy is
     # built flat regardless (build_table_envelope); this sets the OCCUPIED
     # BASE readout the relax fills.
-    table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
-    # per-survivor fields: conservative scatter from the input onto the
-    # FINAL positions (M22). The truncation split needs rho_edge BEFORE the
-    # build - computed here in LOCKSTEP with build_table_envelope (same m,
-    # same c, same k resolve on the same cells).
-    t0 = _time.perf_counter()
-    src_rho, _ = particle_density(pos_in, mass_in, box=box, nsmooth=nsmooth)
-    timings['src_rho'] = _time.perf_counter() - t0
+    # The low-density split needs rho_edge BEFORE the build, computed in
+    # lockstep with build_table_envelope (same m/c/k on the same raw cells).
     _, sizes_e, _, vals_e = table_cells(table)
     rho_edge_pre, _ = edge_floor_spacing(
         np.asarray(vals_e, dtype=np.float64), sizes_e.prod(1),
         M_gas / int(count), c=(bg_c or nsmooth),
         k=resolve_bg_k(bg_k, n_frame, nsmooth=(bg_c or nsmooth)))
     field_audit = {}
+    if field_transfer == 'scatter':
+        t0 = _time.perf_counter()
+        src_rho, _ = particle_density(pos_in, mass_in, box=box,
+                                      nsmooth=nsmooth)
+        timings['src_rho'] = _time.perf_counter() - t0
 
-    def _hook(final_pos):
-        t = _time.perf_counter()
-        out, fa = scatter_fields(final_pos, M_gas / max(len(final_pos), 1),
-                                 pos_in, mass_in, src_rho, fields,
-                                 rho_edge=rho_edge_pre, box=box,
-                                 nsmooth=nsmooth)
-        field_audit.update(fa)
-        timings['scatter'] = _time.perf_counter() - t
-        return out
+        def _hook(final_pos):
+            t = _time.perf_counter()
+            out, fa = scatter_fields(
+                final_pos, M_gas / max(len(final_pos), 1), pos_in, mass_in,
+                src_rho, fields, rho_edge=rho_edge_pre, box=box,
+                nsmooth=nsmooth)
+            field_audit.update(fa)
+            timings['scatter'] = _time.perf_counter() - t
+            return out
+    else:
+        resolved = np.asarray(table.vals) >= rho_edge_pre
+        full_budget = state.integrated_contents()
+        resolved_budget = state.integrated_contents(resolved)
+        tail_budget = state.integrated_contents(~resolved)
+
+        def _plain_budget(budget):
+            return {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                    for k, v in budget.items()}
+
+        field_audit.update(
+            transfer='table', source_to_table=dict(
+                source=state.metadata.get('source_budget', {}),
+                table=state.metadata.get('table_budget',
+                                         _plain_budget(full_budget)),
+                residual=state.metadata.get('source_to_table_residual', {})),
+            resolved_table=_plain_budget(resolved_budget),
+            low_density_tail=_plain_budget(tail_budget),
+            rho_edge=float(rho_edge_pre))
+        source_derived = None
+        if 'vel' in fields:
+            source_vel = np.asarray(fields['vel'], dtype=np.float64)
+            source_com = np.average(pos_in, axis=0, weights=mass_in)
+            source_momentum = np.sum(mass_in[:, None] * source_vel, axis=0)
+            source_derived = dict(
+                momentum=source_momentum.tolist(),
+                momentum_scale=float(np.sum(
+                    mass_in * np.linalg.norm(source_vel, axis=1))),
+                kinetic_energy=float(np.sum(
+                    0.5 * mass_in * np.sum(source_vel ** 2, axis=1))),
+                angular_momentum=np.sum(
+                    mass_in[:, None]
+                    * np.cross(pos_in - source_com, source_vel), axis=0).tolist())
+
+        def _hook(final_pos):
+            t = _time.perf_counter()
+            out, query_audit = state.query_fields(final_pos,
+                                                  interp=field_interp)
+            m_out = M_gas / max(len(final_pos), 1)
+            if energy_mode == 'total':
+                if 'u' not in out or 'vel' not in out:
+                    raise ValueError("energy_mode='total' requires scalar 'u' "
+                                     "and vector 'vel' fields")
+                kinetic_mean = out.pop('__kinetic')
+                kinetic_bulk = 0.5 * np.sum(out['vel'] ** 2, axis=1)
+                unresolved = kinetic_mean - kinetic_bulk
+                tol = 64.0 * np.finfo(np.float64).eps * np.maximum(
+                    np.abs(kinetic_mean), 1.0)
+                negative = unresolved < -tol
+                unresolved = np.maximum(unresolved, 0.0)
+                out['u'] = out['u'] + unresolved
+                field_audit['energy_closure'] = dict(
+                    mode='total', negative_variance_count=int(negative.sum()),
+                    unresolved_kinetic=float(m_out * unresolved.sum()),
+                    unresolved_specific_min=float(unresolved.min(initial=0.0)),
+                    unresolved_specific_max=float(unresolved.max(initial=0.0)))
+            else:
+                out.pop('__kinetic', None)
+                field_audit['energy_closure'] = dict(mode='internal')
+            # Close the bulk momentum only AFTER extracting any unresolved
+            # kinetic variance from the raw vertex field. A uniform boost is
+            # Galilean: it must not be mistaken for (or alter) local velocity
+            # dispersion.
+            if momentum_closure == 'boost':
+                if 'vel' not in out or 'vel' not in full_budget:
+                    raise ValueError("momentum_closure='boost' requires a "
+                                     "vector 'vel' field")
+                target_momentum = np.asarray(full_budget['vel'],
+                                             dtype=np.float64)
+                momentum_pre = np.sum(m_out * out['vel'], axis=0)
+                delta_v = (target_momentum - momentum_pre) / M_gas
+                ke_pre = float(np.sum(
+                    0.5 * m_out * np.sum(out['vel'] ** 2, axis=1)))
+                ke_com_pre = ke_pre - float(
+                    np.dot(momentum_pre, momentum_pre)) / (2.0 * M_gas)
+                out['vel'] = out['vel'] + delta_v
+                momentum_post = np.sum(m_out * out['vel'], axis=0)
+                ke_post = float(np.sum(
+                    0.5 * m_out * np.sum(out['vel'] ** 2, axis=1)))
+                ke_com_post = ke_post - float(
+                    np.dot(momentum_post, momentum_post)) / (2.0 * M_gas)
+                field_audit['momentum_closure'] = dict(
+                    mode='boost', target=target_momentum.tolist(),
+                    pre=momentum_pre.tolist(), delta_v=delta_v.tolist(),
+                    post=momentum_post.tolist(),
+                    post_residual=(momentum_post-target_momentum).tolist(),
+                    ke_com_pre=ke_com_pre, ke_com_post=ke_com_post,
+                    ke_com_change=ke_com_post-ke_com_pre)
+            else:
+                field_audit['momentum_closure'] = dict(mode='none')
+            # Density is a property of the reconstructed equal-mass SPH set,
+            # not a primitive to imprint from the source table.
+            out['rho'], h_out = particle_density(
+                final_pos, np.full(len(final_pos), m_out), box=box,
+                nsmooth=nsmooth)
+            if 'aux_smoothlength' in fields:
+                out['aux_smoothlength'] = h_out
+            output_budget = {'mass': M_gas}
+            mass_ref = float(resolved_budget['mass'])
+            imprint_drift = {
+                'mass': float((M_gas - mass_ref) /
+                              max(abs(mass_ref), 1e-300))}
+            for name in state.fields:
+                values = np.asarray(out[name])
+                total = (float(np.sum(m_out * values)) if values.ndim == 1
+                         else np.sum(m_out * values, axis=0))
+                ref = np.asarray(resolved_budget[name])
+                denom = np.maximum(np.abs(ref), 1e-300)
+                drift = np.asarray(total - ref) / denom
+                output_budget[name] = (total.tolist()
+                                       if isinstance(total, np.ndarray)
+                                       else total)
+                imprint_drift[name] = (drift.tolist() if drift.ndim else
+                                       float(drift))
+            field_audit.update(query=query_audit,
+                               output=_plain_budget(output_budget),
+                               imprint_drift=imprint_drift)
+            if source_derived is not None:
+                out_vel = np.asarray(out['vel'], dtype=np.float64)
+                out_momentum = np.sum(m_out * out_vel, axis=0)
+                delta_momentum = (out_momentum
+                                  - np.asarray(source_derived['momentum']))
+                out_angular = np.sum(
+                    m_out * np.cross(final_pos - source_com, out_vel), axis=0)
+                field_audit['derived'] = dict(
+                    source=source_derived,
+                    output=dict(
+                        momentum=out_momentum.tolist(),
+                        kinetic_energy=float(np.sum(
+                            0.5 * m_out * np.sum(out_vel ** 2, axis=1))),
+                        angular_momentum=out_angular.tolist()),
+                    delta_momentum=delta_momentum.tolist(),
+                    delta_momentum_over_scale=float(
+                        np.linalg.norm(delta_momentum)
+                        / max(source_derived['momentum_scale'], 1e-300)))
+            timings['table_imprint'] = _time.perf_counter() - t
+            return out
 
     rkw = dict(relax_kw or {})
     if progress is not None:
@@ -570,6 +1000,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
               if k in ('rho_edge', 'rho_frame', 'delta_bg', 'm',
                        'scaffold', 'alpha')},
              relax_iters=int(res.niter), relax_stop=str(res.stop_reason),
+             density_capture=density_capture_audit,
              timings=timings, fields=dict(field_audit),
              levels=[dict(name=lv.get('name'), n=lv.get('n'),
                           niter=lv.get('niter'), wall=lv.get('wall'))
@@ -834,6 +1265,7 @@ def apply_count_overlay(table, count, c=64, k=None,
     # build_table_envelope - same resolve, same solve below)
     k = resolve_bg_k(k, n_frame, nsmooth=c)
     re, delta_bg = edge_floor_spacing(vals, vols, m, c=c, k=k)
+    occ_cells = vals >= re
     fbox = table.box if getattr(table, 'periodic', False) is True \
         or (hasattr(table, 'periodic') and bool(np.ravel(table.periodic)[0])) \
         else None
@@ -842,12 +1274,25 @@ def apply_count_overlay(table, count, c=64, k=None,
     # stay in lockstep with build_table_envelope or the rendered target and
     # the relaxed target disagree on tail_scale.
     if fbox is None:
-        dom_lo = (centres - 0.5 * sizes).min(0)
-        dom_hi = (centres + 0.5 * sizes).max(0)
-        frame_extent, _ = frame_open_box(dom_lo, dom_hi, delta_bg,
+        cell_lo = centres - 0.5 * sizes
+        cell_hi = centres + 0.5 * sizes
+        active_lo = cell_lo[occ_cells].min(0)
+        active_hi = cell_hi[occ_cells].max(0)
+        particle_lo = getattr(table, 'capture_particle_lo', None)
+        particle_hi = getattr(table, 'capture_particle_hi', None)
+        if particle_lo is None or particle_hi is None:
+            # Legacy tables carried no capture metadata: their table bounds
+            # are the only record of the intended physical domain.
+            active_lo = cell_lo.min(0)
+            active_hi = cell_hi.max(0)
+        else:
+            active_lo = np.minimum(active_lo, particle_lo)
+            active_hi = np.maximum(active_hi, particle_hi)
+        frame_extent, _ = frame_open_box(active_lo, active_hi, delta_bg,
                                          nsmooth=c, k=k)
     else:
         frame_extent = np.asarray(fbox, dtype=np.float64).reshape(3)
+        active_lo = active_hi = None
     rho_frame = re / k ** 6               # two-rung ladder: rho_edge -> rho_frame
     # M20: solve tail_reach from nl0 (or take the legacy explicit value) -
     # MUST stay in lockstep with build_table_envelope or the rendered
@@ -874,6 +1319,9 @@ def apply_count_overlay(table, count, c=64, k=None,
                 delta_bg=delta_bg, occ_frac=occ,
                 tail_reach=tail_reach, bg_k=k,
                 n_emptied=n_emptied, n_cells=len(vals))
+    if active_lo is not None:
+        info['active_lo'], info['active_hi'] = active_lo, active_hi
+        info['frame_extent'] = frame_extent
     if nl0_eff is not None:               # M20: launch N_L + exponent
         info['nl0'] = nl0_eff
         info['profile_p'] = p_eff
@@ -985,6 +1433,23 @@ def main(argv=None):
                          '--table unless --raw-only')
     ap.add_argument('--raw-only', dest='raw_only', action='store_true',
                     help='write only the raw table + render (no envelope pair)')
+    ap.add_argument('--fields', action='store_true',
+                    help='also capture and render EVERY field the snapshot '
+                         'carries (velocity, internal energy, metals, and -- '
+                         'if BField aux is present -- the magnetic field as a '
+                         'raw pre-Hodge and a divergence-projected post-Hodge '
+                         'pair) as per-cell tipsy files ${out}_fields*.00000')
+    ap.add_argument('--open-padding', '--raw-padding',
+                    dest='open_padding',
+                    choices=('full_pad', 'rho_edge_pad', 'constant_pad'),
+                    default=None,
+                    help='open raw-table bounds: full_pad adds max(2h), '
+                         'rho_edge_pad adds 2*h_edge from the INPUT particle '
+                         'count (default for --open), and constant_pad adds '
+                         '0.1*max(particle span), on every side')
+    ap.add_argument('--open-pad-fraction', type=float, default=0.1,
+                    help='fraction of the longest particle span used by '
+                         'constant_pad')
     ap.add_argument('--no-contour-refine', dest='contour_refine',
                     action='store_false',
                     help='disable the M10 contour-resolving capture (extra '
@@ -1030,6 +1495,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.table:
+        if args.open_padding is not None:
+            ap.error('--open-padding/--raw-padding only applies while '
+                     'capturing with -I --open')
         for val, name in ((args.param, '--param'), (args.box, '--box'),
                           (args.grid_npx, '--grid-npx')):
             if val:
@@ -1044,15 +1512,22 @@ def main(argv=None):
         out = args.out or re.sub(r'(_raw)?\.npz$', '', args.table)
         _export_table(table, f'{out}_raw', 'raw table')
     else:
+        if args.open_pad_fraction < 0.0:
+            ap.error('--open-pad-fraction must be non-negative')
         if not (args.param or args.box or args.open):
             ap.error('capturing with -I needs --param, --box or --open')
         if args.open:
             box = None
+            open_padding = args.open_padding or 'rho_edge_pad'
         elif args.box:
             box = np.asarray(args.box, dtype=np.float64)
+            open_padding = None
         else:
             from .params import box_from_param, read_param
             box = box_from_param(read_param(args.param))
+            open_padding = None
+        if args.open_padding is not None and not args.open:
+            ap.error('--open-padding/--raw-padding requires --open')
         tip = _import_readtipsy()
         gas, _, _, _, _ = tip.readtipsy(args.infile)
         if len(gas) == 0:
@@ -1066,7 +1541,9 @@ def main(argv=None):
         # vacuum - the N-dependent fill is applied as an overlay below, never
         # baked into the saved table.
         kw = dict(grid=args.grid, nsmooth=args.nsmooth,
-                  method=args.capture_method, empty='zero')
+                  method=args.capture_method, empty='zero',
+                  open_padding=open_padding,
+                  open_pad_fraction=args.open_pad_fraction)
         if args.grid == 'amr':
             kw['grade'] = args.grade      # uniform grids have no levels
         if args.grid == 'amr' and args.contour_refine:
@@ -1076,11 +1553,37 @@ def main(argv=None):
             kw['base_npx' if args.grid == 'amr' else 'npx'] = args.grid_npx
         table = capture_density(gas[:, 1:4].astype(np.float64),
                                 gas[:, 0].astype(np.float64), box=box, **kw)
+        da = getattr(table, 'capture_domain_audit', None)
+        if da is not None:
+            extra = (f', rho_edge,in={da["rho_edge_in"]:.6g}, '
+                     f'h_edge,in={da["h_edge_in"]:.6g}'
+                     if da['rho_edge_in'] is not None else '')
+            print(f'open raw domain: {da["mode"]}, pad={da["pad"]:.6g} '
+                  f'per side, span={np.round(da["hi"]-da["lo"], 6)}'
+                  f'{extra}', flush=True)
         print(f'captured ({describe_table(table)})', flush=True)
         out = args.out or re.sub(r'\.\d+$', '', args.infile) + '_table'
         save_table(table, f'{out}_raw.npz')
         print(f'wrote {out}_raw.npz', flush=True)
         _export_table(table, f'{out}_raw', 'raw table')
+
+        if args.fields:
+            if args.grid != 'amr':
+                ap.error('--fields requires --grid amr (field capture is '
+                         'AMR-only)')
+            from . import fieldexport
+            field_kwargs = dict(method=args.capture_method,
+                                max_level=16, part_per_cell=8, grade=args.grade)
+            if args.grid_npx:
+                field_kwargs['base_npx'] = args.grid_npx
+            if args.contour_refine:
+                field_kwargs.update(contour_band=args.contour_band,
+                                    contour_beta=args.contour_beta)
+            fieldexport.export_fields(
+                sys.modules[__name__], args.infile, out, box, gas,
+                nsmooth=args.nsmooth,
+                count=(args.count if args.contour_refine else None),
+                capture_kwargs=field_kwargs)
 
     if args.raw_only or not args.count:
         return

@@ -29,10 +29,10 @@ neighbour count, so it is carried through unscaled.
 --count N, decoupled from the input count. A thin wrapper around the
 glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10): capture
 the input gas density on a raw AMR table (sph_interp), sample + envelope +
-progressive relax in glassgen (build_from_table), then conservatively
-scatter the fields (vel/u/...) from the input onto the final positions
-(M22: interior totals exact, truncation budgeted) - the output has no
-history to inherit. Positions are rebuilt from scratch, so this is for
+progressive relax in glassgen (build_from_table), then transfer fields
+(vel/u/...) either by the M22 particle-scatter control or an opt-in M23
+conservative raw-AMR state plus vertex imprint - the output has no history
+to inherit. Positions are rebuilt from scratch, so this is for
 ICs / quasi-equilibrium snapshots, not mid-run states with strong coherent
 flows. Only the gas is processed; dark/star (and their aux slices) pass
 through unchanged.
@@ -204,8 +204,7 @@ def main(argv=None):
         'rebuild the gas at --count N: capture the input gas density on a '
         'raw AMR table, then run the glassgen table builder (sample + '
         'N-aware envelope + progressive relax + cull/renorm to M_gas) and '
-        'conservatively scatter the fields from the input onto the '
-        'final positions (M22).')
+        'transfer fields from the input onto the final positions.')
     rec.add_argument('--grid-npx', type=int, default=None,
                      help='AMR BASE grid cells per axis (default ~N^(1/3)/8, '
                           'power of two - refinement supplies locality). '
@@ -221,12 +220,50 @@ def main(argv=None):
                           'deficit at the gas edge as the relax\'s own '
                           'density estimate, so the edge biases cancel '
                           'instead of driving a persistent edge force')
+    rec.add_argument('--field-transfer', choices=('scatter', 'table'),
+                     default='scatter',
+                     help='field transfer after reconstruction: scatter is '
+                          'the M22 particle-to-particle control (default); '
+                          'table captures conservative rho*A channels on '
+                          'the raw AMR grid and imprints A=vertex(rho*A)/'
+                          'vertex(rho) after relaxation (M23 opt-in)')
+    rec.add_argument('--field-interp',
+                     choices=('vertex', 'limited', 'flat'), default='vertex',
+                     help='M23 table field readout at final particle '
+                          'positions (default: vertex). Numerator and rho '
+                          'use the same operator before division')
+    rec.add_argument('--energy-mode', choices=('internal', 'total'),
+                     default='internal',
+                     help='M23 table transfer: internal preserves deposited '
+                          'u (default); total also deposits kinetic energy '
+                          'and converts unresolved within-cell velocity '
+                          'variance to heat. Requires --field-transfer table')
+    rec.add_argument('--momentum-closure', choices=('boost', 'none'),
+                     default=None,
+                     help='M23 table transfer: apply the minimum-change '
+                          'uniform velocity boost that matches full raw-table '
+                          'linear momentum (default for table), or none for '
+                          'an uncorrected A/B')
+    state_io = rec.add_mutually_exclusive_group()
+    state_io.add_argument('--state-table', default=None, metavar='FILE.npz',
+                          help='M23: reuse a previously captured raw AMR '
+                               'state table (still reads the input snapshot '
+                               'for gas mass and non-gas families)')
+    state_io.add_argument('--save-state', default=None, metavar='FILE.npz',
+                          help='M23: save the captured raw AMR state before '
+                               'starting relaxation')
     rec.add_argument('--icr0-stop', dest='icr0_stop', type=float,
                      default=None, metavar='X',
                      help='median-smoothed icr0 stop (max step as a fraction '
                           'of h) for the relax - the quality dial: 3e-3 '
                           '(default) fast/good, ~1e-3 tight; capped at 4800 '
                           'iterations either way')
+    rec.add_argument('--momentum', type=float, default=None, metavar='B',
+                     help='heavy-ball coefficient on the relax move, applied '
+                          'ONLY in the polish phase (hardwired 2026-07-22; '
+                          'default 0 = off). NB with the default icr0-stop '
+                          'the envelope build barely polishes before the '
+                          'stop fires')
     rec.add_argument('--nedge', dest='bg_c', type=int, default=0,
                      help='envelope: resolvability contour count (INTEGRAL: '
                           'rho_edge = where the cumulative faint-end mass '
@@ -277,13 +314,29 @@ def main(argv=None):
         for val, name in ((args.count, '--count'),
                           (args.grid_npx, '--grid-npx'),
                           (args.capture_method, '--capture-method'),
-                          (args.icr0_stop, '--icr0-stop')):
+                          (args.icr0_stop, '--icr0-stop'),
+                          (args.momentum, '--momentum')):
             if val is not None:
                 ap.error(f'{name} requires --op reconstruct')
     if args.capture_method is None:
         args.capture_method = 'petkova'
+    if (args.op == 'reconstruct' and args.field_transfer == 'table'
+            and args.capture_method != 'petkova'):
+        ap.error('--field-transfer table requires --capture-method petkova')
+    if (args.op == 'reconstruct' and args.energy_mode == 'total'
+            and args.field_transfer != 'table'):
+        ap.error('--energy-mode total requires --field-transfer table')
+    if (args.op == 'reconstruct' and args.momentum_closure == 'boost'
+            and args.field_transfer != 'table'):
+        ap.error('--momentum-closure boost requires --field-transfer table')
+    if (args.op == 'reconstruct'
+            and (args.state_table or args.save_state)
+            and args.field_transfer != 'table'):
+        ap.error('--state-table/--save-state require --field-transfer table')
     if args.icr0_stop is None:
         args.icr0_stop = 3e-3
+    if args.momentum is None:
+        args.momentum = 0.0
     if args.orient is None:
         args.orient = 'jr96'
 
@@ -347,7 +400,13 @@ def main(argv=None):
               + (f', {args.grid_npx} cells/axis' if args.grid_npx else '')
               + ' -> glassgen table build: envelope '
               f'{"cascade" if args.cascade else "single relax"}, {budget}, '
-              'conservative field scatter at the final positions); '
+              f'{args.field_transfer} field transfer at the final positions'
+              + (f' ({args.field_interp})' if args.field_transfer == 'table'
+                 else '')
+              + (f', energy {args.energy_mode}'
+                 if args.field_transfer == 'table' else '')
+              + (f', momentum {args.momentum_closure or "boost"}'
+                 if args.field_transfer == 'table' else '') + '); '
               f'box {boxdesc}; nsmooth {args.nsmooth}', flush=True)
     else:
         arrow = ('x%d' if args.op == 'split' else '1/%d') % factor
@@ -389,6 +448,10 @@ def main(argv=None):
         n_in, dt = len(sel), sel.dtype
         if args.op == 'reconstruct':    # gas rebuild via the glassgen builder
             from . import reconstruct
+            state_cap = None
+            if args.state_table:
+                from .amrtable import AMRStateTable
+                state_cap = AMRStateTable.load(args.state_table)
             # the input rows are fully unpacked into pos/mass/aux float64 -
             # release the float32 originals so the heavy build does not carry
             # them (gas-only processing; dark/star stay untouched in fam)
@@ -399,15 +462,53 @@ def main(argv=None):
             # split/merge confined heal. max_iter 4800; icr0_stop usually
             # finishes it earlier.
             rkw = dict(icr0_stop=args.icr0_stop, max_iter=4800,
-                       callback_every=10)
+                       callback_every=10, momentum=args.momentum)
+            field_payload = aux
+            tu_fac = 1.0
+            if args.field_transfer == 'table':
+                magnetic = [k for k in aux
+                            if k.lower().removeprefix('aux_').startswith(
+                                'bfield')]
+                if magnetic:
+                    sys.exit('M23 table transfer does not yet support '
+                             'divergence-aware magnetic fields; remove these '
+                             'aux inputs or use --field-transfer scatter: '
+                             + ', '.join(magnetic))
+                # Recomputed/resolution fields are not hydrodynamic state
+                # channels. eps is restored below then scaled to output mass;
+                # phi is intentionally reset for the target gravity solve.
+                field_payload = {k: v for k, v in aux.items()
+                                 if k not in ('eps', 'phi')}
+                if args.energy_mode == 'total':
+                    # Tipsy col 8 is temperature, whereas kinetic energy is
+                    # in code-specific-energy units. Convert T->u for closure
+                    # and convert back before writing the snapshot.
+                    from sph_interp.particles import read_param_tufac
+                    tu_fac = read_param_tufac(args.infile)
+                    if tu_fac is None:
+                        from IC_analysis_general import read_tufac
+                        tu_fac = read_tufac(args.infile, np.nan)
+                    if not np.isfinite(tu_fac) or tu_fac <= 0.0:
+                        sys.exit('--energy-mode total needs a valid dTuFac '
+                                 '(u=dTuFac*T) in the sibling .param/.log; '
+                                 'this snapshot has no compatible energy-unit '
+                                 'conversion')
+                    field_payload = dict(field_payload)
+                    field_payload['u'] = aux['u'] * tu_fac
             print(f'reconstruct: {n_in} gas -> {args.count} target '
                   f'(capture -> glassgen build_from_table, envelope '
                   f'{"cascade" if args.cascade else "single relax"})...',
                   flush=True)
             ct = time.perf_counter()
             pos2, mass2, aux2, _isf, ea = reconstruct.reconstruct_resample(
-                pos, mass, args.count, aux, box=box, nsmooth=args.nsmooth,
+                pos, mass, args.count, field_payload, box=box,
+                nsmooth=args.nsmooth,
                 method=args.capture_method, base_npx=args.grid_npx,
+                field_transfer=args.field_transfer,
+                field_interp=args.field_interp,
+                energy_mode=args.energy_mode,
+                momentum_closure=args.momentum_closure,
+                amr_cap=state_cap, save_state=args.save_state,
                 bg_c=args.bg_c,
                 n_frame=args.n_frame, nl0=args.nl0, cascade=args.cascade,
                 alpha=args.alpha,
@@ -416,11 +517,28 @@ def main(argv=None):
                     f'  iter {s.it}: denserr {s.dens_err:.4f} icr0 '
                     f'{s.icr0:.1e} ({time.perf_counter() - ct:.0f}s)',
                     flush=True))
+            if args.field_transfer == 'table':
+                if args.energy_mode == 'total':
+                    aux2['u'] = aux2['u'] / tu_fac
+                aux2['eps'] = np.full(
+                    len(pos2),
+                    np.average(aux['eps'], weights=mass))
+                aux2['phi'] = np.zeros(len(pos2), dtype=np.float64)
             n2 = len(pos2)
             print(f'  -> {n2} gas (target {args.count}): bg {ea["n_background"]} '
                   f'seeded, culled {ea["n_culled"]}, mf {ea["mf"]:.3e}, '
                   f'rho_edge {ea["rho_edge"]:.2e}, rho_frame {ea["rho_frame"]:.2e} '
                   f'({time.perf_counter() - t0:.0f}s)', flush=True)
+            density_capture = ea.get('density_capture')
+            if density_capture is not None:
+                print(
+                    '  raw AMR mass: pre-closure residual '
+                    f'{density_capture["relative_error_before_closure"]:+.3e}; '
+                    'uniform closure x'
+                    f'{density_capture["uniform_closure_factor"]:.9g}; '
+                    'final residual '
+                    f'{density_capture["relative_error_after_closure"]:+.3e}',
+                    flush=True)
         elif args.op == 'split':
             print(f'splitting {n_in} {ptype} particles '
                   f'(orient {args.orient})...', flush=True)

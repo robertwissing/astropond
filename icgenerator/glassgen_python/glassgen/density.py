@@ -161,6 +161,11 @@ class TableDensity(DensityField):
             meta['mapping'] = np.array([self.mapping])
         elif self.dim == 2:
             meta['mapping'] = np.array(list(self.mapping))
+        if hasattr(self, 'capture_particle_lo'):
+            meta['capture_particle_lo'] = self.capture_particle_lo
+            meta['capture_particle_hi'] = self.capture_particle_hi
+            meta['capture_padding_mode'] = np.array(
+                [self.capture_padding_mode])
         np.savez(path, **meta)
 
     @classmethod
@@ -182,7 +187,13 @@ class TableDensity(DensityField):
                     f'{path}: a {dim}D table needs its coordinate mapping in '
                     'the header - re-save it, or convert the original xdr '
                     'with python -m glassgen.density')
-        return cls(axes, values, mapping=mapping)
+        out = cls(axes, values, mapping=mapping)
+        with np.load(path) as d:
+            if 'capture_particle_lo' in d.files:
+                out.capture_particle_lo = d['capture_particle_lo'].copy()
+                out.capture_particle_hi = d['capture_particle_hi'].copy()
+                out.capture_padding_mode = str(d['capture_padding_mode'][0])
+        return out
 
     @classmethod
     def from_xdr(cls, filename, mapping='r_sph'):

@@ -1,4 +1,4 @@
-"""CLI: functional replacement for the gasoline.gdicgen invocation in
+glassgen/cli.py"""CLI: functional replacement for the gasoline.gdicgen invocation in
 runtest.sh (tipsy pre-IC + density table in -> relaxed tipsy glass out).
 
 Example, mirroring runtest.sh ICCONFIG:
@@ -165,7 +165,9 @@ def main(argv=None):
                               'split in the progressive cascade (default 10)'))
     ap.add_argument('--momentum', type=float, default=0.5,
                     help=hide('heavy-ball coefficient on the post-split '
-                              'confined stages (default 0.5; 0 = off)'))
+                              'confined stages, active ONLY in the polish '
+                              'phase (hardwired 2026-07-22; default 0.5; '
+                              '0 = off)'))
     ap.add_argument('--icr0-stop', dest='icr0_stop', type=float, default=3e-3,
                     help='median-smoothed icr0 stop (max step as a fraction of '
                          'h) - the quality dial: 3e-3 fast/good, ~1e-3 tight. '
@@ -173,6 +175,17 @@ def main(argv=None):
     ap.add_argument('--polish-iter', dest='polish_iter', type=int, default=0,
                     help='fixed polish-iteration budget on the fine stage '
                          '(0 = off; composes with --icr0-stop)')
+    ap.add_argument('--polish-down', dest='polish_down', type=float,
+                    default=0.1,
+                    help=hide('polish-phase icr0 shrink coefficient (C '
+                              'default 0.1 = a 47:1 ratchet vs --polish-up '
+                              'that freezes the run shortly after polish '
+                              'entry; ~0.01 keeps icr0 mobile for deep '
+                              'fixed-budget polishes)'))
+    ap.add_argument('--polish-up', dest='polish_up', type=float,
+                    default=0.002,
+                    help=hide('polish-phase icr0 grow coefficient (C '
+                              'default 0.002)'))
     ap.add_argument('--no-self-bias', dest='self_bias', action='store_false',
                     help=hide('disable the Wendland C2 self-density bias '
                               'correction (Wzero10); density then uses the '
@@ -304,6 +317,7 @@ def main(argv=None):
             coarse_target=ct, alpha=args.alpha, inter_iter=args.inter_iter,
             max_iter=args.max_iter, momentum=args.momentum,
             icr0_stop=args.icr0_stop, polish_iter=args.polish_iter,
+            polish_down=args.polish_down, polish_up=args.polish_up,
             cap=2.0, start_icr0=2.0,
             flavour=args.flavour, rhopow=args.rhopow, icr0rate=args.icr0rate,
             margin=args.margin, one_sided=args.one_sided, hmode=args.hmode,
@@ -396,7 +410,9 @@ def main(argv=None):
             coarse_target=ct, alpha=args.alpha, inter_iter=args.inter_iter,
             nsmooth=args.nsmooth, max_iter=args.max_iter,
             momentum=args.momentum, icr0_stop=args.icr0_stop,
-            polish_iter=args.polish_iter, cap=2.0, start_icr0=2.0,
+            polish_iter=args.polish_iter,
+            polish_down=args.polish_down, polish_up=args.polish_up,
+            cap=2.0, start_icr0=2.0,
             flavour=args.flavour, rhopow=args.rhopow, icr0rate=args.icr0rate,
             margin=args.margin, one_sided=args.one_sided, hmode=args.hmode,
             nsmoothmin=args.nsmoothmin, self_bias=args.self_bias,
@@ -448,6 +464,7 @@ def main(argv=None):
                 margin=args.margin, one_sided=args.one_sided,
                 hmode=args.hmode, nsmoothmin=args.nsmoothmin,
                 icr0_stop=args.icr0_stop, polish_iter=args.polish_iter,
+                polish_down=args.polish_down, polish_up=args.polish_up,
                 self_bias=args.self_bias,
                 callback=callback, callback_every=args.oi or args.max_iter,
                 verbose=True)

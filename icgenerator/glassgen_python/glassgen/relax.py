@@ -80,7 +80,8 @@ def relax(pos, mass, density, box=None, nsmooth=64,
           confine=False, max_step_frac=None,
           cap_mode='h', reanneal=True, momentum=0.0, icr0_stop=3e-3,
           stop_window=10,
-          polish_iter=0, diagnostics=False,
+          polish_iter=0, polish_down=0.1, polish_up=0.002,
+          diagnostics=False,
           callback=None, callback_every=100, verbose=False):
     """Relax particles into a glass matching a target density field.
 
@@ -142,7 +143,18 @@ def relax(pos, mass, density, box=None, nsmooth=64,
         accelerating the slow frms tail that pure steepest descent cannot beat
         on the stiff 360:1 gradient. Composes with confine (the cap clamps the
         final blended move) and the icr0 feedback controller (which then sees
-        momentum-smoothed moves). Remaining parameters mirror the gdicgen
+        momentum-smoothed moves). polish_down/polish_up : polish-phase icr0
+        shrink/grow coefficients (StepController; C defaults 0.1/0.002 - a
+        47:1 ratchet at rate 1.5 that freezes the run ~250 iters after
+        polish entry; ~0.01 keeps icr0 mobile through a long polish budget).
+        Momentum is HARDWIRED to the polish phase
+        (user decision 2026-07-22): beta stays 0 while the re-anneal ladder /
+        icr0 decay is active and turns on only once the controller enters
+        polish (icfmax = -1). Measured basis: beta=0.5 through the envelope
+        build's anneal ladder cost +30% iterations at identical quality
+        (recon_m8/momab_* A/B); direction memory is unwanted across anneal
+        kicks. The disp_prev buffer starts clean at polish entry because
+        beta=0 never writes it. Remaining parameters mirror the gdicgen
         ICCONFIG flags.
     """
     if hmode not in ('knn', 'measured', 'target'):
@@ -212,7 +224,8 @@ def relax(pos, mass, density, box=None, nsmooth=64,
     # /h_avg, so capped steps start at ~icr0*h and anneal down. The actual move
     # + wrap in apply_step still use the real periodic box.
     ctrl = StepController(icr0, icrloop0, icr0rate, nsmooth,
-                          box=(None if confine else boxarr), reanneal=reanneal)
+                          box=(None if confine else boxarr), reanneal=reanneal,
+                          polish_down=polish_down, polish_up=polish_up)
     dummybox = boxarr if periodic else np.ones(3)
     # The per-step move cap (apply_step clamps each component to max_step_frac*h)
     # is normally tied to confine: confine -> cap at 1*h, else no cap. They are
@@ -396,9 +409,15 @@ def relax(pos, mass, density, box=None, nsmooth=64,
         # apply_step (which still computes cap = arg*h) - no kernel change. The
         # move itself already scales by icr0, so this caps |d| at max_step_frac.
         cap_arg = max_step_frac * ctrl.icr0 if cap_icr0 else max_step_frac
+        # Momentum is polish-only (hardwired, 2026-07-22): beta=0 through the
+        # anneal ladder / icr0 decay (big coherent transient moves + kicks -
+        # direction memory measured harmful there, momab A/B +30% iters), on
+        # in the quiescent polish descent. disp_prev is only written when the
+        # effective beta > 0, so polish entry starts with a clean buffer.
+        mom_now = momentum if ctrl.polish else 0.0
         max_step = apply_step(pos, icvel, hforce, ctrl.icr0, dummybox,
                               periodic, pdisp, cap_arg, disp_prev,
-                              momentum)
+                              mom_now)
         (ballnl if use_ball else nblist).record_move(max_step)
         tprof['move'] += pc() - t
         if not np.isfinite(dens_err):

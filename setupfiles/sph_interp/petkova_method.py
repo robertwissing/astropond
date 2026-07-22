@@ -897,6 +897,7 @@ class _chunked:
 def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                              nx, ny, nz, lox, loy, loz, pwx, pwy, pwz,
                              perx, pery, perz, faces, need_w,
+                             conservative_fields,
                              mass_local, den_local, num_local):
     npart = x.shape[0]
     K = vals.shape[1]
@@ -958,18 +959,24 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                         continue
                     mass_local[t, iw, jw, kw] += mi * frac
                     if need_w:
-                        den_local[t, iw, jw, kw] += wi * frac
+                        if not conservative_fields:
+                            den_local[t, iw, jw, kw] += wi * frac
+                        fw = mi if conservative_fields else wi
                         for p in range(K):
-                            num_local[t, iw, jw, kw, p] += wi * vals[i, p] * frac
+                            num_local[t, iw, jw, kw, p] += fw * vals[i, p] * frac
 
 
-def interpolate_uniform_petkova(particles, grid, values=None):
+def interpolate_uniform_petkova(particles, grid, values=None,
+                                 conservative_fields=False):
     """Petkova exact interpolation of `particles` onto a `UniformGrid`.
 
     Returns data: dict[name -> (nx,ny,nz)]. Density-like fields ('rho'/'density')
     are the MASS-CONSERVING estimate sum_j m_j (integral_cell W_j) / V_cell; other
     fields are the kernel-volume-weighted cell average
-    sum_j (m_j/rho_j) A_j I / sum_j (m_j/rho_j) I.
+    sum_j (m_j/rho_j) A_j I / sum_j (m_j/rho_j) I. With
+    ``conservative_fields=True``, non-density fields instead use the exact
+    mass fractions: sum_j m_j A_j I / sum_j m_j I, and their raw integrated
+    contents are exposed as ``_content_<name>``.
     """
     if not isinstance(grid, UniformGrid):
         raise TypeError("interpolate_uniform_petkova requires a UniformGrid target")
@@ -983,10 +990,12 @@ def interpolate_uniform_petkova(particles, grid, values=None):
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
     need_w = _needs_weights(names)
-    wshape = (nx, ny, nz) if need_w else (1, 1, 1)
+    dshape = ((nx, ny, nz) if need_w and not conservative_fields
+              else (1, 1, 1))
+    nshape = (nx, ny, nz) if need_w else (1, 1, 1)
     mass_local = np.zeros((nthreads, nx, ny, nz), dtype=np.float64)
-    den_local = np.zeros((nthreads,) + wshape, dtype=np.float64)
-    num_local = np.zeros((nthreads,) + wshape + (K,), dtype=np.float64)
+    den_local = np.zeros((nthreads,) + dshape, dtype=np.float64)
+    num_local = np.zeros((nthreads,) + nshape + (K,), dtype=np.float64)
 
     pos = particles.pos
     with _chunked():
@@ -996,7 +1005,7 @@ def interpolate_uniform_petkova(particles, grid, values=None):
             np.ascontiguousarray(pos[:, 2]),
             particles.h, particles.mass, particles.mass / particles.rho, vals,
             nx, ny, nz, lo[0], lo[1], lo[2], pw[0], pw[1], pw[2],
-            perx, pery, perz, _CUBE_FACES, need_w,
+            perx, pery, perz, _CUBE_FACES, need_w, conservative_fields,
             mass_local, den_local, num_local)
 
     mass = np.empty((nx, ny, nz), dtype=np.float64)
@@ -1004,10 +1013,11 @@ def interpolate_uniform_petkova(particles, grid, values=None):
     den = np.zeros((nx, ny, nz), dtype=np.float64)
     num = np.zeros((nx, ny, nz, K), dtype=np.float64)
     if need_w:
-        _reduce_threads(den_local, den)
+        if not conservative_fields:
+            _reduce_threads(den_local, den)
         _reduce_threads(num_local, num)
     cv = grid.cell_volume
-    mask = den > 0.0
+    mask = mass > 0.0 if conservative_fields else den > 0.0
 
     data = {}
     for p, name in enumerate(names):
@@ -1015,8 +1025,11 @@ def interpolate_uniform_petkova(particles, grid, values=None):
             data[name] = mass / cv
         else:
             g = np.zeros((nx, ny, nz), dtype=np.float64)
-            g[mask] = num[..., p][mask] / den[mask]
+            divisor = mass if conservative_fields else den
+            g[mask] = num[..., p][mask] / divisor[mask]
             data[name] = g
+            if conservative_fields:
+                data[f"_content_{name}"] = num[..., p]
     # always expose the conserved mass grid for convenience
     data.setdefault("_mass", mass)
     return data
@@ -1034,6 +1047,7 @@ def _deposit_petkova_amr(x, y, z, h, mass, volw, vals, cell_lo, cell_size,
                          base_start, base_count, blo0, blo1, blo2,
                          bpw0, bpw1, bpw2, nbx, nby, nbz,
                          perx, pery, perz, boxx, boxy, boxz, faces, need_w,
+                         conservative_fields,
                          mass_local, den_local, num_local):
     npart = x.shape[0]
     K = vals.shape[1]
@@ -1107,19 +1121,25 @@ def _deposit_petkova_amr(x, y, z, h, mass, volw, vals, cell_lo, cell_size,
                             continue
                         mass_local[t, li] += mi * frac
                         if need_w:
-                            den_local[t, li] += wi * frac
+                            if not conservative_fields:
+                                den_local[t, li] += wi * frac
+                            fw = mi if conservative_fields else wi
                             for p in range(K):
-                                num_local[t, li, p] += wi * vals[i, p] * frac
+                                num_local[t, li, p] += fw * vals[i, p] * frac
 
 
-def interpolate_amr_petkova(particles, grid, values=None):
+def interpolate_amr_petkova(particles, grid, values=None,
+                             conservative_fields=False):
     """Petkova exact interpolation of `particles` onto an `AMRGrid`.
 
     Returns data: dict[name -> (Ncell,)]. Density-like fields ('rho'/'density')
     are the MASS-CONSERVING estimate sum_j m_j (integral_cell W_j) / V_cell; other
-    fields are the kernel-volume-weighted leaf average. The summed leaf mass
-    equals the particle mass to high precision (the headline Petkova property),
-    now on the adaptive cells. `_mass` (conserved per-leaf mass) is also exposed.
+    fields are the kernel-volume-weighted leaf average. With
+    ``conservative_fields=True``, non-density fields are mass-weighted from the
+    same exact fractions and raw integrated contents are exposed as
+    ``_content_<name>``. The summed leaf mass equals the particle mass to high
+    precision (the headline Petkova property), now on the adaptive cells.
+    `_mass` (conserved per-leaf mass) is also exposed.
     """
     if not isinstance(grid, AMRGrid):
         raise TypeError("interpolate_amr_petkova requires an AMRGrid target")
@@ -1135,10 +1155,11 @@ def interpolate_amr_petkova(particles, grid, values=None):
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
     need_w = _needs_weights(names)
-    nw = Ncell if need_w else 1
+    nd = Ncell if need_w and not conservative_fields else 1
+    nn = Ncell if need_w else 1
     mass_local = np.zeros((nthreads, Ncell), dtype=np.float64)
-    den_local = np.zeros((nthreads, nw), dtype=np.float64)
-    num_local = np.zeros((nthreads, nw, K), dtype=np.float64)
+    den_local = np.zeros((nthreads, nd), dtype=np.float64)
+    num_local = np.zeros((nthreads, nn, K), dtype=np.float64)
 
     pos = particles.pos
     with _chunked():
@@ -1150,7 +1171,7 @@ def interpolate_amr_petkova(particles, grid, values=None):
             grid.cell_lo, grid.cell_size, grid.base_start, grid.base_count,
             blo[0], blo[1], blo[2], bpw[0], bpw[1], bpw[2],
             nbx, nby, nbz, perx, pery, perz, box[0], box[1], box[2],
-            _CUBE_FACES, need_w,
+            _CUBE_FACES, need_w, conservative_fields,
             mass_local, den_local, num_local)
 
     mass = np.empty(Ncell, dtype=np.float64)
@@ -1158,10 +1179,11 @@ def interpolate_amr_petkova(particles, grid, values=None):
     den = np.zeros(Ncell, dtype=np.float64)
     num = np.zeros((Ncell, K), dtype=np.float64)
     if need_w:
-        _reduce_threads(den_local, den)
+        if not conservative_fields:
+            _reduce_threads(den_local, den)
         _reduce_threads(num_local, num)
     vol = grid.volumes()
-    mask = den > 0.0
+    mask = mass > 0.0 if conservative_fields else den > 0.0
 
     data = {}
     for p, name in enumerate(names):
@@ -1169,8 +1191,11 @@ def interpolate_amr_petkova(particles, grid, values=None):
             data[name] = mass / vol
         else:
             g = np.zeros(Ncell, dtype=np.float64)
-            g[mask] = num[mask, p] / den[mask]
+            divisor = mass if conservative_fields else den
+            g[mask] = num[mask, p] / divisor[mask]
             data[name] = g
+            if conservative_fields:
+                data[f"_content_{name}"] = num[:, p]
     data.setdefault("_mass", mass)
     return data
 

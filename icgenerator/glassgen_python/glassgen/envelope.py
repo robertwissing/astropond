@@ -648,13 +648,19 @@ def _with_values(table, vals):
     with :func:`table_cells` order). Supports AMRTable and 3D TableDensity."""
     vals = np.ascontiguousarray(vals, dtype=np.float64)
     if isinstance(table, AMRTable):
-        return AMRTable(table.lo, table.box, table.dims, table.offsets,
-                        table.keys, vals, table.order, table.periodic,
-                        interp=table.interp)
-    if isinstance(table, TableDensity):
-        return TableDensity(table.axes, vals.reshape(table.values.shape),
-                            mapping=None)
-    raise TypeError(f'cannot rebuild table of type {type(table).__name__}')
+        out = AMRTable(table.lo, table.box, table.dims, table.offsets,
+                       table.keys, vals, table.order, table.periodic,
+                       interp=table.interp)
+    elif isinstance(table, TableDensity):
+        out = TableDensity(table.axes, vals.reshape(table.values.shape),
+                           mapping=None)
+    else:
+        raise TypeError(f'cannot rebuild table of type {type(table).__name__}')
+    for name in ('capture_domain_audit', 'capture_particle_lo',
+                 'capture_particle_hi', 'capture_padding_mode'):
+        if hasattr(table, name):
+            setattr(out, name, getattr(table, name))
+    return out
 
 
 def table_mass(table):
@@ -746,6 +752,7 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     k = resolve_bg_k(k, n_frame, nsmooth=nsmooth)
     re, delta_bg = edge_floor_spacing(vals, vols, m, c=c, k=k)
     shell_cap = None                    # local-start launch (M12; C2 fixed)
+    occ_cells = vals >= re
     # occupancy is DOMAIN-AWARE: outside the table's bbox the AMR/grid readout
     # clamps to the boundary cell, so a stray beyond the domain could read
     # >= rho_edge and dodge the vacuum cull (seen when the capture stopped
@@ -780,8 +787,28 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     # independent of tail_scale). Removing it tightens the frame to what
     # kernel-safety + padding require and compresses the vacuum profile, so
     # the scaffold drains faster - the direction M18 wants.
-    region_lo = dom_lo
-    region_hi = dom_hi
+    # A raw capture may deliberately extend well beyond the physical object
+    # (full compact-support, input-rho-edge, or constant padding).  Those
+    # sub-rho_edge leaves are scaffold storage, not part of the resolved gas
+    # extent.  Size the relaxation frame from the ACTIVE cell boxes so raw
+    # capture padding cannot silently inflate rho_frame's periodic frame.
+    cell_lo = centres - 0.5 * sizes
+    cell_hi = centres + 0.5 * sizes
+    region_lo = cell_lo[occ_cells].min(0)
+    region_hi = cell_hi[occ_cells].max(0)
+    particle_lo = getattr(table, 'capture_particle_lo', None)
+    particle_hi = getattr(table, 'capture_particle_hi', None)
+    capture_padded = particle_lo is not None and particle_hi is not None
+    if capture_padded:
+        # Include every input particle centre even when a faint outlier falls
+        # below the output-count rho_edge classification, but exclude the
+        # deliberately added raw-table padding beyond that source bbox.
+        region_lo = np.minimum(region_lo, particle_lo)
+        region_hi = np.maximum(region_hi, particle_hi)
+    else:
+        # Backward compatibility: an older/external table has no way to tell
+        # us which part of its domain was deliberate capture padding.
+        region_lo, region_hi = dom_lo, dom_hi
     # frame BEFORE the fill (M6 needs its extent): open build -> M2 rule;
     # explicit periodic box -> the box IS the frame.
     frame_box_ = frame_centre = None
@@ -790,8 +817,18 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
             region_lo, region_hi, delta_bg, nsmooth=nsmooth,
             pad_frac=pad_frac, k=k)
         frame_extent = frame_box_
+        frame_lo = frame_centre - 0.5 * frame_box_
+        frame_hi = frame_centre + 0.5 * frame_box_
     else:
         frame_extent = np.asarray(box, dtype=np.float64).reshape(3)
+        frame_lo = -0.5 * frame_extent
+        frame_hi = 0.5 * frame_extent
+    # Exact per-cell volume inside the relaxation frame.  Usually this is the
+    # full leaf volume; the intersection matters when an exported raw table is
+    # wider than the active-cell-derived frame.
+    overlap_size = np.maximum(
+        np.minimum(cell_hi, frame_hi) - np.maximum(cell_lo, frame_lo), 0.0)
+    frame_cell_vols = overlap_size.prod(1)
     # M6 whole-frame vacuum tail: past the exponential taper the shell keeps
     # decaying as a power law, reaching rho_frame (= rho_floor/k**3) only at
     # the frame edge - a kicked stray anywhere in the frame feels a
@@ -825,8 +862,9 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     d_out, r_scale = 0.0, 1.0
     if box is None:
         dom_half = 0.5 * (dom_hi - dom_lo)
-        d_out = float(np.linalg.norm(
-            np.maximum(0.5 * frame_extent - dom_half, 0.0)))
+        outside_reach = np.maximum(
+            np.maximum(dom_lo - frame_lo, frame_hi - dom_hi), 0.0)
+        d_out = float(np.linalg.norm(outside_reach))
         if d_out > 0.0:
             r_scale = max(float(np.linalg.norm(dom_half)), 1e-12)
             padded_shell = _TailedShell(shell, dom_lo, dom_hi, r_scale,
@@ -865,17 +903,16 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     # uniform rho/rho0 offset and distributes ~prop rho0, so ~M_occ/M_target
     # (~95%) of the extra lands inside the contour - bg_over ~ (f-1) aims the
     # post-cull survivor count at N (renorm f ~ 1).
-    occ_cells = vals >= re
-    M_occ = float((vals[occ_cells] * vols[occ_cells]).sum())
-    M_shell_in = float((shell_vals[~occ_cells] * vols[~occ_cells]).sum())
+    M_occ = float((vals[occ_cells] * frame_cell_vols[occ_cells]).sum())
+    M_shell_in = float(
+        (shell_vals[~occ_cells] * frame_cell_vols[~occ_cells]).sum())
     M_out = 0.0
     if box is None and d_out > 0.0:
         rng = np.random.default_rng(seed + 7)
-        fr_lo = frame_centre - 0.5 * frame_box_
-        q = fr_lo + rng.random((200_000, 3)) * frame_box_
+        q = frame_lo + rng.random((200_000, 3)) * frame_box_
         outside = ~np.all((q >= dom_lo) & (q <= dom_hi), axis=1)
         v_frame = float(np.prod(frame_box_))
-        v_out = v_frame - float(np.prod(dom_hi - dom_lo))
+        v_out = max(0.0, v_frame - float(frame_cell_vols.sum()))
         if outside.any() and v_out > 0.0:
             M_out = float(_eval(padded_shell, q[outside]).mean()) * v_out
     M_target = M_occ + M_shell_in + M_out
@@ -884,12 +921,17 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     bg_pos, bg_mass = np.zeros((0, 3)), np.zeros(0)
     rng = np.random.default_rng(seed + 13)
     if n_bg_want > 0:
-        vac = np.where(~occ_cells)[0]
-        w = shell_vals[vac] * vols[vac]
+        vac = np.where((~occ_cells) & (frame_cell_vols > 0.0))[0]
+        w = shell_vals[vac] * frame_cell_vols[vac]
+        if len(vac) == 0 or float(w.sum()) <= 0.0:
+            raise ValueError('envelope frame has scaffold mass but no '
+                             'in-table vacuum cells to sample')
         pick = rng.choice(len(vac), size=n_bg_want, p=w / w.sum())
         cells = vac[pick]
-        bg_pos = (centres[cells] - 0.5 * sizes[cells]
-                  + rng.random((len(cells), 3)) * sizes[cells])
+        sample_lo = np.maximum(cell_lo[cells], frame_lo)
+        sample_hi = np.minimum(cell_hi[cells], frame_hi)
+        bg_pos = (sample_lo
+                  + rng.random((len(cells), 3)) * (sample_hi - sample_lo))
         bg_mass = np.full(len(bg_pos), m)
     env = dict(density=padded, occupancy=occupancy, bg_pos=bg_pos,
                bg_mass=bg_mass, gas_mass=float(gas_mass),
@@ -900,6 +942,8 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     env['bg_over'] = float(bg_over)
     env['bg_k'] = k
     env['tail_reach'] = tail_reach
+    env['active_lo'], env['active_hi'] = region_lo, region_hi
+    env['capture_padded'] = bool(capture_padded)
     if nl0_eff is not None:                      # M20: launch N_L + exponent
         env['nl0'] = nl0_eff
         env['profile_p'] = p_eff

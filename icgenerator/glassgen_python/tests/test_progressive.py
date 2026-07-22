@@ -42,6 +42,21 @@ def test_default_levels_coarse_skip():
     assert lv[0]['split_factor'] == 1
 
 
+def test_single_level_honours_momentum():
+    # A single full-res level IS the final relax, so an explicit momentum=
+    # must reach it (2026-07-22 fix: it was silently dropped, so envelope
+    # builds - cascade merge factor 1 - could never receive momentum from
+    # any caller). Default stays 0 and coarse_kw still wins.
+    for maker in (lambda **kw: default_levels(nx_full=8, nx_coarse=16, **kw),
+                  lambda **kw: cascade_levels(factor=1, **kw)):
+        lv = maker()
+        assert len(lv) == 1 and lv[0].get('momentum', 0.0) == 0.0
+        lv = maker(momentum=0.5)
+        assert lv[0]['momentum'] == 0.5
+        lv = maker(momentum=0.5, coarse_kw=dict(momentum=0.2))
+        assert lv[0]['momentum'] == 0.2
+
+
 def test_progressive_coarse_to_fine_converges():
     box = np.array([1.0, 1.0, 1.0])
     rng = np.random.default_rng(0)

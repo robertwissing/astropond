@@ -129,14 +129,40 @@ def amr_max_level(args):
     return max(0, math.ceil(math.log2(max(args.npx, 1) / args.base_npx)))
 
 
+def target_domain(args, p):
+    """Resolve one authoritative target domain for every grid geometry."""
+    if args.box is not None:
+        box = np.asarray(args.box, dtype=np.float64).reshape(3)
+        lo, hi = -0.5 * box, 0.5 * box
+        audit = dict(mode='explicit_box', pad=0.0, lo=lo, hi=hi)
+    elif any(np.atleast_1d(p.periodic)):
+        box = np.asarray(p.box, dtype=np.float64).reshape(3)
+        lo, hi = -0.5 * box, 0.5 * box
+        audit = dict(mode='periodic_box', pad=0.0, lo=lo, hi=hi)
+    else:
+        from sph_interp import open_domain_bounds
+        lo, hi, audit = open_domain_bounds(
+            p.pos, p.mass, p.rho, p.h, mode=args.open_padding,
+            nsmooth=args.nsmooth,
+            constant_fraction=args.open_pad_fraction)
+    args._domain_audit = audit
+    return np.asarray(lo), np.asarray(hi)
+
+
 def build_target(args, p):
     from sph_interp import (UniformGrid, AMRGrid, VoronoiGrid, Projection2D,
                             refine_smoothing_length, refine_mass, refine_count)
-    box = p.box if p.box is not None else (p.pos.max(0) - p.pos.min(0))
+    lo, hi = target_domain(args, p)
+    box = hi - lo
+    audit = args._domain_audit
+    detail = (f" pad={audit['pad']:.6g}/side"
+              if audit.get('pad', 0.0) else '')
+    print(f"  domain: {audit['mode']}{detail}, lo={np.round(lo, 4)}, "
+          f"hi={np.round(hi, 4)}")
 
     if args.grid == "uniform":
         print(f"  target: UniformGrid {args.npx}^3 over box {np.round(box, 4)}")
-        return UniformGrid.centered(box, args.npx)
+        return UniformGrid(lo=lo, hi=hi, npx=args.npx)
 
     if args.grid == "amr":
         # Quasi-Lagrangian default, matching RAMSES poisson_refine
@@ -171,30 +197,29 @@ def build_target(args, p):
               f"(= base_npx x 2^max_level, derived from --npx {args.npx}); "
               "coarse in voids, fine only where the data warrants it")
         g = AMRGrid.build(p, base_npx=args.base_npx, max_level=max_level,
-                          criterion=crit)
+                          criterion=crit, lo=lo, hi=hi)
         dense = fine ** 3
         print(f"          -> {g.ncell} leaf cells "
               f"({dense/max(g.ncell,1):.0f}x fewer than a dense {fine}^3 grid)")
         return g
 
     if args.grid == "voronoi":
-        half = 0.5 * np.asarray(box).reshape(3)
         # Periodic box -> bounds ARE the period (ghost images give exact periodic
         # cells, Sum volume = box volume); non-periodic -> pad past the box.
         vper = p.periodic if any(np.atleast_1d(p.periodic)) else False
         if vper:
-            bounds = [[-half[a], half[a]] for a in range(3)]
+            bounds = [[lo[a], hi[a]] for a in range(3)]
             ptag = " (periodic, ghost images)"
         else:
             pad = args.voronoi_pad
-            bounds = [[-half[a] - pad, half[a] + pad] for a in range(3)]
+            bounds = [[lo[a] - pad, hi[a] + pad] for a in range(3)]
             ptag = ""
         if args.voronoi_source == "particles":
             print(f"  target: VoronoiGrid from {p.n} particles{ptag}")
             return VoronoiGrid.from_particles(p, bounds=bounds, periodic=vper)
         if args.voronoi_source == "grid":
             nx = args.npx
-            axes = [(-half[a] + (np.arange(nx) + 0.5) * (2.0 * half[a] / nx))
+            axes = [(lo[a] + (np.arange(nx) + 0.5) * (box[a] / nx))
                     for a in range(3)]
             X, Y, Z = np.meshgrid(*axes, indexing="ij")
             pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
@@ -204,7 +229,7 @@ def build_target(args, p):
         ncells = args.npx ** 3                     # npx per-axis-equivalent count
         rng = np.random.default_rng(args.seed)
         if args.voronoi_source == "random":
-            pts = rng.uniform(-half + 1e-9, half - 1e-9, size=(ncells, 3))
+            pts = rng.uniform(lo + 1e-9, hi - 1e-9, size=(ncells, 3))
             print(f"  target: VoronoiGrid from {ncells} (={args.npx}^3) random "
                   f"generators{ptag}")
         else:  # subsample
@@ -219,8 +244,9 @@ def build_target(args, p):
         a1, a2 = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}[args.axes]
         print(f"  target: Projection2D {args.axes} {args.npx}^2, "
               f"mode={args.project}")
-        return Projection2D.centered(box, a1, a2, npx=args.npx,
-                                     mode=args.project)
+        return Projection2D(axis1=a1, axis2=a2, lo=lo[[a1, a2]],
+                            hi=hi[[a1, a2]], npx=args.npx,
+                            mode=args.project)
 
     raise ValueError(f"unknown grid {args.grid!r}")
 
@@ -248,7 +274,8 @@ def _collect(res):
         out.update(fields)                       # 2D arrays as-is
     elif isinstance(grid, AMRGrid):
         c = grid.centres()
-        out.update(x=c[:, 0], y=c[:, 1], z=c[:, 2], dx=grid.cell_size[:, 0],
+        out.update(x=c[:, 0], y=c[:, 1], z=c[:, 2], lo=grid.lo, hi=grid.hi,
+                   dx=grid.cell_size[:, 0],
                    dy=grid.cell_size[:, 1], dz=grid.cell_size[:, 2],
                    volume=grid.volumes(), level=grid.cell_level,
                    base=grid.cell_base)
@@ -369,12 +396,21 @@ def build_parser():
     # snapshot / domain
     pa.add_argument("--nsmooth", type=int, default=64,
                     help="neighbours for h when no smoothlength aux")
-    pa.add_argument("--box", type=float, default=None,
-                    help="override periodic box size (cube)")
+    pa.add_argument("--box", type=float, nargs="+", default=None, metavar="L",
+                    help="exact target box lengths: one value for a cube or "
+                         "three values LX LY LZ; overrides open padding")
+    pa.add_argument("--open-padding", "--raw-padding",
+                    choices=["full_pad", "rho_edge_pad", "constant_pad"],
+                    default="rho_edge_pad",
+                    help="non-periodic target bounds: max(2h), 2*h_edge from "
+                         "the input particle count, or 0.1*max(span) per side")
+    pa.add_argument("--open-pad-fraction", type=float, default=0.1,
+                    help="fraction of max particle span for constant_pad")
     g = pa.add_mutually_exclusive_group()
     g.add_argument("--periodic", dest="periodic", action="store_true")
-    g.add_argument("--no-periodic", dest="periodic", action="store_false")
-    pa.set_defaults(periodic=True)
+    g.add_argument("--no-periodic", "--open", dest="periodic",
+                   action="store_false")
+    pa.set_defaults(periodic=None)
 
     # resolution (single knob): cells per axis
     pa.add_argument("--npx", type=int, default=128,
@@ -489,9 +525,23 @@ def main(argv=None):
                       "(override with --tu-fac)")
 
     print(f"reading {args.input}  fields={fields}")
-    box = (np.repeat(args.box, 3) if args.box is not None else None)
+    if args.box is not None:
+        if len(args.box) == 1:
+            args.box = np.repeat(args.box[0], 3)
+        elif len(args.box) == 3:
+            args.box = np.asarray(args.box, dtype=np.float64)
+        else:
+            pa.error('--box takes either one length or LX LY LZ')
+        if np.any(np.asarray(args.box) <= 0.0):
+            pa.error('--box lengths must be positive')
+    box = None if args.box is None else np.asarray(args.box, dtype=np.float64)
     p = from_tipsy(args.input, fields=fields, nsmooth=args.nsmooth,
-                   periodic=args.periodic, box=box)
+                   periodic=(True if args.periodic is None else args.periodic),
+                   box=box)
+    # An explicit CLI boundary choice overrides snapshot metadata.  With no
+    # choice, from_tipsy keeps the .param periodicity as the authority.
+    if args.periodic is not None:
+        p.periodic = (args.periodic,) * 3
     print(f"  {p.n} gas particles, box {np.round(p.box, 4)}, "
           f"periodic={p.periodic}")
 

@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from glassgen import reconstruct
+from glassgen.amrtable import AMRStateTable
 from glassgen.reconstruct import AMRTable, capture_density
 
 try:
@@ -42,6 +44,63 @@ def _gradient(nside=24, seed=0):
     mass = np.full(n, 1.5 / n)          # integral of rho over the unit box
     rho_true = lambda p: 1.0 + (p[:, 0] + 0.5)         # noqa: E731
     return pos, mass, np.ones(3), rho_true
+
+
+def _state_table(interp='vertex'):
+    dims = np.array([[2, 2, 2]], dtype=np.int64)
+    offsets = np.array([0, 8], dtype=np.int64)
+    keys = np.arange(8, dtype=np.int64)
+    rho = np.linspace(1.0, 2.4, 8)
+    density = AMRTable(-0.5 * np.ones(3), np.ones(3), dims, offsets,
+                       keys, rho, np.array([0]), True, interp=interp)
+    contents = {
+        'u': 2.75 * rho,
+        'vel': rho[:, None] * np.array([0.25, -0.5, 1.5])[None, :],
+    }
+    return AMRStateTable(density, contents, metadata={'fixture': True})
+
+
+def test_amr_state_vertex_ratio_preserves_constant_fields():
+    state = _state_table()
+    q = np.random.default_rng(4).uniform(-0.5, 0.5, size=(200, 3))
+    out, audit = state.query_fields(q, interp='vertex')
+    np.testing.assert_allclose(out['u'], 2.75, rtol=2e-15, atol=2e-15)
+    expected_vel = np.tile([0.25, -0.5, 1.5], (len(q), 1))
+    np.testing.assert_allclose(out['vel'], expected_vel,
+                               rtol=2e-15, atol=2e-15)
+    assert audit['fallback_flat'] == 0
+    assert audit['fallback_nearest'] == 0
+
+
+def test_amr_state_integrals_and_roundtrip(tmp_path):
+    state = _state_table()
+    before = state.integrated_contents()
+    path = tmp_path / 'state.npz'
+    state.save(path)
+    loaded = AMRStateTable.load(path)
+    after = loaded.integrated_contents()
+    assert loaded.fields == ('u', 'vel')
+    assert loaded.metadata == {'fixture': True}
+    assert after['mass'] == before['mass']
+    assert after['u'] == before['u']
+    np.testing.assert_array_equal(after['vel'], before['vel'])
+
+
+def test_amr_state_empty_leaf_uses_audited_nearest_fallback():
+    state = _state_table(interp='flat')
+    state.density.vals[0] = 0.0
+    state.contents['u'][0] = 0.0
+    out, audit = state.query_fields([[-0.4, -0.4, -0.4]], interp='flat')
+    assert out['u'][0] == pytest.approx(2.75)
+    assert audit['fallback_flat'] == 1
+    assert audit['fallback_nearest'] == 1
+
+
+def test_amr_state_rejects_generic_magnetic_transfer():
+    pos, mass, box = _lattice(n=3)
+    with pytest.raises(NotImplementedError, match='magnetic'):
+        reconstruct.capture_amr_state(
+            pos, mass, {'aux_BField': np.ones((len(pos), 3))}, box=box)
 
 
 @needs_sph_interp
@@ -108,6 +167,168 @@ def test_petkova_conserves_mass():
     res = si.interpolate(parts, amr, method='petkova', values=['rho'])
     vals = reconstruct._grid_rho(res, amr.volumes(), 'petkova')
     assert np.isclose((vals * amr.volumes()).sum(), mass.sum(), rtol=1e-6)
+
+
+@needs_sph_interp
+def test_petkova_conserves_field_contents():
+    # M23: non-density fields use the SAME exact Petkova cell fractions as
+    # mass. Their raw m*A content must therefore sum to the particle content,
+    # while the public primitive is content / deposited cell mass.
+    pos, mass, box, _ = _gradient(nside=12)
+    si = reconstruct._import_sph_interp()
+    rho, h = reconstruct.particle_density(pos, mass, box=box)
+    u = 1.0 + 0.3 * pos[:, 0] - 0.2 * pos[:, 2]
+    vx = -0.4 + 0.7 * pos[:, 1]
+    parts = si.Particles(pos=pos, mass=mass, rho=rho, h=h,
+                         values={'u': u, 'vx': vx}, box=box, periodic=True)
+    amr = si.AMRGrid.build(parts, base_npx=8, max_level=4,
+                           criterion=si.refine_count(8))
+    res = si.interpolate(parts, amr, method='petkova',
+                         values=['u', 'vx'], conservative_fields=True)
+    cmass = res.data['_mass']
+    for name, src in (('u', u), ('vx', vx)):
+        content = res.data[f'_content_{name}']
+        assert np.isclose(content.sum(), np.sum(mass * src), rtol=1e-6)
+        occupied = cmass > 0.0
+        np.testing.assert_allclose(res.data[name][occupied],
+                                   content[occupied] / cmass[occupied],
+                                   rtol=1e-13, atol=0.0)
+
+
+@needs_sph_interp
+def test_petkova_conservative_constant_field_is_exact():
+    pos, mass, box, _ = _gradient(nside=10)
+    si = reconstruct._import_sph_interp()
+    rho, h = reconstruct.particle_density(pos, mass, box=box)
+    const = np.full(len(pos), 2.75)
+    parts = si.Particles(pos=pos, mass=mass, rho=rho, h=h,
+                         values={'u': const}, box=box, periodic=True)
+    amr = si.AMRGrid.build(parts, base_npx=8, max_level=3,
+                           criterion=si.refine_count(8))
+    res = si.interpolate(parts, amr, method='petkova', values=['u'],
+                         conservative_fields=True)
+    occupied = res.data['_mass'] > 0.0
+    np.testing.assert_allclose(res.data['u'][occupied], 2.75,
+                               rtol=2e-15, atol=2e-15)
+
+
+@needs_sph_interp
+def test_capture_amr_state_conserves_all_components():
+    pos, mass, box, _ = _gradient(nside=10)
+    fields = {
+        'u': 1.0 + 0.2 * pos[:, 0],
+        'vel': np.stack([pos[:, 1], -pos[:, 0], 0.5 + pos[:, 2]], axis=1),
+        'rho': np.full(len(pos), 999.0),  # explicitly not imprinted/stored
+    }
+    state = reconstruct.capture_amr_state(
+        pos, mass, fields, box=box, base_npx=8, max_level=3,
+        part_per_cell=8, grade=False)
+    budget = state.integrated_contents()
+    assert state.fields == ('u', 'vel')
+    assert budget['mass'] == pytest.approx(mass.sum(), rel=1e-6)
+    assert budget['u'] == pytest.approx(np.sum(mass * fields['u']), rel=1e-6)
+    np.testing.assert_allclose(
+        budget['vel'], np.sum(mass[:, None] * fields['vel'], axis=0),
+        rtol=1e-6, atol=1e-14)
+
+
+@needs_sph_interp
+def test_capture_open_amr_state_includes_complete_kernel_support():
+    pos, mass, _, _ = _gradient(nside=8)
+    u = 2.0 + pos[:, 0]
+    state = reconstruct.capture_amr_state(
+        pos, mass, {'u': u}, box=None, base_npx=8, max_level=3,
+        part_per_cell=8, grade=False)
+    budget = state.integrated_contents()
+    assert budget['mass'] == pytest.approx(mass.sum(), rel=1e-10)
+    assert budget['u'] == pytest.approx(np.sum(mass * u), rel=1e-10)
+
+
+@needs_sph_interp
+def test_capture_open_amr_state_stamps_source_bbox(tmp_path):
+    # The open state capture tiles the kernel-support union (pos +- 2h) so
+    # Petkova conserves without renormalisation - deliberate padding, not
+    # physical extent.  The density table must carry the source particle
+    # bbox so the envelope sizes the relax frame from it rather than the
+    # padded capture domain.
+    from glassgen import envelope as E
+    pos, mass, _ = _ball(n=320)
+    state = reconstruct.capture_amr_state(
+        pos, mass, {'u': np.ones(len(pos))}, box=None, base_npx=8,
+        max_level=3, part_per_cell=8, grade=False)
+    d = state.density
+    np.testing.assert_allclose(d.capture_particle_lo, pos.min(0))
+    np.testing.assert_allclose(d.capture_particle_hi, pos.max(0))
+    assert d.capture_padding_mode == 'kernel_union'
+    assert np.all(d.lo < pos.min(0))            # domain IS padded beyond bbox
+    assert np.all(d.lo + d.box > pos.max(0))
+
+    gm = float(mass.sum())
+    env = E.build_table_envelope(d, gm, 2000, box=None)
+    assert env['capture_padded'] is True
+    stripped = AMRTable(d.lo, d.box, d.dims, d.offsets, d.keys, d.vals,
+                        d.order, d.periodic, interp=d.interp)
+    env_legacy = E.build_table_envelope(stripped, gm, 2000, box=None)
+    assert np.all(env['frame_box'] <= env_legacy['frame_box'] + 1e-12)
+    assert np.any(env['frame_box'] < env_legacy['frame_box'] - 1e-12)
+
+    path = tmp_path / 'state_bbox.npz'
+    state.save(path)
+    loaded = AMRStateTable.load(path)
+    np.testing.assert_allclose(loaded.density.capture_particle_lo,
+                               pos.min(0))
+    np.testing.assert_allclose(loaded.density.capture_particle_hi,
+                               pos.max(0))
+    assert loaded.density.capture_padding_mode == 'kernel_union'
+
+
+@needs_sph_interp
+def test_reconstruct_table_transfer_imprints_after_build(monkeypatch,
+                                                         tmp_path):
+    pos, mass, box = _lattice(n=8, jitter=0.1)
+    fields = {
+        'rho': np.ones(len(pos)),
+        'u': np.full(len(pos), 3.25),
+        'vel': np.stack([0.1 + 0.2 * pos[:, 0],
+                         -0.2 + 0.1 * pos[:, 1],
+                         0.3 - 0.15 * pos[:, 2]], axis=1),
+    }
+
+    def fake_build(table, count, filler_field_hook=None, **kwargs):
+        q = pos[:count].copy()
+        aux = filler_field_hook(q)
+        return SimpleNamespace(
+            pos=q, aux=aux,
+            envelope_audit={'mf': float(mass.sum()) / len(q)},
+            table_build={}, niter=0, stop_reason='test', levels=[])
+
+    import glassgen.progressive as progressive
+    monkeypatch.setattr(progressive, 'build_from_table', fake_build)
+    saved = tmp_path / 'captured_state.npz'
+    p2, m2, out, _, audit = reconstruct.reconstruct_resample(
+        pos, mass, 256, fields, box=box, nsmooth=32,
+        base_npx=4, max_level=3, part_per_cell=8, grade=False,
+        contour_refine=False, field_transfer='table',
+        field_interp='vertex', energy_mode='total', save_state=saved)
+    assert len(p2) == len(m2) == 256
+    assert np.all(out['u'] >= 3.25 - 2e-14)
+    assert np.all(np.isfinite(out['rho']))
+    assert audit['fields']['transfer'] == 'table'
+    assert audit['fields']['query']['fallback_nearest'] == 0
+    assert audit['fields']['energy_closure']['mode'] == 'total'
+    assert audit['fields']['energy_closure']['negative_variance_count'] == 0
+    closure = audit['fields']['momentum_closure']
+    assert closure['mode'] == 'boost'
+    assert np.linalg.norm(closure['delta_v']) > 1e-5
+    np.testing.assert_allclose(closure['post'], closure['target'],
+                               rtol=0.0, atol=2e-15)
+    assert abs(closure['ke_com_change']) < 2e-14
+    loaded = AMRStateTable.load(saved)
+    assert loaded.fields == ('u', 'vel')
+    assert '__kinetic' in loaded.all_fields
+    assert set(audit['fields']) >= {
+        'source_to_table', 'resolved_table', 'low_density_tail',
+        'output', 'imprint_drift'}
 
 
 @needs_sph_interp
@@ -292,6 +513,33 @@ def test_padded_table_density_fused_matches_generic():
     av = KernelMatchedDensity(pv).rho0_h(q, h)
     bv = KernelMatchedDensity(gv).rho0_h(q, h)
     np.testing.assert_allclose(av, bv, rtol=1e-10, atol=0.0)
+
+
+@needs_sph_interp
+def test_open_raw_amr_mass_closure_preserves_bbox_geometry():
+    # An open particle-bbox capture clips extremal compact kernels.  The
+    # production reconstruct path keeps that validated geometry/envelope but
+    # closes the tiny global mass deficit with one recorded uniform factor.
+    pos, mass, _ = _ball(n=1200)
+    historical, historical_vals = reconstruct.capture_amr_raw(
+        pos, mass, box=None, nsmooth=32, close_open_mass=False)
+    closed, closed_vals = reconstruct.capture_amr_raw(
+        pos, mass, box=None, nsmooth=32, close_open_mass=True)
+    np.testing.assert_array_equal(closed.lo, historical.lo)
+    np.testing.assert_array_equal(closed.hi, historical.hi)
+    np.testing.assert_array_equal(closed.cell_lo, historical.cell_lo)
+    np.testing.assert_array_equal(closed.cell_size, historical.cell_size)
+    source_mass = float(mass.sum())
+    historical_mass = float(np.sum(
+        historical_vals * historical.volumes()))
+    closed_mass = float(np.sum(closed_vals * closed.volumes()))
+    assert historical_mass < source_mass
+    assert abs(closed_mass / source_mass - 1.0) < 3e-15
+    audit = closed.capture_mass_audit
+    assert audit['closure_applied'] is True
+    assert audit['uniform_closure_factor'] > 1.0
+    assert audit['relative_error_before_closure'] < 0.0
+    assert abs(audit['relative_error_after_closure']) < 3e-15
 
 
 @needs_sph_interp
@@ -679,6 +927,98 @@ def test_rho_edge_particles_mass_integral():
     # tiny cut -> the faintest particle; huge cut -> the densest
     assert reconstruct.rho_edge_particles(rho, mass, 0.1, c=1) == 1.0
     assert reconstruct.rho_edge_particles(rho, mass, 100.0, c=10) == 200.0
+
+
+@needs_sph_interp
+def test_open_domain_padding_modes_are_input_count_based():
+    si = reconstruct._import_sph_interp()
+    pos = np.array([[-1.0, -2.0, -0.5], [1.0, 2.0, 0.5],
+                    [0.0, 0.0, 0.0]])
+    mass = np.ones(3)
+    rho = np.array([1.0, 2.0, 4.0])
+    h = np.array([0.1, 0.4, 0.2])
+
+    lo, hi, a = si.open_domain_bounds(
+        pos, mass, rho, h, mode='full_pad', nsmooth=2)
+    assert a['pad'] == pytest.approx(0.8)
+    np.testing.assert_allclose(lo, pos.min(0) - 0.8)
+    np.testing.assert_allclose(hi, pos.max(0) + 0.8)
+
+    lo, hi, a = si.open_domain_bounds(
+        pos, mass, rho, h, mode='constant_pad', nsmooth=2,
+        constant_fraction=0.1)
+    assert a['pad'] == pytest.approx(0.4)  # 0.1 * longest span (y=4)
+    np.testing.assert_allclose(hi - lo, np.array([2.8, 4.8, 1.8]))
+
+    lo, hi, a = si.open_domain_bounds(
+        pos, mass, rho, h, mode='rho_edge_pad', nsmooth=2)
+    # Faint-end threshold = nsmooth*M/N = 2: the second unit-mass particle
+    # sets rho_edge,in=2, independently of any later output count.
+    assert a['rho_edge_in'] == 2.0
+    hedge = (3.0 * 2.0 / (32.0 * np.pi * 2.0)) ** (1.0 / 3.0)
+    assert a['h_edge_in'] == pytest.approx(hedge)
+    assert a['pad'] == pytest.approx(2.0 * hedge)
+
+
+@needs_sph_interp
+def test_capture_density_uses_open_padding_for_raw_table_bounds(tmp_path):
+    pos, mass, _ = _ball(n=320)
+    frac = 0.15
+    pad = frac * float(np.ptp(pos, axis=0).max())
+    table = reconstruct.capture_density(
+        pos, mass, box=None, grid='uniform', npx=8, nsmooth=16,
+        method='petkova', empty='zero', open_padding='constant_pad',
+        open_pad_fraction=frac)
+    widths = np.array([np.diff(a).mean() for a in table.axes])
+    lo = np.array([a[0] for a in table.axes]) - 0.5 * widths
+    hi = np.array([a[-1] for a in table.axes]) + 0.5 * widths
+    np.testing.assert_allclose(lo, pos.min(0) - pad)
+    np.testing.assert_allclose(hi, pos.max(0) + pad)
+    assert table.capture_padding_mode == 'constant_pad'
+
+    path = tmp_path / 'open_uniform.npz'
+    reconstruct.save_table(table, path)
+    loaded = reconstruct.load_table(path)
+    np.testing.assert_allclose(loaded.capture_particle_lo, pos.min(0))
+    np.testing.assert_allclose(loaded.capture_particle_hi, pos.max(0))
+
+
+def test_padded_capture_metadata_roundtrip_and_frame_invariance(tmp_path):
+    from glassgen import envelope as E
+    from glassgen.density import TableDensity
+
+    # Same physical unit-box field, with a deliberately wider zero-padded raw
+    # table.  Capture metadata identifies the original particle bbox, so the
+    # padding stores kernel/scaffold support without enlarging the relax frame.
+    ax0 = (np.arange(10) + 0.5) / 10.0 - 0.5
+    ax1 = (np.arange(20) + 0.5) / 10.0 - 1.0
+
+    def values(ax):
+        x, y, z = np.meshgrid(ax, ax, ax, indexing='ij')
+        return np.where(x*x + y*y + z*z < 0.25**2, 10.0, 0.0)
+
+    base = TableDensity((ax0, ax0, ax0), values(ax0))
+    padded = TableDensity((ax1, ax1, ax1), values(ax1))
+    padded.capture_particle_lo = np.full(3, -0.5)
+    padded.capture_particle_hi = np.full(3, 0.5)
+    padded.capture_padding_mode = 'constant_pad'
+    path = tmp_path / 'padded.npz'
+    padded.save(path)
+    padded = reconstruct.load_table(path)
+    assert padded.capture_padding_mode == 'constant_pad'
+    np.testing.assert_allclose(padded.capture_particle_lo, -0.5)
+
+    gm = E.table_mass(base)
+    env0 = E.build_table_envelope(base, gm, 5000, box=None, c=64, k=2.0)
+    env1 = E.build_table_envelope(padded, gm, 5000, box=None, c=64, k=2.0)
+    np.testing.assert_allclose(env1['frame_box'], env0['frame_box'])
+    np.testing.assert_allclose(env1['frame_centre'], env0['frame_centre'],
+                               atol=1e-15)
+    assert env1['capture_padded'] is True
+    lo = env1['frame_centre'] - 0.5 * env1['frame_box']
+    hi = env1['frame_centre'] + 0.5 * env1['frame_box']
+    assert np.all(env1['bg_pos'] >= lo - 1e-12)
+    assert np.all(env1['bg_pos'] <= hi + 1e-12)
 
 
 @needs_sph_interp

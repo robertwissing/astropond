@@ -1,4 +1,4 @@
-"""Relax-ready AMR density table (the CONSUME side of the capture pipeline).
+"""Relax-ready AMR density/state tables (capture pipeline consume side).
 
 `AMRTable` wraps an ALREADY-DEPOSITED AMR leaf set (per-cell densities) as a
 glassgen `DensityField` the relax can query at every particle every iteration.
@@ -17,6 +17,8 @@ Moved here from `reconstruct.py` so glassgen owns the relax-target lookup
 structure (the envelope port); `reconstruct.py` re-exports `AMRTable` for
 backwards compatibility.
 """
+import json
+
 import numpy as np
 from numba import njit, prange
 
@@ -651,10 +653,16 @@ class AMRTable(DensityField):
     __call__ = rho0
 
     def save(self, path):
-        np.savez(path, lo=self.lo, box=self.box, dims=self.dims,
-                 offsets=self.offsets, keys=self.keys, vals=self.vals,
-                 order=self.order, periodic=np.array([self.periodic]),
-                 interp=np.array([self.interp]))
+        meta = dict(lo=self.lo, box=self.box, dims=self.dims,
+                    offsets=self.offsets, keys=self.keys, vals=self.vals,
+                    order=self.order, periodic=np.array([self.periodic]),
+                    interp=np.array([self.interp]))
+        if hasattr(self, 'capture_particle_lo'):
+            meta['capture_particle_lo'] = self.capture_particle_lo
+            meta['capture_particle_hi'] = self.capture_particle_hi
+            meta['capture_padding_mode'] = np.array(
+                [self.capture_padding_mode])
+        np.savez(path, **meta)
 
     @classmethod
     def load(cls, path):
@@ -662,6 +670,203 @@ class AMRTable(DensityField):
         interp = str(d['interp'][0]) if 'interp' in d.files else 'limited'
         if interp == 'linear':                # pre-retirement save:
             interp = 'limited'                # remap quietly, no warning
-        return cls(d['lo'], d['box'], d['dims'], d['offsets'], d['keys'],
-                   d['vals'], d['order'], bool(d['periodic'][0]),
-                   interp=interp)
+        out = cls(d['lo'], d['box'], d['dims'], d['offsets'], d['keys'],
+                  d['vals'], d['order'], bool(d['periodic'][0]),
+                  interp=interp)
+        if 'capture_particle_lo' in d.files:
+            out.capture_particle_lo = d['capture_particle_lo'].copy()
+            out.capture_particle_hi = d['capture_particle_hi'].copy()
+            out.capture_padding_mode = str(d['capture_padding_mode'][0])
+        return out
+
+
+class AMRStateTable:
+    """Conservative gas state aligned with an :class:`AMRTable` leaf set.
+
+    ``density`` stores deposited mass per volume. ``contents`` stores the
+    corresponding conserved field contents per volume, e.g. rho*v, rho*u,
+    and rho*Z.  Primitive values are deliberately not stored: a point query
+    applies one identical AMR readout to numerator and denominator and only
+    then divides.  Consequently a constant source field remains constant
+    through flat, limited, or conforming-vertex readout.
+
+    Field arrays are leaf-aligned scalars ``(ncell,)`` or vectors
+    ``(ncell, ncomp)``.  The class owns a portable, versioned NPZ format and
+    does not require sph_interp when it is loaded or queried.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, density, contents, metadata=None):
+        if not isinstance(density, AMRTable):
+            raise TypeError('density must be an AMRTable')
+        self.density = density
+        self.contents = {}
+        for name, values in contents.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError('state field names must be non-empty strings')
+            a = np.ascontiguousarray(values, dtype=np.float64)
+            if a.ndim not in (1, 2) or a.shape[0] != density.ncell:
+                raise ValueError(
+                    f"field {name!r} has shape {a.shape}; expected "
+                    f"({density.ncell},) or ({density.ncell}, ncomp)")
+            self.contents[name] = a
+        self.metadata = dict(metadata or {})
+        self._table_cache = {}
+        self._nearest_cache = None
+
+    @property
+    def ncell(self):
+        return self.density.ncell
+
+    @property
+    def fields(self):
+        internal = set(self.metadata.get('internal_fields', ()))
+        return tuple(name for name in self.contents if name not in internal)
+
+    @property
+    def all_fields(self):
+        """All stored channels, including reserved bookkeeping channels."""
+        return tuple(self.contents)
+
+    def _with_values(self, values, interp):
+        """Cached scalar table sharing this state's AMR geometry."""
+        values = np.asarray(values, dtype=np.float64)
+        # Component slices are short-lived ndarray views; Python may recycle
+        # their object ids between loop iterations.  The backing-data address
+        # plus layout identifies each persistent content component instead.
+        key = (int(values.__array_interface__['data'][0]), values.shape,
+               values.strides, interp)
+        table = self._table_cache.get(key)
+        if table is None:
+            d = self.density
+            table = AMRTable(d.lo, d.box, d.dims, d.offsets, d.keys, values,
+                             d.order, d.periodic, interp=interp)
+            self._table_cache[key] = table
+        return table
+
+    def _nearest_occupied(self, pos):
+        """Indices of nearest positive-mass leaves (periodic-aware)."""
+        from scipy.spatial import cKDTree
+
+        if self._nearest_cache is None:
+            centres, _, _, rho = self.density.leaves()
+            occupied = np.isfinite(rho) & (rho > 0.0)
+            if not occupied.any():
+                raise ValueError('AMR state has no positive-density leaves')
+            c = centres[occupied]
+            if self.density.periodic:
+                c = np.mod(c - self.density.lo, self.density.box)
+                tree = cKDTree(c, boxsize=self.density.box)
+            else:
+                tree = cKDTree(c)
+            self._nearest_cache = (tree, np.flatnonzero(occupied))
+        tree, leaf_indices = self._nearest_cache
+        q = np.asarray(pos, dtype=np.float64)
+        if self.density.periodic:
+            q = np.mod(q - self.density.lo, self.density.box)
+        _, j = tree.query(q, k=1)
+        return leaf_indices[np.asarray(j, dtype=np.int64)]
+
+    def query_fields(self, pos, interp='vertex'):
+        """Recover primitive fields at ``pos`` from conserved AMR state.
+
+        The requested interpolation is applied independently to rho and each
+        rho*A component, followed by A=(rho*A)/rho.  A zero/non-finite
+        interpolated denominator first falls back to the containing leaf's
+        flat state, then (only for a genuinely empty leaf) to the nearest
+        positive-density leaf.  Both fallback counts are returned.
+        """
+        if interp not in ('flat', 'limited', 'vertex'):
+            raise ValueError("interp must be 'flat', 'limited', or 'vertex'")
+        pos = np.ascontiguousarray(pos, dtype=np.float64).reshape(-1, 3)
+        rho = self._with_values(self.density.vals, interp).rho0(pos)
+        bad = ~np.isfinite(rho) | (rho <= 0.0)
+        nflat = int(bad.sum())
+        flat_rho = None
+        if nflat:
+            flat_rho = self._with_values(self.density.vals, 'flat').rho0(pos)
+            rho[bad] = flat_rho[bad]
+        nearest = ~np.isfinite(rho) | (rho <= 0.0)
+        nnearest = int(nearest.sum())
+        near_idx = self._nearest_occupied(pos[nearest]) if nnearest else None
+        if nnearest:
+            rho[nearest] = self.density.vals[near_idx]
+
+        out = {}
+        for name, content in self.contents.items():
+            scalar = content.ndim == 1
+            cols = content[:, None] if scalar else content
+            qcols = np.empty((len(pos), cols.shape[1]), dtype=np.float64)
+            for k in range(cols.shape[1]):
+                num = self._with_values(cols[:, k], interp).rho0(pos)
+                if nflat:
+                    flat_num = self._with_values(cols[:, k], 'flat').rho0(pos)
+                    num[bad] = flat_num[bad]
+                if nnearest:
+                    num[nearest] = cols[near_idx, k]
+                qcols[:, k] = num / rho
+            out[name] = qcols[:, 0] if scalar else qcols
+        audit = dict(interp=interp, query_count=len(pos),
+                     fallback_flat=nflat, fallback_nearest=nnearest)
+        return out, audit
+
+    def integrated_contents(self, mask=None):
+        """Return mass and field integrals over all (or selected) leaves."""
+        _, sizes, _, rho = self.density.leaves()
+        vol = sizes.prod(axis=1)
+        if mask is None:
+            mask = np.ones(self.ncell, dtype=bool)
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape != (self.ncell,):
+                raise ValueError(f'mask must have shape ({self.ncell},)')
+        out = {'mass': float(np.sum(rho[mask] * vol[mask]))}
+        for name, values in self.contents.items():
+            if values.ndim == 1:
+                out[name] = float(np.sum(values[mask] * vol[mask]))
+            else:
+                out[name] = np.sum(values[mask] * vol[mask, None], axis=0)
+        return out
+
+    def save(self, path):
+        """Write the versioned portable state-table NPZ (no pickle data)."""
+        d = self.density
+        names = list(self.contents)
+        payload = dict(
+            schema_version=np.array([self.SCHEMA_VERSION], dtype=np.int64),
+            metadata_json=np.array([json.dumps(self.metadata, sort_keys=True)]),
+            field_names=np.asarray(names, dtype=np.str_),
+            lo=d.lo, box=d.box, dims=d.dims, offsets=d.offsets, keys=d.keys,
+            density=d.vals, order=d.order,
+            periodic=np.array([d.periodic]), interp=np.array([d.interp]))
+        if hasattr(d, 'capture_particle_lo'):
+            payload['capture_particle_lo'] = d.capture_particle_lo
+            payload['capture_particle_hi'] = d.capture_particle_hi
+            payload['capture_padding_mode'] = np.array(
+                [d.capture_padding_mode])
+        for i, name in enumerate(names):
+            payload[f'state_field_{i}'] = self.contents[name]
+        np.savez(path, **payload)
+
+    @classmethod
+    def load(cls, path):
+        """Load a state table written by :meth:`save`."""
+        with np.load(path, allow_pickle=False) as d:
+            version = int(d['schema_version'][0])
+            if version != cls.SCHEMA_VERSION:
+                raise ValueError(f'unsupported AMR state schema {version}')
+            interp = str(d['interp'][0])
+            density = AMRTable(d['lo'], d['box'], d['dims'], d['offsets'],
+                               d['keys'], d['density'], d['order'],
+                               bool(d['periodic'][0]), interp=interp)
+            if 'capture_particle_lo' in d.files:
+                density.capture_particle_lo = d['capture_particle_lo'].copy()
+                density.capture_particle_hi = d['capture_particle_hi'].copy()
+                density.capture_padding_mode = str(
+                    d['capture_padding_mode'][0])
+            names = [str(x) for x in d['field_names']]
+            contents = {name: np.array(d[f'state_field_{i}'], copy=True)
+                        for i, name in enumerate(names)}
+            metadata = json.loads(str(d['metadata_json'][0]))
+        return cls(density, contents, metadata=metadata)

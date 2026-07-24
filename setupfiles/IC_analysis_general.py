@@ -499,7 +499,6 @@ def find_files2(arg: str) -> List[str]:
 
 import os, glob
 import numpy as np
-import imageio.v2 as imageio
 from matplotlib.colors import LogNorm
 from matplotlib import pyplot as plt
 
@@ -647,6 +646,7 @@ def render_movie_over_files(files, axis1_idx, axis2_idx, render_idx,
             if log and vmin <= 0: vmin = 1e-12
 
     # PASS 2: stream frames directly into a video
+    import imageio.v2 as imageio            # lazy: only the movie path needs it
     with imageio.get_writer(out, fps=fps, codec="libx264", quality=8) as writer:
         for i, fn in enumerate(files):
             print(f"[{i+1}/{len(files)}] {fn}")

@@ -126,13 +126,128 @@ def _capture_fill_kw(empty, vals, boxarr, pos, floor_frac):
                 tail_floor=fl)
 
 
+def _coincidence_labels(pos, tol):
+    """Connected-component labels for points within ``tol`` (single-link,
+    cKDTree pairs + path-compressed union-find). Relabelled 0..ng-1."""
+    from scipy.spatial import cKDTree
+    n = len(pos)
+    parent = np.arange(n)
+
+    def find(i):
+        root = i
+        while parent[root] != root:
+            root = parent[root]
+        while parent[i] != root:      # path compression
+            parent[i], i = root, parent[i]
+        return root
+
+    for i, j in cKDTree(pos).query_pairs(tol):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+    roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
+    _, inv = np.unique(roots, return_inverse=True)
+    return np.asarray(inv, dtype=np.int64).reshape(-1)
+
+
+def dedup_coincident(pos, mass, fields=None, tol=0.0):
+    """Merge coincident (or near-coincident) input particles into one
+    representative BEFORE capture (RECONSTRUCT_PLAN Q6).
+
+    Exactly-coincident donors make the capture octree refine forever - the
+    points never separate under ``refine_count``, so the tree runs to
+    ``max_level`` around the cluster, burning leaves/memory without resolving
+    anything. Merging is a no-op on clean inputs (``tol=0.0`` groups only
+    bit-identical rows) and fires only on genuine duplicates.
+
+    Each group collapses to ONE particle that conserves the group's mass and
+    every conserved content ``sum(m_i A_i)`` exactly::
+
+        mass = sum(m_i)
+        pos  = sum(m_i x_i) / sum(m_i)      (identical to the shared point, tol=0)
+        A    = sum(m_i A_i) / sum(m_i)      (mass-weighted intensive mean)
+
+    A zero-total-mass group (pathological) falls back to equal weights so no
+    NaN is produced; its returned mass is still the exact (zero) sum.
+
+    tol : coincidence radius. 0.0 (default) = exact bitwise-equal rows;
+          tol > 0 clusters points within ``tol`` (single-link).
+
+    Returns (pos2, mass2, fields2, audit). ``fields2`` is None when ``fields``
+    is None; otherwise a dict with the same keys, merged. ``audit`` records
+    n_input / n_output / n_merged / n_groups_merged / max_group_size / tol.
+    """
+    pos = np.ascontiguousarray(pos, dtype=np.float64)
+    mass = np.ascontiguousarray(mass, dtype=np.float64).reshape(-1)
+    if pos.shape != (len(mass), 3):
+        raise ValueError('pos must have shape (len(mass), 3)')
+    n = len(mass)
+
+    if n == 0:
+        audit = dict(n_input=0, n_output=0, n_merged=0, n_groups_merged=0,
+                     max_group_size=0, tol=float(tol))
+        return pos, mass, (dict(fields) if fields is not None else None), audit
+
+    if tol <= 0.0:
+        _, inv = np.unique(pos, axis=0, return_inverse=True)
+        inv = np.asarray(inv, dtype=np.int64).reshape(-1)
+    else:
+        inv = _coincidence_labels(pos, float(tol))
+    ng = int(inv.max()) + 1
+
+    counts = np.bincount(inv, minlength=ng)
+    audit = dict(n_input=n, n_output=ng, n_merged=n - ng,
+                 n_groups_merged=int(np.count_nonzero(counts > 1)),
+                 max_group_size=int(counts.max()), tol=float(tol))
+    if ng == n:                       # nothing coincident - exact identity
+        return pos, mass, (dict(fields) if fields is not None else None), audit
+
+    gmass = np.bincount(inv, weights=mass, minlength=ng)
+    # equal-weight any zero-total-mass group so the centroid/means stay finite
+    w = np.where((gmass <= 0.0)[inv], 1.0, mass)
+    den = np.bincount(inv, weights=w, minlength=ng)
+
+    def _merge(a):                    # mass-weighted mean of a (N,) column
+        return np.bincount(inv, weights=w * a, minlength=ng) / den
+
+    gpos = np.stack([_merge(pos[:, d]) for d in range(3)], axis=1)
+
+    fields2 = None
+    if fields is not None:
+        fields2 = {}
+        for name, values in fields.items():
+            a = np.asarray(values, dtype=np.float64)
+            if a.shape[0] != n:
+                raise ValueError(
+                    f"field {name!r} has leading dim {a.shape[0]}; expected {n}")
+            if a.ndim == 1:
+                fields2[name] = _merge(a)
+            elif a.ndim == 2:
+                fields2[name] = np.stack(
+                    [_merge(a[:, c]) for c in range(a.shape[1])], axis=1)
+            else:
+                raise ValueError(f"field {name!r} must be 1D or 2D")
+    return (np.ascontiguousarray(gpos), np.ascontiguousarray(gmass),
+            fields2, audit)
+
+
+def _dedup_warn(audit, where):
+    """Emit the standard warning when a capture dedup actually merged."""
+    if audit is not None and audit['n_merged']:
+        warnings.warn(
+            f"{where}: merged {audit['n_merged']} coincident donor(s) into "
+            f"{audit['n_groups_merged']} representative(s) "
+            f"(largest group {audit['max_group_size']}, tol={audit['tol']:g}) "
+            'before capture - conserved mass and mass*field content exactly')
+
+
 def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     method='petkova', base_npx=None, max_level=16,
                     part_per_cell=8, npx=None, empty='decay',
                     floor_frac=1e-3, interp='vertex',
                     contour_n=None, contour_band=8.0, contour_beta=0.5,
                     contour_passes=2, grade=True, open_padding=None,
-                    open_pad_fraction=0.1):
+                    open_pad_fraction=0.1, dedup=True, dedup_tol=0.0):
     """Capture the particle density field on a 3D grid, relax-ready.
 
     pos, mass : the particles whose density defines the target (capture the
@@ -199,7 +314,13 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                 The input-particle definition is independent of the requested
                 output glass count. None preserves the historical particle
                 bounding box used internally by reconstruct/glassrelax.
+    dedup     : merge coincident donors before capture (default True; a no-op
+                on clean inputs). ``dedup_tol`` is the coincidence radius (0.0
+                = exact). See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6).
     """
+    if dedup:
+        pos, mass, _, _dda = dedup_coincident(pos, mass, tol=dedup_tol)
+        _dedup_warn(_dda, 'capture_density')
     si, parts, n, boxarr = _build_parts(pos, mass, box, nsmooth)
     domain_lo = domain_hi = None
     domain_audit = None
@@ -448,7 +569,7 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
                     base_npx=None, max_level=16, part_per_cell=8,
                     contour_n=None, contour_band=8.0, contour_beta=0.5,
                     contour_passes=2, grade=True,
-                    close_open_mass=True):
+                    close_open_mass=True, dedup=True, dedup_tol=0.0):
     """Raw AMR capture: the space-filling leaf set + per-leaf density BEFORE
     any empty-cell fill (unlike capture_density, which returns a finished,
     filled table). `AMRTable.from_grid(amr, vals_raw)` makes it the EXACT
@@ -470,7 +591,15 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
     final density leaves so ``sum(rho*V) == sum(mass)``. The factor is normally
     tiny (``1.000033`` for the M22 galaxy). Set False only for a historical
     boundary-truncation control.
+
+    dedup : merge coincident donors before capture (default True; a no-op on
+    clean inputs). See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6). The
+    audit is stashed on the returned grid as ``amr.dedup_audit``.
     """
+    dedup_audit = None
+    if dedup:
+        pos, mass, _, dedup_audit = dedup_coincident(pos, mass, tol=dedup_tol)
+        _dedup_warn(dedup_audit, 'capture_amr_raw')
     si, parts, n, _ = _build_parts(pos, mass, box, nsmooth)
     contour = None
     if contour_n:
@@ -507,6 +636,7 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
         relative_error_after_closure=(
             final_mass / source_mass - 1.0 if source_mass != 0.0 else None),
         closure_applied=apply_closure)
+    amr.dedup_audit = dedup_audit
     return amr, vals_raw
 
 
@@ -514,7 +644,7 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
                       base_npx=None, max_level=16, part_per_cell=8,
                       contour_n=None, contour_band=8.0, contour_beta=0.5,
                       contour_passes=2, grade=True, interp='vertex',
-                      store_kinetic=False):
+                      store_kinetic=False, dedup=True, dedup_tol=0.0):
     """Capture density and conservative field contents on one raw AMR grid.
 
     Geometry/refinement is completed first using the density-only raw-capture
@@ -522,6 +652,11 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
     final geometry with Petkova's exact mass fractions.  The returned state
     stores rho*A (not A), so its final point imprint can interpolate numerator
     and denominator identically before division.
+
+    dedup : merge coincident donors (and their fields) before capture (default
+    True; a no-op on clean inputs). Kinetic content is formed per-particle
+    BEFORE the merge, so its conserved sum survives the mass-weighted collapse.
+    See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6).
     """
     pos = np.ascontiguousarray(pos, dtype=np.float64)
     mass = np.ascontiguousarray(mass, dtype=np.float64)
@@ -552,6 +687,16 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
             raise ValueError('store_kinetic requires a (N,3) vel field')
         clean['__kinetic'] = 0.5 * np.sum(clean['vel'] ** 2, axis=1)
         internal_fields.append('__kinetic')
+
+    # Merge coincident donors BEFORE capture (Q6). Kinetic content is already
+    # per-particle above, so it collapses as a conserved intensive scalar
+    # (mass-weighted) rather than being recomputed from the merged velocity -
+    # the group's sub-position velocity variance is thus retained in the total.
+    dedup_audit = None
+    if dedup:
+        pos, mass, clean, dedup_audit = dedup_coincident(
+            pos, mass, clean, tol=dedup_tol)
+        _dedup_warn(dedup_audit, 'capture_amr_state')
 
     # Build/refine/contour-correct/grade using density only.  This avoids
     # repeating the expensive physical-field deposit on temporary geometries.
@@ -628,7 +773,8 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
         density, contents,
         metadata=dict(schema='glassgen-amr-state', fields=field_meta,
                       internal_fields=internal_fields,
-                      capture=dict(method='petkova', nsmooth=int(nsmooth))))
+                      capture=dict(method='petkova', nsmooth=int(nsmooth),
+                                   dedup=dedup_audit)))
     source_budget = {'mass': float(mass.sum())}
     for name, values in clean.items():
         source_budget[name] = np.sum(
@@ -655,7 +801,146 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
     state.metadata['source_budget'] = source_budget
     state.metadata['table_budget'] = table_budget_plain
     state.metadata['source_to_table_residual'] = residual
+    # Transient (not serialized): the raw capture geometry, so a same-process
+    # magnetic transfer can deposit B on the identical grid. A state reloaded
+    # from NPZ has no grid.
+    state._amr_grid = amr
     return state
+
+
+def _magnetic_split(fields):
+    """Pop the magnetic B keys out of a reconstruct field dict.
+
+    Returns ``(payload, B, keys)``: the fields without the magnetic entries,
+    the (N,3) source B (from the ``BField`` vector aux when present, else the
+    three ``BFieldx/y/z`` scalars), and the popped key names. ``B`` is None
+    when the input carries no magnetic aux.
+    """
+    vec = None
+    comp = {}
+    for k in fields:
+        base = k.lower().removeprefix('aux_')
+        if base == 'bfield':
+            vec = k
+        elif base in ('bfieldx', 'bfieldy', 'bfieldz'):
+            comp[base[-1]] = k
+    if vec is None and not comp:
+        return fields, None, []
+    if vec is None and len(comp) != 3:
+        raise ValueError('magnetic transfer needs all three BFieldx/y/z aux '
+                         f'components (found only {sorted(comp.values())})')
+    keys = ([vec] if vec else []) + [comp[a] for a in 'xyz' if a in comp]
+    if vec is not None:
+        B = np.asarray(fields[vec], dtype=np.float64).reshape(-1, 3)
+    else:
+        B = np.stack([np.asarray(fields[comp[a]], dtype=np.float64)
+                      for a in 'xyz'], axis=1)
+    return {k: v for k, v in fields.items() if k not in keys}, B, keys
+
+
+def _magnetic_transfer_setup(pos_in, mass_in, B_src, box, nsmooth, mode,
+                             amr_grid):
+    """Prepare the reconstruct magnetic transfer; returns (query, audit).
+
+    ``query(final_pos) -> (N,3)`` evaluates the transferred B. Every mode
+    works on the density AMR capture grid (RECONSTRUCT_PLAN /
+    FIELD_RECONSTRUCTION_PLAN, decided 2026-07-22, surface trimmed
+    2026-07-23):
+      'none'   conservative volume-carrier cell B, conforming-vertex
+               read-back (the validated production default: no projection;
+               divergence is a separate mhd_divBclean pass in the consumer's
+               operator).
+      'hodge'  open AMR face capture + Hodge/solenoidal projection, RT0
+               readout (the RAMSES-export intermediate).
+      'vector-potential'  meshless Biot-Savart particle A -> conservative
+               cell A -> B = central-difference curl of the conforming-vertex
+               A interpolant (open boxes only: free-space kernel).
+    """
+    si = _import_sph_interp()
+    rho, h = particle_density(pos_in, mass_in, box, nsmooth)
+    boxarr = None if box is None else np.asarray(box, dtype=np.float64)
+    periodic = box is not None
+    pos_in = np.ascontiguousarray(pos_in, dtype=np.float64)
+    parts = si.Particles(
+        pos=pos_in, mass=np.ascontiguousarray(mass_in, dtype=np.float64),
+        rho=rho, h=h,
+        values={'Bx': B_src[:, 0], 'By': B_src[:, 1], 'Bz': B_src[:, 2]},
+        box=boxarr, periodic=periodic)
+    audit = {'mode': mode}
+
+    if amr_grid is None:
+        raise ValueError(
+            f'magnetic transfer mode {mode!r} needs the raw AMR capture '
+            'grid; a state table reloaded from disk has none - re-run '
+            'without --state-table')
+
+    def _vertex_tables(cell_values_by_axis):
+        return [AMRTable.from_grid(amr_grid, c, interp='vertex')
+                for c in cell_values_by_axis]
+
+    def _conservative_cells(vec, tag):
+        carriers = {f'__{tag}{a}': vec[:, i] / rho
+                    for i, a in enumerate('xyz')}
+        parts_c = si.Particles(pos=pos_in, mass=parts.mass, rho=rho, h=h,
+                               values=carriers, box=boxarr,
+                               periodic=periodic)
+        dep = si.interpolate(parts_c, amr_grid, method='petkova',
+                             values=list(carriers), conservative_fields=True)
+        vols = np.asarray(amr_grid.volumes(), dtype=np.float64)
+        return [np.asarray(dep.data[f'_content___{tag}{a}'],
+                           dtype=np.float64) / vols for a in 'xyz']
+
+    if mode == 'vector-potential':
+        if periodic:
+            raise NotImplementedError(
+                'vector-potential magnetic transfer is open-box only for '
+                'reconstruct (free-space Biot-Savart kernel)')
+        softening = float(np.median(h))
+        pA = si.particle_vector_potential(pos_in, B_src, parts.mass / rho,
+                                          softening)
+        tables = _vertex_tables(_conservative_cells(pA, 'A'))
+        sizes = np.asarray(amr_grid.cell_size, dtype=np.float64)
+        counts = getattr(amr_grid, 'cell_count', None)
+        occ = (np.asarray(counts) > 0 if counts is not None
+               else np.ones(len(sizes), bool))
+        curl_eps = 0.5 * float(np.median(np.cbrt(sizes[occ].prod(axis=1))))
+        audit.update(softening=softening, curl_eps=curl_eps)
+
+        def query(final_pos):
+            def read(p):
+                return np.column_stack([t.rho0(p) for t in tables])
+            d = {}
+            for axis in range(3):
+                e = np.zeros(3)
+                e[axis] = curl_eps
+                d[axis] = (read(final_pos + e) - read(final_pos - e)) \
+                    / (2.0 * curl_eps)
+            return np.column_stack([d[1][:, 2] - d[2][:, 1],
+                                    d[2][:, 0] - d[0][:, 2],
+                                    d[0][:, 1] - d[1][:, 0]])
+        return query, audit
+
+    if mode == 'hodge':
+        if periodic:
+            raise NotImplementedError(
+                'hodge magnetic transfer is open-box only for reconstruct '
+                '(periodic AMR face capture is not implemented)')
+        table, h_audit, _cell = si.capture_open_amr_face_field(
+            parts, amr_grid, background='particle-mean',
+            normal_trace='nearest', boundary_flux='balance',
+            allow_clipped_support=True)
+        audit.update({k: v for k, v in h_audit.items()
+                      if isinstance(v, (int, float, str))})
+        return table.hdiv_reconstruction().query, audit
+
+    if mode != 'none':
+        raise ValueError(f'unknown magnetic_projection {mode!r}')
+    # 'none': conservative m*(B/rho) volume carrier -> cell B -> vertex read
+    tables = _vertex_tables(_conservative_cells(B_src, 'B'))
+
+    def query(final_pos):
+        return np.column_stack([t.rho0(final_pos) for t in tables])
+    return query, audit
 
 
 def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
@@ -665,14 +950,15 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          bg_c=None, bg_k=None, kernel_match=True,
                          contour_refine=True, contour_band=8.0,
                          contour_beta=0.5, target_interp='vertex',
-                         field_transfer='scatter', field_interp='vertex',
+                         field_transfer='table', field_interp='vertex',
                          energy_mode='internal', save_state=None,
                          momentum_closure=None,
                          grade=True,
                          alpha=None,
                          tail_reach=None, n_frame=None, nl0=None,
                          bg_over=0.0,
-                         km_hmode='particle', km_hscale=1.0, verbose=False):
+                         km_hmode='particle', km_hscale=1.0,
+                         magnetic_projection='none', verbose=False):
     """The `glassresample --op reconstruct` engine - a THIN WRAPPER around
     the glassgen table builder (decided 2026-07-10): capture the input gas
     density (exact raw AMR table), hand it to
@@ -682,7 +968,8 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     fields onto the FINAL positions. ``field_transfer='scatter'`` retains the
     M22 particle-to-particle control; ``'table'`` captures conservative field
     contents on the final raw AMR geometry and imprints numerator/rho ratios
-    after the relax (M23).
+    after the relax (M23). ``'table'`` is the default (flipped 2026-07-24,
+    user); ``'scatter'`` stays as the M22 control/fallback.
 
       pos_in, mass_in : the INPUT gas.
       count           : target gas particle count (may be < or > the input).
@@ -705,6 +992,11 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                         amr_cap is passed (the table is already built).
       amr_cap         : optional precomputed (amr, vals_raw) in scatter mode,
                         or an AMRStateTable in table mode, to skip capture.
+      magnetic_projection : 'none' (default) | 'hodge' | 'vector-potential'.
+                        Any BField aux components in `fields` are split out
+                        of the generic transfer and moved by their own
+                        governed path on the density AMR capture grid (see
+                        _magnetic_transfer_setup).
 
     Returns (pos, mass, aux, is_filler, audit); final count is the post-cull
     occupancy, near but not exactly `count`. is_filler is all-False (survivors
@@ -734,14 +1026,10 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          "field_transfer='table'")
     if field_transfer == 'table' and method != 'petkova':
         raise ValueError("field_transfer='table' requires method='petkova'")
-    if field_transfer == 'table':
-        for name in fields:
-            lname = name.lower().removeprefix('aux_')
-            if (lname == 'b' or lname.startswith('bfield')
-                    or lname in ('bx', 'by', 'bz')):
-                raise NotImplementedError(
-                    f"magnetic field {name!r} cannot use generic AMR vertex "
-                    'transfer; M23 magnetic transfer is explicitly deferred')
+    # Magnetic aux never rides the generic transfer (scatter's ungoverned
+    # pass-through and M23's mass-ratio vertex readout are both wrong for B):
+    # split it out here and move it by its own path after the build.
+    fields, B_src, magnetic_keys = _magnetic_split(dict(fields or {}))
     timings = {}
     density_capture_audit = None
     # OPEN IC (box is None): capture in WORLD coordinates. Density-only/M22
@@ -756,6 +1044,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     # everything here stays in the IC's own coordinates.
     t0 = _time.perf_counter()
     state = None
+    amr_for_B = None            # raw capture geometry for the magnetic path
     if amr_cap is None and field_transfer == 'table':
         state = capture_amr_state(
             pos_in, mass_in, fields, box=box, nsmooth=nsmooth,
@@ -766,6 +1055,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
             grade=grade, interp=target_interp,
             store_kinetic=(energy_mode == 'total'))
         table = state.density
+        amr_for_B = getattr(state, '_amr_grid', None)
     elif amr_cap is None:
         amr, vals_raw = capture_amr_raw(
             pos_in, mass_in, box=box, nsmooth=nsmooth, method=method,
@@ -775,12 +1065,14 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
             contour_band=contour_band, contour_beta=contour_beta, grade=grade)
         density_capture_audit = getattr(amr, 'capture_mass_audit', None)
         table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
+        amr_for_B = amr
     elif field_transfer == 'table':
         if not isinstance(amr_cap, AMRStateTable):
             raise TypeError('table field transfer requires amr_cap to be an '
                             'AMRStateTable')
         state = amr_cap
         table = state.density
+        amr_for_B = getattr(state, '_amr_grid', None)
         expected = {
             name for name in fields
             if name.lower().removeprefix('aux_')
@@ -797,6 +1089,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
         amr, vals_raw = amr_cap
         density_capture_audit = getattr(amr, 'capture_mass_audit', None)
         table = AMRTable.from_grid(amr, vals_raw, interp=target_interp)
+        amr_for_B = amr
     timings['capture'] = _time.perf_counter() - t0
     M_gas = float(mass_in.sum())
     if state is not None:
@@ -824,6 +1117,28 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
         M_gas / int(count), c=(bg_c or nsmooth),
         k=resolve_bg_k(bg_k, n_frame, nsmooth=(bg_c or nsmooth)))
     field_audit = {}
+    magnetic_query = None
+    if B_src is not None:
+        t0 = _time.perf_counter()
+        magnetic_query, mag_audit = _magnetic_transfer_setup(
+            pos_in, mass_in, B_src, box, nsmooth, magnetic_projection,
+            amr_for_B)
+        field_audit['magnetic'] = mag_audit
+        timings['magnetic_capture'] = _time.perf_counter() - t0
+
+    def _apply_magnetic(out, final_pos):
+        if magnetic_query is None:
+            return out
+        t = _time.perf_counter()
+        Bq = magnetic_query(np.ascontiguousarray(final_pos,
+                                                 dtype=np.float64))
+        for key in magnetic_keys:
+            base = key.lower().removeprefix('aux_')
+            out[key] = Bq if base == 'bfield' \
+                else Bq[:, 'xyz'.index(base[-1])]
+        timings['magnetic_readout'] = _time.perf_counter() - t
+        return out
+
     if field_transfer == 'scatter':
         t0 = _time.perf_counter()
         src_rho, _ = particle_density(pos_in, mass_in, box=box,
@@ -838,7 +1153,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                 nsmooth=nsmooth)
             field_audit.update(fa)
             timings['scatter'] = _time.perf_counter() - t
-            return out
+            return _apply_magnetic(out, final_pos)
     else:
         resolved = np.asarray(table.vals) >= rho_edge_pre
         full_budget = state.integrated_contents()
@@ -975,7 +1290,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                         np.linalg.norm(delta_momentum)
                         / max(source_derived['momentum_scale'], 1e-300)))
             timings['table_imprint'] = _time.perf_counter() - t
-            return out
+            return _apply_magnetic(out, final_pos)
 
     rkw = dict(relax_kw or {})
     if progress is not None:

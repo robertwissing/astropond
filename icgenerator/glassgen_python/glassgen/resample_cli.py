@@ -221,17 +221,31 @@ def main(argv=None):
                           'density estimate, so the edge biases cancel '
                           'instead of driving a persistent edge force')
     rec.add_argument('--field-transfer', choices=('scatter', 'table'),
-                     default='scatter',
-                     help='field transfer after reconstruction: scatter is '
-                          'the M22 particle-to-particle control (default); '
-                          'table captures conservative rho*A channels on '
-                          'the raw AMR grid and imprints A=vertex(rho*A)/'
-                          'vertex(rho) after relaxation (M23 opt-in)')
+                     default='table',
+                     help='field transfer after reconstruction: table '
+                          '(default, M23) captures conservative rho*A channels '
+                          'on the raw AMR grid and imprints A=vertex(rho*A)/'
+                          'vertex(rho) after relaxation; scatter is the M22 '
+                          'particle-to-particle control/fallback')
     rec.add_argument('--field-interp',
                      choices=('vertex', 'limited', 'flat'), default='vertex',
                      help='M23 table field readout at final particle '
                           'positions (default: vertex). Numerator and rho '
                           'use the same operator before division')
+    rec.add_argument('--magnetic-projection',
+                     choices=('none', 'hodge', 'vector-potential'),
+                     default='none',
+                     help='transfer of any BField aux (never rides the '
+                          'generic scatter/table path); every mode works on '
+                          'the density AMR capture grid. none (default): '
+                          'conservative volume-carrier cell B, vertex '
+                          'read-back at the final positions - no projection; '
+                          'clean divergence afterwards in the consumer\'s '
+                          'operator (mhd_divBclean). hodge: open AMR face '
+                          'capture + Hodge/solenoidal projection, RT0 '
+                          'readout. vector-potential: meshless Biot-Savart '
+                          'particle A -> conservative cell A -> B = curl of '
+                          'the vertex A interpolant (open boxes only)')
     rec.add_argument('--energy-mode', choices=('internal', 'total'),
                      default='internal',
                      help='M23 table transfer: internal preserves deposited '
@@ -318,6 +332,8 @@ def main(argv=None):
                           (args.momentum, '--momentum')):
             if val is not None:
                 ap.error(f'{name} requires --op reconstruct')
+        if args.magnetic_projection != 'none':
+            ap.error('--magnetic-projection requires --op reconstruct')
     if args.capture_method is None:
         args.capture_method = 'petkova'
     if (args.op == 'reconstruct' and args.field_transfer == 'table'
@@ -406,7 +422,8 @@ def main(argv=None):
               + (f', energy {args.energy_mode}'
                  if args.field_transfer == 'table' else '')
               + (f', momentum {args.momentum_closure or "boost"}'
-                 if args.field_transfer == 'table' else '') + '); '
+                 if args.field_transfer == 'table' else '')
+              + f', magnetic {args.magnetic_projection}' + '); '
               f'box {boxdesc}; nsmooth {args.nsmooth}', flush=True)
     else:
         arrow = ('x%d' if args.op == 'split' else '1/%d') % factor
@@ -466,14 +483,9 @@ def main(argv=None):
             field_payload = aux
             tu_fac = 1.0
             if args.field_transfer == 'table':
-                magnetic = [k for k in aux
-                            if k.lower().removeprefix('aux_').startswith(
-                                'bfield')]
-                if magnetic:
-                    sys.exit('M23 table transfer does not yet support '
-                             'divergence-aware magnetic fields; remove these '
-                             'aux inputs or use --field-transfer scatter: '
-                             + ', '.join(magnetic))
+                # BField aux no longer needs rejecting here: reconstruct
+                # splits magnetic components out of the generic transfer and
+                # moves them by --magnetic-projection (2026-07-23).
                 # Recomputed/resolution fields are not hydrodynamic state
                 # channels. eps is restored below then scaled to output mass;
                 # phi is intentionally reset for the target gravity solve.
@@ -508,6 +520,7 @@ def main(argv=None):
                 field_interp=args.field_interp,
                 energy_mode=args.energy_mode,
                 momentum_closure=args.momentum_closure,
+                magnetic_projection=args.magnetic_projection,
                 amr_cap=state_cap, save_state=args.save_state,
                 bg_c=args.bg_c,
                 n_frame=args.n_frame, nl0=args.nl0, cascade=args.cascade,

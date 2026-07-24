@@ -30,6 +30,14 @@ Examples
   # column-density projection map in the xy plane
   interpolate_to_grid.sh run/snap.00100 col.npz --grid projection \
       --axes xy --project column
+
+  # divergence-aware magnetic transfer: face capture + Hodge projection
+  interpolate_to_grid.sh run/snap.00100 mesh.npz --grid amr \
+      --fields rho,Bx,By,Bz --magnetic-projection hodge
+
+  # vector-potential capture (div B == 0 pointwise); stores Ax,Ay,Az too
+  interpolate_to_grid.sh run/snap.00100 vecpot.npz --grid uniform --npx 128 \
+      --fields Bx,By,Bz --magnetic-projection vector-potential
 """
 
 import argparse
@@ -367,6 +375,145 @@ def report_mass(res, p):
 
 
 # --------------------------------------------------------------------------- #
+#  Magnetic components (--magnetic-projection)
+# --------------------------------------------------------------------------- #
+
+def magnetic_component_names(fields):
+    """The (Bx,By,Bz) spellings from --fields, or None unless all three exist."""
+    m = {f.lower(): f for f in fields}
+    if all(k in m for k in ("bx", "by", "bz")):
+        return (m["bx"], m["by"], m["bz"])
+    return None
+
+
+def conservative_cell_vector(p, target, names):
+    """Exact volume-carrier deposit: cell value = sum_i V_i f_i w_ic / V_cell.
+
+    This is the conservative m*(f/rho) Petkova deposit used by every magnetic
+    mode's cell field (sum_cells content == sum_i V_i f_i to machine
+    precision), as opposed to the kernel-volume-weighted average the ordinary
+    field path produces.
+    """
+    from sph_interp import Particles, UniformGrid, interpolate
+    carriers, keys = {}, []
+    for nm in names:
+        k = f"__mag_{nm}"
+        carriers[k] = np.asarray(p.values[nm], dtype=np.float64) / p.rho
+        keys.append(k)
+    cp = Particles(pos=p.pos, mass=p.mass, rho=p.rho, h=p.h, values=carriers,
+                   box=p.box, periodic=p.periodic)
+    dep = interpolate(cp, target, method="petkova", values=keys,
+                      conservative_fields=True)
+    vol = (target.cell_volume if isinstance(target, UniformGrid)
+           else target.volumes())
+    return [np.asarray(dep.data[f"_content_{k}"], dtype=np.float64) / vol
+            for k in keys]
+
+
+def deposit_magnetic(args, p, target, res, bnames):
+    """Fill res.data[Bx,By,Bz] (+ faces / A) per --magnetic-projection."""
+    from sph_interp import UniformGrid
+    mode = args.magnetic_projection
+    per = bool(np.all(np.atleast_1d(p.periodic)))
+
+    if mode == "none":
+        print(f"  magnetic: conservative volume-carrier deposit of {bnames} "
+              "(no projection; clean divergence in the consumer's operator "
+              "with mhd_divBclean)")
+        for nm, cell in zip(bnames,
+                            conservative_cell_vector(p, target, bnames)):
+            res.data[nm] = cell
+        return
+
+    if mode == "hodge":
+        if isinstance(target, UniformGrid):
+            if per:
+                from sph_interp import capture_periodic_face_field
+                table, audit, _cell = capture_periodic_face_field(
+                    p, target, fields=bnames)
+            else:
+                from sph_interp import capture_open_face_field
+                try:
+                    table, audit, _cell = capture_open_face_field(
+                        p, target, fields=bnames, background="particle-mean")
+                except ValueError as err:
+                    if "support" in str(err):
+                        raise SystemExit(
+                            f"hodge: {err}\n  (the open face capture needs a "
+                            "support-complete grid: rerun with --open-padding "
+                            "full_pad, or an explicit --box containing "
+                            "pos +/- 2h)")
+                    raise
+        else:                                    # open AMRGrid
+            if per:
+                raise SystemExit(
+                    "--magnetic-projection hodge on a PERIODIC AMR grid is "
+                    "not implemented (uniform periodic, uniform open, or "
+                    "open amr)")
+            from sph_interp import capture_open_amr_face_field
+            table, audit, _cell = capture_open_amr_face_field(
+                p, target, fields=bnames, background="particle-mean",
+                normal_trace="nearest", boundary_flux="balance",
+                allow_clipped_support=True)
+        cc = table.cell_centred()
+        for k, nm in enumerate(bnames):
+            res.data[nm] = cc[..., k]
+        for attr, out in (("Bx_face", f"{bnames[0]}_face"),
+                          ("By_face", f"{bnames[1]}_face"),
+                          ("Bz_face", f"{bnames[2]}_face")):
+            if hasattr(table, attr):             # uniform tables expose faces
+                res.data[out] = getattr(table, attr)
+        args._magnetic_audit = audit
+        print(f"  magnetic: hodge face capture + solenoidal projection "
+              f"({'periodic' if per else 'open'} "
+              f"{'uniform' if isinstance(target, UniformGrid) else 'AMR'}; "
+              "cell-centred B + face arrays where available)")
+        return
+
+    # vector-potential (uniform only; enforced at parse time)
+    from sph_interp import capture_uniform_vector_potential
+    if per and args.a_method == "biot-savart":
+        print("  WARNING: biot-savart uses the free-space kernel; on a "
+              "periodic box prefer --a-method spectral")
+    table = capture_uniform_vector_potential(
+        p, target, fields=bnames, a_method=args.a_method)
+    cc = table.cell_centred()
+    for k, nm in enumerate(bnames):
+        res.data[nm] = cc[..., k]
+    for k, nm in enumerate(("Ax", "Ay", "Az")):  # A as first-class channels
+        res.data[nm] = table.cell_A[..., k]
+    a = table.audit
+    print(f"  magnetic: vector-potential ({args.a_method}) "
+          f"Bbar={np.round(table.Bbar, 6)}; round-trip @particles "
+          f"rel-L2 {a['roundtrip_B_rel_l2']:.3f}, "
+          f"E/E0 {a['roundtrip_over_source']:.3f} "
+          "(div B == 0 pointwise by construction)")
+
+
+def report_magnetic(res, p, bnames):
+    """Grid-vs-particle Sum(V*B) per component (the material ledger)."""
+    from sph_interp import UniformGrid, AMRGrid
+    grid = res.target
+    if isinstance(grid, UniformGrid):
+        gsum = [float(np.sum(res.data[nm]) * grid.cell_volume)
+                for nm in bnames]
+    elif isinstance(grid, AMRGrid):
+        v = grid.volumes()
+        gsum = [float(np.sum(np.asarray(res.data[nm]) * v)) for nm in bnames]
+    else:
+        return
+    V = p.mass / p.rho
+    psum = [float(np.sum(V * np.asarray(p.values[nm], np.float64)))
+            for nm in bnames]
+    pairs = "  ".join(f"{nm}: grid {g:.6g} vs particles {q:.6g}"
+                      for nm, g, q in zip(bnames, gsum, psum))
+    print(f"  magnetic integral check (Sum V*B): {pairs}")
+    print("    (NB with a particle-mean background -- hodge/open -- the grid "
+          "integral counts Bbar over the WHOLE box, not just the material "
+          "volume, so a mismatch there is bookkeeping, not loss)")
+
+
+# --------------------------------------------------------------------------- #
 #  Main
 # --------------------------------------------------------------------------- #
 
@@ -448,6 +595,28 @@ def build_parser():
                     help="pad cell domain past the box (keeps boundary kernels in)")
     pa.add_argument("--seed", type=int, default=0, help="RNG seed (voronoi)")
 
+    # magnetic components (Bx,By,Bz in --fields)
+    pa.add_argument("--magnetic-projection",
+                    choices=["none", "hodge", "vector-potential"],
+                    default="none",
+                    help="treatment of the magnetic triplet Bx,By,Bz (all "
+                         "three in --fields). none (default): conservative "
+                         "Petkova m*(B/rho) volume-carrier deposit, NO "
+                         "projection -- divergence is handled afterwards in "
+                         "the consumer's own operator (mhd_divBclean). "
+                         "hodge: shared-face capture + Hodge/solenoidal "
+                         "projection (RT0 face table, the RAMSES-export "
+                         "intermediate); uniform (periodic or open) and open "
+                         "amr. vector-potential: capture A, B = "
+                         "curl(interp(A)) -> div B == 0 pointwise; uniform "
+                         "grids only, also stores Ax,Ay,Az cell channels.")
+    pa.add_argument("--a-method", choices=["spectral", "biot-savart"],
+                    default="spectral",
+                    help="vector-potential A derivation: spectral Coulomb-"
+                         "gauge ik x B/k^2 on the (zero-padded open) grid, or "
+                         "the meshless parts-integrated Biot-Savart particle "
+                         "sum Petkova-deposited to the grid")
+
     # visualisation
     pa.add_argument("--visualise", "--visualize", dest="visualise", nargs="?",
                     const="", default=None,
@@ -499,6 +668,26 @@ def main(argv=None):
     from sph_interp import from_tipsy, interpolate
 
     fields = tuple(f.strip() for f in args.fields.split(",") if f.strip())
+
+    # magnetic triplet handling (--magnetic-projection)
+    bnames = magnetic_component_names(fields)
+    if args.magnetic_projection != "none":
+        if bnames is None:
+            pa.error("--magnetic-projection requires --fields to include all "
+                     "of Bx,By,Bz")
+        if args.grid not in ("uniform", "amr"):
+            pa.error("--magnetic-projection supports --grid uniform or amr")
+        if args.grid == "amr" and args.magnetic_projection == "vector-potential":
+            pa.error("--magnetic-projection vector-potential is uniform-grid "
+                     "only (AMR-native A capture is deferred); use --grid "
+                     "uniform, or --magnetic-projection none/hodge for amr")
+    # The magnetic path replaces the ordinary deposit of Bx,By,Bz whenever a
+    # projection is requested, or for the default petkova method (mode 'none'
+    # = the conservative volume-carrier deposit). gather/scatter with 'none'
+    # keep the legacy approximate path.
+    magnetic = (bnames is not None and args.grid in ("uniform", "amr")
+                and (args.magnetic_projection != "none"
+                     or args.method == "petkova"))
 
     # AREPO ICs need a temperature field (u = dTuFac*T) -> auto-include one, and
     # resolve dTuFac from the run .log unless the user gave --tu-fac.
@@ -559,8 +748,16 @@ def main(argv=None):
 
     target = build_target(args, p)
     print(f"  depositing with method={args.method} ...")
-    res = interpolate(p, target, method=args.method, values=list(fields))
-    report_mass(res, p)
+    deposit_values = [f for f in fields if not (magnetic and f in bnames)]
+    if deposit_values or not magnetic:
+        res = interpolate(p, target, method=args.method, values=deposit_values)
+        report_mass(res, p)
+    else:                      # magnetic-only field list: nothing else to deposit
+        from sph_interp import GridResult
+        res = GridResult({}, None, target, args.method)
+    if magnetic:
+        deposit_magnetic(args, p, target, res, bnames)
+        report_magnetic(res, p, bnames)
 
     write_output(res, args.output, args.output_format, args, p)
 

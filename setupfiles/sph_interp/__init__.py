@@ -40,6 +40,11 @@ from .magnetic_balsara import (Balsara2Reconstruction,
 from .magnetic_amr_balsara import (AMRBalsara2Reconstruction,
                                    build_amr_balsara2_reconstruction)
 from .magnetic_validation import validate_magnetic_reconstruction
+from .vector_potential import (VectorPotentialTable,
+                               bfield_to_vector_potential,
+                               particle_vector_potential,
+                               curl_interp,
+                               capture_uniform_vector_potential)
 from .kernels import wkernel, cnorm3D
 from .visualise import (visualise, field_image, sample_at_particles,
                         draw_cells, draw_cells_3d)
@@ -64,6 +69,9 @@ __all__ = [
     "AMRBalsara2Reconstruction", "build_amr_balsara2_reconstruction",
     "sph_divergence", "sph_divergence_audit",
     "validate_magnetic_reconstruction",
+    "VectorPotentialTable", "bfield_to_vector_potential",
+    "particle_vector_potential", "curl_interp",
+    "capture_uniform_vector_potential",
     "wkernel", "cnorm3D",
     "visualise", "field_image", "sample_at_particles", "draw_cells",
     "draw_cells_3d",

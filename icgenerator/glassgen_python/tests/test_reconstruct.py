@@ -103,6 +103,74 @@ def test_amr_state_rejects_generic_magnetic_transfer():
             pos, mass, {'aux_BField': np.ones((len(pos), 3))}, box=box)
 
 
+def test_dedup_coincident_conserves_mass_and_content():
+    # two exact-coincident groups + one lone particle
+    pos = np.array([[0, 0, 0], [0, 0, 0], [1, 1, 1],
+                    [2, 2, 2], [2, 2, 2]], float)
+    mass = np.array([1.0, 3.0, 2.0, 4.0, 4.0])
+    fields = {'u': np.array([10.0, 20.0, 5.0, 1.0, 3.0]),
+              'vel': np.array([[1, 0, 0], [3, 0, 0], [0, 0, 0],
+                               [0, 2, 0], [0, 4, 0]], float)}
+    p2, m2, f2, a = reconstruct.dedup_coincident(pos, mass, fields)
+    assert (a['n_input'], a['n_output'], a['n_merged']) == (5, 3, 2)
+    assert a['n_groups_merged'] == 2 and a['max_group_size'] == 2
+    # mass conserved; every conserved content sum*(m*A) conserved exactly
+    assert m2.sum() == pytest.approx(mass.sum())
+    assert np.sum(m2 * f2['u']) == pytest.approx(np.sum(mass * fields['u']))
+    np.testing.assert_allclose(np.sum(m2[:, None] * f2['vel'], axis=0),
+                               np.sum(mass[:, None] * fields['vel'], axis=0))
+    # merged intensive value = mass-weighted mean ((1*10+3*20)/4 = 17.5)
+    assert f2['u'][0] == pytest.approx(17.5)
+
+
+def test_dedup_coincident_clean_input_is_identity():
+    pos = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]], float)
+    mass = np.ones(3)
+    p2, m2, f2, a = reconstruct.dedup_coincident(pos, mass)
+    assert a['n_merged'] == 0 and f2 is None          # nothing merged
+    np.testing.assert_array_equal(p2, pos)            # values untouched
+    np.testing.assert_array_equal(m2, mass)
+
+
+def test_dedup_coincident_near_tolerance_clusters():
+    pos = np.array([[0, 0, 0], [1e-9, 0, 0], [5, 5, 5]], float)
+    _, _, _, a0 = reconstruct.dedup_coincident(pos, np.ones(3), tol=0.0)
+    _, _, _, a1 = reconstruct.dedup_coincident(pos, np.ones(3), tol=1e-6)
+    assert a0['n_merged'] == 0          # not bit-identical
+    assert a1['n_merged'] == 1          # within tol
+
+
+@needs_sph_interp
+def test_capture_amr_state_dedup_merges_coincident_donors():
+    # duplicate a chunk of donors at IDENTICAL positions - without dedup this
+    # is the Q6 octree runaway; dedup collapses them and conserves content.
+    pos, mass, box, _ = _gradient(nside=10)
+    fields = {'u': 1.0 + 0.2 * pos[:, 0],
+              'vel': np.stack([pos[:, 1], -pos[:, 0], pos[:, 2]], axis=1)}
+    dup = slice(0, 50)
+    pos_d = np.concatenate([pos, pos[dup]])
+    mass_d = np.concatenate([mass, mass[dup]])
+    fields_d = {k: np.concatenate([v, v[dup]]) for k, v in fields.items()}
+
+    state = reconstruct.capture_amr_state(
+        pos_d, mass_d, fields_d, box=box, base_npx=8, max_level=3,
+        part_per_cell=8, grade=False)
+    audit = state.metadata['capture']['dedup']
+    assert audit['n_input'] == len(pos_d)
+    assert audit['n_merged'] == 50 and audit['n_output'] == len(pos)
+    # content budgets match the FULL duplicated source (merge is conservative)
+    budget = state.integrated_contents()
+    assert budget['mass'] == pytest.approx(mass_d.sum(), rel=1e-6)
+    assert budget['u'] == pytest.approx(np.sum(mass_d * fields_d['u']),
+                                        rel=1e-6)
+
+    # dedup=False leaves the audit empty (opt-out path still works)
+    state_off = reconstruct.capture_amr_state(
+        pos, mass, fields, box=box, base_npx=8, max_level=3,
+        part_per_cell=8, grade=False, dedup=False)
+    assert state_off.metadata['capture']['dedup'] is None
+
+
 @needs_sph_interp
 def test_amr_table_uniform_density():
     pos, mass, box = _lattice()
@@ -604,7 +672,10 @@ def test_reconstruct_resample_cascade_conserves_mass_and_fields():
         posf, massf, auxf, isf, a = reconstruct.reconstruct_resample(
             pos, mass, count, fields, box=box, nsmooth=64,
             relax_kw=dict(icr0_stop=2e-2, max_iter=80), seed=1,
-            contour_refine=False, grade=False)
+            contour_refine=False, grade=False,
+            # scatter is no longer the default (flipped to 'table' 2026-07-24);
+            # this test validates the M22 scatter content/audit tiers, so pin it.
+            field_transfer='scatter')
         # exact mass conservation + equal-mass glass
         assert abs(massf.sum() - mass.sum()) < 1e-9
         assert np.allclose(massf, massf[0])

@@ -45,6 +45,8 @@ from .vector_potential import (VectorPotentialTable,
                                particle_vector_potential,
                                curl_interp,
                                capture_uniform_vector_potential)
+from .spline_derham import (SplineDeRham, spline_derham_curl,
+                            curl_coeffs, div_coeffs)
 from .kernels import wkernel, cnorm3D
 from .visualise import (visualise, field_image, sample_at_particles,
                         draw_cells, draw_cells_3d)
@@ -72,6 +74,7 @@ __all__ = [
     "VectorPotentialTable", "bfield_to_vector_potential",
     "particle_vector_potential", "curl_interp",
     "capture_uniform_vector_potential",
+    "SplineDeRham", "spline_derham_curl", "curl_coeffs", "div_coeffs",
     "wkernel", "cnorm3D",
     "visualise", "field_image", "sample_at_particles", "draw_cells",
     "draw_cells_3d",

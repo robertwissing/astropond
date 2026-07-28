@@ -38,8 +38,60 @@ MAGIC = 0x47524943          # 'GRIC'
 VERSION = 1
 
 
+def _with_v2(p):
+    """`p` plus a `_v2` value field holding |v|^2, without mutating the input.
+
+    The caller may have handed us their own Particles; adding a field in place
+    would be a surprising side effect, and `_v2` would then turn up in any
+    later `values=None` deposit they do.
+    """
+    from dataclasses import replace
+    missing = [k for k in ("vx", "vy", "vz") if k not in p.values]
+    if missing:
+        raise ValueError(
+            f"the conservative GridIC deposit needs the velocity components "
+            f"as value fields; missing {missing}. Read the snapshot with "
+            f"fields=('rho','vx','vy','vz','T'), or pass conservative=False.")
+    v2 = sum(np.asarray(p.values[k], dtype=np.float64) ** 2
+             for k in ("vx", "vy", "vz"))
+    return replace(p, values={**p.values, "_v2": v2})
+
+
+def _report_budget(p, M, vx, vy, vz, u, tu_fac, e_unresolved):
+    """Print how exactly the deposit conserved mass, momentum and energy.
+
+    These are the numbers the plan set out to beat (orzag 64^3, old path:
+    momentum ~5e-9, E_therm +2.4e-7, E_kin -0.53%), so print them rather than
+    asserting: on a genuinely under-resolved grid a real deficit is
+    information, not a failure.
+    """
+    m = p.mass
+    vel = np.stack([p.values[k] for k in ("vx", "vy", "vz")], axis=1)
+    tot_m = float(m.sum())
+    tot_p = (m[:, None] * vel).sum(axis=0)
+    tot_therm = float((m * p.values["T"]).sum() * tu_fac)
+    tot_kin = float(0.5 * (m * np.sum(vel ** 2, axis=1)).sum())
+
+    got_m = float(M.sum())
+    got_p = np.array([float((M * c).sum()) for c in (vx, vy, vz)])
+    got_kin = float(0.5 * (M * (vx * vx + vy * vy + vz * vz)).sum())
+    got_int = float((M * u).sum())
+
+    def rel(a, b):
+        return (a - b) / b if b else a
+
+    pscale = float(np.abs(tot_p).max()) or 1.0
+    print(f"  GridIC conservative deposit: "
+          f"mass {rel(got_m, tot_m):+.2e}, "
+          f"momentum {np.max(np.abs(got_p - tot_p)) / pscale:+.2e}, "
+          f"E_tot {rel(got_kin + got_int, tot_kin + tot_therm):+.2e} "
+          f"(E_kin {rel(got_kin, tot_kin):+.2%} -> thermalised "
+          f"{float(e_unresolved.sum()) / (tot_kin or 1.0):.2%} of it)")
+
+
 def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
-                  gamma=5.0 / 3.0, tu_fac=None, time=0.0, fields_b=("Bx", "By", "Bz")):
+                  gamma=5.0 / 3.0, tu_fac=None, time=0.0,
+                  fields_b=("Bx", "By", "Bz"), conservative=True):
     """Deposit an SPH IC onto a fine uniform grid and write a GridIC file.
 
     source : a tipsy snapshot path, or a `Particles` instance.
@@ -51,6 +103,42 @@ def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
     box    : periodic period (3,); default = the particles' box.
     gamma  : adiabatic index (P = (gamma-1) * rho * u).
     tu_fac : dTuFac if the particle thermal field is a temperature (u = tu_fac*T).
+    conservative : petkova only. Build the cell state from CONSERVED CONTENTS
+             (momentum and energy) rather than from kernel-volume-weighted
+             averages, and close the total-energy budget. See below.
+
+    THE CONSERVATIVE PATH (default; `conservative=False` restores the old
+    volume-weighted state). Mass was always conserved - petkova's density is
+    `sum_j m_j (integral_cell W_j) / V_cell` - but velocity and temperature
+    were kernel-volume-weighted averages, so MOMENTUM and ENERGY were not
+    conserved, only approximated. Using the `_content_<name>` channels that
+    the field-reconstruction work (M23) added:
+
+        M_cell   = sum_j m_j I_j                    (`_mass`)
+        v_cell   = sum_j m_j v_j I_j / M_cell       (`_content_v*` / M)
+        u_therm  = sum_j m_j u_j I_j / M_cell       (`_content_T` * tu_fac / M)
+
+    which conserves total mass, momentum and thermal energy exactly.
+
+    ENERGY CLOSURE. Mass-weighting the velocity is not energy-neutral: a cell
+    holding particles with different velocities has kinetic energy
+    `1/2 sum_j m_j |v_j|^2`, while the bulk motion it is collapsed to carries
+    only `1/2 M |v_cell|^2`. The difference is the UNRESOLVED VELOCITY
+    VARIANCE, non-negative by Jensen, and it is exactly the -0.53% E_kin the
+    old path lost on orzag 64^3. A finite-volume cell has nowhere to put
+    sub-cell motion except its internal energy, so it is added there:
+
+        u_cell = u_therm + [1/2 sum_j m_j |v_j|^2 - 1/2 M |v_cell|^2] / M_cell
+
+    making TOTAL energy exact rather than thermal energy exact. That is a
+    physical choice, not a bookkeeping one: the kinetic energy of motion the
+    grid cannot represent is thermalised, which is what the grid code would do
+    to it within a step anyway. It requires depositing |v|^2 as its own field,
+    since `sum m_j |v_j|^2` cannot be recovered from `sum m_j v_j`.
+
+    B is deliberately NOT mass-weighted - the meaningful cell average of a
+    field threading the cell is volume-weighted - so in MHD mode it is
+    deposited in a second pass with the original weighting.
     """
     if isinstance(source, str):
         flds = ["rho", "vx", "vy", "vz", "T"]
@@ -74,22 +162,50 @@ def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
     # form the specific internal energy u = dTuFac * T (tu_fac); P = (gamma-1)*rho*u.
     # This mirrors the AREPO/GIZMO converters (from_tipsy's derived 'u' is 0 when
     # dTuFac can't be resolved from a .log, so deposit T and scale here).
+    use_cons = bool(conservative) and method == "petkova"
+
     values = ["rho", "vx", "vy", "vz", "T"]
-    if mhd:
+    if use_cons:
+        # |v|^2 must be deposited in its own right: sum_j m_j |v_j|^2 is not
+        # recoverable from sum_j m_j v_j, and it is what the energy closure needs
+        p = _with_v2(p)
+        values = values + ["_v2"]
+    if mhd and not use_cons:
         values += list(fields_b)
-    res = interpolate(p, grid, method=method, values=values)
+    res = interpolate(p, grid, method=method, values=values,
+                      **({"conservative_fields": True} if use_cons else {}))
     d = res.data
 
     def f(name):
         return np.ascontiguousarray(np.asarray(d[name], dtype=np.float64))
 
-    rho = f("rho")
-    vx, vy, vz = f("vx"), f("vy"), f("vz")
-    u = f("T") * tu_fac
+    if use_cons:
+        M = f("_mass")
+        ok = M > 0.0
+        inv = np.zeros_like(M)
+        inv[ok] = 1.0 / M[ok]
+        rho = M / grid.cell_volume
+        vx = f("_content_vx") * inv
+        vy = f("_content_vy") * inv
+        vz = f("_content_vz") * inv
+        # the closure: particle kinetic energy in the cell, minus the bulk
+        # kinetic energy the cell can actually represent -> heat
+        e_kin_particles = 0.5 * f("_content__v2")
+        e_kin_bulk = 0.5 * M * (vx * vx + vy * vy + vz * vz)
+        e_unresolved = np.maximum(e_kin_particles - e_kin_bulk, 0.0)
+        u = (f("_content_T") * tu_fac + e_unresolved) * inv
+        _report_budget(p, M, vx, vy, vz, u, tu_fac, e_unresolved)
+    else:
+        rho = f("rho")
+        vx, vy, vz = f("vx"), f("vy"), f("vz")
+        u = f("T") * tu_fac
     P = (gamma - 1.0) * rho * u
 
     faces = None
     if mhd:
+        if use_cons:
+            # second pass: B stays kernel-volume-weighted (see the docstring)
+            res = interpolate(p, grid, method=method, values=list(fields_b))
         faces = project_solenoidal(res, fields=fields_b, periodic=True,
                                    add_to_result=False)
 

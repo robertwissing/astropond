@@ -28,6 +28,7 @@ on a real orzag snapshot the summed grid mass matches the particle mass to 0.00%
 """
 
 import math
+import os
 import numpy as np
 import numba
 from numba import njit, prange
@@ -871,6 +872,77 @@ def _reduce_threads(local, out):
         oflat[i] = s
 
 
+@njit(parallel=True, cache=True)
+def _reduce_threads_zslab(local, out, k0, nk):
+    """out[:, :, k0:k0+nk] = sum_t local[t, :, :, :nk].
+
+    `_reduce_threads` reshapes to (nt, -1), which a partial z view is not
+    contiguous enough for, and the last slab is short whenever G does not
+    divide nz. Indexing 4-D directly sidesteps both."""
+    nt, ni, nj = local.shape[0], local.shape[1], local.shape[2]
+    for i in prange(ni):
+        for j in range(nj):
+            for k in range(nk):
+                s = 0.0
+                for t in range(nt):
+                    s += local[t, i, j, k]
+                out[i, j, k0 + k] = s
+
+
+@njit(parallel=True, cache=True)
+def _reduce_threads_zslab_k(local, out, k0, nk):
+    """The same, for the (nt, nx, ny, nz, K) field accumulator."""
+    nt, ni, nj, K = (local.shape[0], local.shape[1], local.shape[2],
+                     local.shape[4])
+    for i in prange(ni):
+        for j in range(nj):
+            for k in range(nk):
+                for p in range(K):
+                    s = 0.0
+                    for t in range(nt):
+                        s += local[t, i, j, k, p]
+                    out[i, j, k0 + k, p] = s
+
+
+# Peak per-thread accumulator bytes tolerated before the uniform deposit is
+# split into z slabs. The accumulators are (nthreads,) + cell_shape + (K,) --
+# N_grid x nthreads, with NO N_part axis, so particle count is free and only the
+# grid and the thread count drive this. Measured ceilings (K=1 / K=5 fields):
+#
+#     uniform 64^3    0.07 / 0.16 GB at 12 threads     0.75 /   1.75 GB at 128
+#     uniform 128^3   0.56 / 1.31 GB at 12 threads     6.0  /  14.0  GB at 128
+#     uniform 256^3   4.5  / 10.5 GB at 12 threads    48    / 112    GB at 128
+#
+# 2 GiB leaves every 64^3 and most 128^3 runs at G=1 (bit-identical to the
+# unslabbed code, same summation order) and catches the cases that would
+# otherwise have died. Override with SPH_INTERP_MAX_ACCUM_BYTES, or per call
+# with `slabs=`.
+MAX_ACCUM_BYTES = int(os.environ.get("SPH_INTERP_MAX_ACCUM_BYTES",
+                                     2 * 1024**3))
+
+
+def _slab_count(nthreads, nx, ny, nz, nstreams, cap=None):
+    """Number of z slabs so the per-thread accumulators fit in `cap` bytes.
+
+    `nstreams` is the number of float64 values accumulated per cell (1 for the
+    mass grid, +1 for the kernel-volume denominator, +K for the fields), so
+    `nthreads * nx * ny * nstreams * 8` is the cost of ONE z layer -- the
+    quantum this can't subdivide. Returns 1 when a full-depth accumulator
+    already fits, and never more than nz.
+    """
+    cap = MAX_ACCUM_BYTES if cap is None else cap
+    per_layer = nthreads * nx * ny * nstreams * 8
+    if cap <= 0 or per_layer <= 0:
+        return 1
+    layers = max(1, int(cap // per_layer))
+    return int(min(nz, -(-nz // layers)))
+
+
+def _slab_edges(nz, nslabs):
+    """z cut points, as equal as nz allows: G+1 edges bounding G slabs."""
+    return np.linspace(0, nz, int(nslabs) + 1).astype(np.int64)
+
+
 def _needs_weights(names):
     """True unless every interpolated field is density-like (those use only the
     conserved mass accumulator, so the kernel-volume den/num accumulators — two
@@ -879,9 +951,26 @@ def _needs_weights(names):
 
 
 # Particles are usually stored in spatially coherent order, so equal-size
-# prange chunks give some threads all the big-h (expensive) particles;
-# a small chunk size lets numba's scheduler rebalance.
+# prange chunks give some threads all the big-h (expensive) particles.
+#
+# MEASURED 2026-07-28: this chunk-size knob does NOT fix that — it does nothing
+# at all. On numba 0.65.1 the deposit takes 21.1 s at _CHUNKSIZE = 1, 4, 16,
+# 256, 4096 and 0 alike, i.e. `set_parallel_chunksize` never reaches this loop.
+# The imbalance it was meant to cure is severe and was still fully present:
+# on the bench's clustered 200k set the last 3 of 12 equal blocks of the
+# particle array hold 99.5% of the work, and petkova scaled 1.03x on 2 threads
+# and 1.04x on 4 (a pure-compute control in the same process scaled 2.01x and
+# 3.94x, so threading itself was fine).
+#
+# `_balanced_order` below fixes it where the scheduler would not: it reorders
+# the particles so that ANY contiguous chunk holds a representative mix of
+# cheap and expensive ones. Kept alongside rather than deleted, since it is
+# harmless and would start helping again if numba honours it in future.
 _CHUNKSIZE = 16
+
+# Below this, threading is not the bottleneck and the permutation is not worth
+# the gather it costs.
+_BALANCE_MIN_N = 4096
 
 
 class _chunked:
@@ -893,12 +982,39 @@ class _chunked:
         numba.set_parallel_chunksize(self._old)
 
 
+def _balanced_order(n):
+    """A permutation making every contiguous prange chunk equally expensive.
+
+    Returns None when reordering cannot pay (single thread, or too few
+    particles), in which case the caller leaves the arrays alone.
+
+    A FIXED-SEED shuffle rather than a work-sorted deal: numba's actual
+    partitioning of a prange is not part of its API, so the only property that
+    holds for whatever chunking it picks is that a random permutation makes
+    every contiguous subrange a uniform sample of the work distribution. It is
+    deterministic across runs, so the deposit stays reproducible.
+
+    Cost is one gather of the particle arrays and it does NOT hurt locality in
+    practice — measured single-thread time is unchanged (51.7 s shuffled vs
+    52.0 s in order), because the deposit is compute-bound in the per-cell
+    integral, not bandwidth-bound.
+
+    THE RESULT IS UNCHANGED except for floating-point summation order: the
+    accumulators are indexed by CELL, not by particle, so a permutation only
+    reorders the additions into each cell. Measured max relative difference
+    5.2e-16.
+    """
+    if n < _BALANCE_MIN_N or numba.get_num_threads() < 2:
+        return None
+    return np.random.default_rng(0).permutation(n)
+
+
 @njit(parallel=True, cache=True)
 def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                              nx, ny, nz, lox, loy, loz, pwx, pwy, pwz,
                              perx, pery, perz, faces, need_w,
                              conservative_fields,
-                             mass_local, den_local, num_local):
+                             mass_local, den_local, num_local, kz0, kz1):
     npart = x.shape[0]
     K = vals.shape[1]
     for i in prange(npart):
@@ -926,6 +1042,13 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
             jymin = max(jymin, 0); jymax = min(jymax, ny)
         if not perz:
             kzmin = max(kzmin, 0); kzmax = min(kzmax, nz)
+            # This pass owns wrapped z indices [kz0, kz1). On a NON-periodic
+            # axis the raw index IS the wrapped one, so the slab clips the loop
+            # bounds and a particle outside the slab exits here, before any
+            # geometry. (kz0=0, kz1=nz when unslabbed: both no-ops.)
+            kzmin = max(kzmin, kz0); kzmax = min(kzmax, kz1)
+            if kzmin >= kzmax:
+                continue
 
         for ix in range(ixmin, ixmax):
             iw = ix % nx if perx else ix
@@ -936,12 +1059,26 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                 ye0 = loy + jy * pwy
                 ye1 = ye0 + pwy
                 for kz in range(kzmin, kzmax):
+                    if perz:
+                        # A PERIODIC axis cannot clip the loop bounds above:
+                        # the raw range lives in unwrapped index space, and a
+                        # kernel straddling the boundary lands on BOTH ends of
+                        # the grid — clamping it would silently drop the wrapped
+                        # half. So the slab test is done in WRAPPED index space,
+                        # per cell, and placed before the geometry so a cell
+                        # outside this slab costs one modulo and a compare.
+                        # (This is the piece `prof_slab.py` left unsolved: the
+                        # probe slabs a non-periodic axis only.)
+                        kw = kz % nz
+                        if kw < kz0 or kw >= kz1:
+                            continue
+                    else:
+                        kw = kz
                     ze0 = loz + kz * pwz
                     ze1 = ze0 + pwz
                     # skip cells entirely outside the kernel sphere
                     if _nearest_dist2(xi, yi, zi, xe0, xe1, ye0, ye1, ze0, ze1) >= kr2:
                         continue
-                    kw = kz % nz if perz else kz
                     # cube vertices relative to particle (min-image via raw index)
                     ax0 = xe0 - xi; ax1 = xe1 - xi
                     ay0 = ye0 - yi; ay1 = ye1 - yi
@@ -957,17 +1094,18 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                     frac = _cube_integral(vx, vy, vz, hi, faces)
                     if frac <= 0.0:
                         continue
-                    mass_local[t, iw, jw, kw] += mi * frac
+                    ks = kw - kz0                 # slab-local z index
+                    mass_local[t, iw, jw, ks] += mi * frac
                     if need_w:
                         if not conservative_fields:
-                            den_local[t, iw, jw, kw] += wi * frac
+                            den_local[t, iw, jw, ks] += wi * frac
                         fw = mi if conservative_fields else wi
                         for p in range(K):
-                            num_local[t, iw, jw, kw, p] += fw * vals[i, p] * frac
+                            num_local[t, iw, jw, ks, p] += fw * vals[i, p] * frac
 
 
 def interpolate_uniform_petkova(particles, grid, values=None,
-                                 conservative_fields=False):
+                                 conservative_fields=False, slabs=None):
     """Petkova exact interpolation of `particles` onto a `UniformGrid`.
 
     Returns data: dict[name -> (nx,ny,nz)]. Density-like fields ('rho'/'density')
@@ -977,6 +1115,16 @@ def interpolate_uniform_petkova(particles, grid, values=None,
     ``conservative_fields=True``, non-density fields instead use the exact
     mass fractions: sum_j m_j A_j I / sum_j m_j I, and their raw integrated
     contents are exposed as ``_content_<name>``.
+
+    ``slabs`` caps peak accumulator memory by depositing in G passes over z
+    slabs, each pass allocating accumulators only one slab deep (see
+    `MAX_ACCUM_BYTES`). ``None`` picks G from that cap; an int forces it.
+    Every cell integral is still performed exactly once — the slab clip happens
+    in the cheap bbox loop, BEFORE `_cube_integral` — so only the per-particle
+    setup of a kernel spanning several slabs repeats, which the profile puts at
+    ~0% of the deposit. Measured on `disk` N=200k at 128³ on 12 threads,
+    slabbing is 7-11% FASTER than G=1 (the accumulator slab fits cache better)
+    with mass conservation unchanged to the last digit.
     """
     if not isinstance(grid, UniformGrid):
         raise TypeError("interpolate_uniform_petkova requires a UniformGrid target")
@@ -990,32 +1138,71 @@ def interpolate_uniform_petkova(particles, grid, values=None,
     nthreads = numba.get_num_threads()
     K = vals.shape[1]
     need_w = _needs_weights(names)
-    dshape = ((nx, ny, nz) if need_w and not conservative_fields
+    # float64s accumulated per cell: the mass grid, the kernel-volume
+    # denominator (only when weights are needed and not conservative), and one
+    # per field (only when weights are needed at all).
+    nstreams = 1 + (1 if (need_w and not conservative_fields) else 0) \
+                 + (K if need_w else 0)
+    if slabs is None:
+        nslabs = _slab_count(nthreads, nx, ny, nz, nstreams)
+    else:
+        nslabs = int(slabs)
+        if nslabs < 1:
+            raise ValueError(f"slabs must be >= 1, got {slabs}")
+        nslabs = min(nslabs, nz)
+    edges = _slab_edges(nz, nslabs)
+    ksz = int(np.max(np.diff(edges)))          # deepest slab; the last is short
+
+    dshape = ((nx, ny, ksz) if need_w and not conservative_fields
               else (1, 1, 1))
-    nshape = (nx, ny, nz) if need_w else (1, 1, 1)
-    mass_local = np.zeros((nthreads, nx, ny, nz), dtype=np.float64)
+    nshape = (nx, ny, ksz) if need_w else (1, 1, 1)
+    mass_local = np.zeros((nthreads, nx, ny, ksz), dtype=np.float64)
     den_local = np.zeros((nthreads,) + dshape, dtype=np.float64)
     num_local = np.zeros((nthreads,) + nshape + (K,), dtype=np.float64)
 
-    pos = particles.pos
-    with _chunked():
-        _deposit_petkova_uniform(
-            np.ascontiguousarray(pos[:, 0]),
-            np.ascontiguousarray(pos[:, 1]),
-            np.ascontiguousarray(pos[:, 2]),
-            particles.h, particles.mass, particles.mass / particles.rho, vals,
-            nx, ny, nz, lo[0], lo[1], lo[2], pw[0], pw[1], pw[2],
-            perx, pery, perz, _CUBE_FACES, need_w, conservative_fields,
-            mass_local, den_local, num_local)
-
     mass = np.empty((nx, ny, nz), dtype=np.float64)
-    _reduce_threads(mass_local, mass)
     den = np.zeros((nx, ny, nz), dtype=np.float64)
     num = np.zeros((nx, ny, nz, K), dtype=np.float64)
-    if need_w:
-        if not conservative_fields:
-            _reduce_threads(den_local, den)
-        _reduce_threads(num_local, num)
+
+    pos = particles.pos
+    h_p, m_p, volw_p, vals_p = (particles.h, particles.mass,
+                                particles.mass / particles.rho, vals)
+    order = _balanced_order(len(m_p))
+    if order is not None:
+        pos = pos[order]
+        h_p, m_p, volw_p, vals_p = (h_p[order], m_p[order], volw_p[order],
+                                    np.ascontiguousarray(vals_p[order]))
+    px = np.ascontiguousarray(pos[:, 0])
+    py = np.ascontiguousarray(pos[:, 1])
+    pz = np.ascontiguousarray(pos[:, 2])
+
+    for g in range(nslabs):
+        k0, k1 = int(edges[g]), int(edges[g + 1])
+        nk = k1 - k0
+        if g > 0:                              # pass 0 gets the fresh zeros
+            mass_local[:, :, :, :nk] = 0.0
+            if need_w:
+                if not conservative_fields:
+                    den_local[:, :, :, :nk] = 0.0
+                num_local[:, :, :, :nk, :] = 0.0
+        with _chunked():
+            _deposit_petkova_uniform(
+                px, py, pz, h_p, m_p, volw_p, vals_p,
+                nx, ny, nz, lo[0], lo[1], lo[2], pw[0], pw[1], pw[2],
+                perx, pery, perz, _CUBE_FACES, need_w, conservative_fields,
+                mass_local, den_local, num_local, k0, k1)
+        if nslabs == 1:
+            _reduce_threads(mass_local, mass)
+            if need_w:
+                if not conservative_fields:
+                    _reduce_threads(den_local, den)
+                _reduce_threads(num_local, num)
+        else:
+            _reduce_threads_zslab(mass_local, mass, k0, nk)
+            if need_w:
+                if not conservative_fields:
+                    _reduce_threads_zslab(den_local, den, k0, nk)
+                _reduce_threads_zslab_k(num_local, num, k0, nk)
     cv = grid.cell_volume
     mask = mass > 0.0 if conservative_fields else den > 0.0
 
@@ -1162,12 +1349,19 @@ def interpolate_amr_petkova(particles, grid, values=None,
     num_local = np.zeros((nthreads, nn, K), dtype=np.float64)
 
     pos = particles.pos
+    h_p, m_p, volw_p, vals_p = (particles.h, particles.mass,
+                                particles.mass / particles.rho, vals)
+    order = _balanced_order(len(m_p))
+    if order is not None:
+        pos = pos[order]
+        h_p, m_p, volw_p, vals_p = (h_p[order], m_p[order], volw_p[order],
+                                    np.ascontiguousarray(vals_p[order]))
     with _chunked():
         _deposit_petkova_amr(
             np.ascontiguousarray(pos[:, 0]),
             np.ascontiguousarray(pos[:, 1]),
             np.ascontiguousarray(pos[:, 2]),
-            particles.h, particles.mass, particles.mass / particles.rho, vals,
+            h_p, m_p, volw_p, vals_p,
             grid.cell_lo, grid.cell_size, grid.base_start, grid.base_count,
             blo[0], blo[1], blo[2], bpw[0], bpw[1], bpw[2],
             nbx, nby, nbz, perx, pery, perz, box[0], box[1], box[2],
@@ -1447,10 +1641,19 @@ def interpolate_voronoi_petkova(particles, grid, values=None):
     blo, bw, bstart, border, bradmax = generator_buckets(
         grid.gen[small], rad[small], nb=NB)
     border = small[border] if border.size else border   # bucket CSR -> global ids
+    # NB `order` above is the CELL radius sort; this is a PARTICLE permutation
+    porder = _balanced_order(len(particles.mass))
+    h_p, m_p, volw_p, vals_p = particles.h, particles.mass, volw, vals
+    if porder is not None:
+        px = np.ascontiguousarray(px[porder])
+        py = np.ascontiguousarray(py[porder])
+        pz = np.ascontiguousarray(pz[porder])
+        h_p, m_p, volw_p, vals_p = (h_p[porder], m_p[porder], volw_p[porder],
+                                    np.ascontiguousarray(vals_p[porder]))
     with _chunked():
         _deposit_petkova_voronoi(
             px, py, pz,
-            particles.h, particles.mass, volw, vals,
+            h_p, m_p, volw_p, vals_p,
             gx, gy, gz, rad,
             NB, blo, bw, bstart,
             np.ascontiguousarray(border, dtype=np.int64), bradmax, rmax_s,

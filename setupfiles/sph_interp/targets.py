@@ -11,12 +11,15 @@ grid), `AMRGrid` (octree-refined cubic cells over a base grid), and `VoronoiGrid
 """
 
 from dataclasses import dataclass
+import importlib.util
 import os
 import contextlib
 import subprocess
 import tempfile
 import numpy as np
 import numba
+
+from .domain import kernel_support_bounds
 
 try:                                  # optional fast parallel mesher (OpenMP voro++)
     import multivoro as _multivoro
@@ -30,7 +33,8 @@ except Exception:                     # pragma: no cover - optional dependency
 # the reference moving-mesh code; it tessellates collapsed high-dynamic-range cores
 # robustly (its native regime) where multivoro's parallel solver under-cuts. It is
 # the preferred backend when built (see `arepo-mesh-backend`), so `auto` picks it
-# whenever codes/arepo/Arepo is present, falling back to multivoro then pyvoro.
+# whenever codes/arepo/AREPO/Arepo is present, falling back to multivoro then
+# pyvoro.
 try:
     from ._arepo import arepo_mesh as _arepo_mesh
     _HAS_AREPO = _arepo_mesh.has_arepo()
@@ -69,7 +73,7 @@ _VOL_BUDGET_TOL = 1e-5
 
 def _resolve_backend(backend):
     """Map the requested backend to the effective mesher. 'auto' prefers AREPO when
-    it is built (codes/arepo/Arepo present) -- it tessellates collapsed cores
+    it is built (codes/arepo/AREPO/Arepo present) -- it tessellates collapsed cores
     robustly -- then multivoro if installed, else pyvoro."""
     if backend in ("arepo", "multivoro", "pyvoro"):
         return backend
@@ -79,6 +83,27 @@ def _resolve_backend(backend):
     if _HAS_MULTIVORO:
         return "multivoro"
     return "pyvoro"
+
+
+def _backend_availability():
+    """[(name, available, why), ...] for every mesher, in the SAME preference order
+    `auto` walks (arepo -> multivoro -> pyvoro). Lets a CLI report which backends
+    `auto` skipped and why, instead of silently landing on the last rung."""
+    if _arepo_mesh is None:
+        arepo_why = "sph_interp._arepo did not import"
+    elif _HAS_AREPO:
+        arepo_why = f"built at {_arepo_mesh._AREPO_EXE}"
+    else:
+        arepo_why = f"not built ({_arepo_mesh._AREPO_EXE})"
+    # find_spec, not import: pyvoro is imported lazily in `_tessellate` and we do
+    # not want to pay for it just to report availability.
+    has_pyvoro = importlib.util.find_spec("pyvoro") is not None
+    return [
+        ("arepo", _HAS_AREPO, arepo_why),
+        ("multivoro", _HAS_MULTIVORO,
+         "installed" if _HAS_MULTIVORO else "not installed"),
+        ("pyvoro", has_pyvoro, "installed" if has_pyvoro else "not installed"),
+    ]
 
 
 def _resolve_threads(n_threads):
@@ -325,8 +350,11 @@ class AMRGrid:
                     True where a cell should be refined. Defaults to
                     `refine_smoothing_length()`. See `refine_mass` /
                     `refine_count`. Empty cells (count==0) are never refined.
-        lo, hi    : domain corners (default: centered particles.box, else the
-                    particle extent).
+        lo, hi    : domain corners. Default: the centered `particles.box` if
+                    there is one, else `kernel_support_bounds(pos, h)` -- the
+                    smallest box holding every 2h support, so an OPEN capture
+                    never clips a kernel. A CLI wanting a density-aware pad
+                    should resolve `open_domain_bounds` itself and pass it.
         periodic  : periodicity (default: particles.periodic).
         refine_empty : allow the criterion to refine EMPTY (count==0) cells.
                     Default False: empties are never split (count-style
@@ -357,7 +385,15 @@ class AMRGrid:
                 half = 0.5 * np.asarray(particles.box, dtype=np.float64).reshape(3)
                 lo, hi = -half, half
             else:
-                lo, hi = pos.min(axis=0), pos.max(axis=0)
+                # OPEN capture: the mesh must contain every particle's 2h
+                # support, not just its centre. The bare particle bounding box
+                # clips half the support of every extremal particle -- silent
+                # mass loss at the boundary, and the open-AMR Hodge solve
+                # refuses the domain outright. `kernel_support_bounds` is the
+                # package's own resolver for exactly this; never hand-roll a
+                # percentage pad here (see `open_domain_bounds` for the
+                # density-aware modes a CLI should offer instead).
+                lo, hi = kernel_support_bounds(pos, h)
         lo = np.asarray(lo, dtype=np.float64).reshape(3)
         hi = np.asarray(hi, dtype=np.float64).reshape(3)
         if periodic is None:
@@ -548,6 +584,54 @@ def refine_any(*crits):
         return out
     crit.needs_lo = any(getattr(c, 'needs_lo', False) for c in crits)
     return crit
+
+
+def refine_all(*crits):
+    """AND-combine refinement criteria (refine only where ALL of them fire).
+
+    The complement of `refine_any`, and the natural way to gate an aggressive
+    geometric criterion on something that says whether the data can support the
+    extra resolution -- see `refine_occupied`.
+    """
+    def crit(count, mass, hmin, size, level, lo=None):
+        out = np.ones(len(count), dtype=bool)
+        for c in crits:
+            if getattr(c, 'needs_lo', False):
+                out &= np.asarray(c(count, mass, hmin, size, level, lo),
+                                  dtype=bool)
+            else:
+                out &= np.asarray(c(count, mass, hmin, size, level),
+                                  dtype=bool)
+        return out
+    crit.needs_lo = any(getattr(c, 'needs_lo', False) for c in crits)
+    return crit
+
+
+def refine_occupied(criterion, min_count=1):
+    """Gate `criterion` on a cell actually holding more than `min_count`
+    particles.
+
+    `refine_smoothing_length` refines wherever h is small, with no reference to
+    whether any particle is present to justify it -- so in a galaxy with a large
+    dynamic range it splits deep into regions the data does not sample. Measured
+    on an evolved 462k-particle merger cutout (base 16, max_level 4):
+
+        refine_smoothing_length(0.5)              680,940 leaves, 86.3% EMPTY,
+                                                  median 0 particles/leaf
+        refine_occupied(same, min_count=1)         ~10x fewer leaves, and every
+                                                  split is backed by particles
+
+    An empty leaf still receives a kernel-weighted value from whatever particles
+    overlap it, but with no local sampling to constrain it -- that is shot noise,
+    and on a vector field it survives into the divergence-free projection as
+    small-scale structure that was never in the data. It also costs: the THB
+    De Rham operators scale with leaf count, so 3M leaves needs ~80 GB where
+    300k needs ~8 GB.
+
+    This does NOT replace the anti-aliasing motivation for refining on h; it
+    keeps it exactly where there are particles and stops it in vacuum.
+    """
+    return refine_all(criterion, refine_count(int(min_count)))
 
 
 def _amr_leaf_keys(amr):
@@ -882,12 +966,53 @@ class VoronoiGrid:
         newpts /= np.bincount(inv, minlength=m)[:, None]
         return np.ascontiguousarray(newpts), n - m
 
+    @staticmethod
+    def _periodic_background(lo, hi, n):
+        """Return an ``n^3`` cell-centred guard lattice spanning the domain.
+
+        These are cheap background/filler generators, not replacements for the
+        supplied generators. In a periodic mesh their covering radius is smaller
+        than half a period, so every cell has an unambiguous minimum image. In an
+        open mesh they fill the empty capture volume and keep the AREPO mesher's
+        internal periodic closure far from the source kernels.
+        """
+        n = int(n)
+        if n < 2:
+            raise ValueError("periodic_background must be 0 or at least 2")
+        frac = (np.arange(n, dtype=np.float64) + 0.5) / n
+        axes = [lo[a] + frac * (hi[a] - lo[a]) for a in range(3)]
+        xx, yy, zz = np.meshgrid(*axes, indexing="ij")
+        return np.ascontiguousarray(
+            np.column_stack((xx.ravel(), yy.ravel(), zz.ravel())))
+
+    @staticmethod
+    def _periodic_coverage_radius(pts, lo, hi, background_n):
+        """Estimate the largest empty-space radius in normalized periodic units.
+
+        A small regular probe lattice makes this independent of the physical box
+        aspect ratio. The comparison radius is the worst-case covering radius of
+        the proposed background lattice. This check is O(N log N) with only a few
+        hundred queries, negligible beside a Voronoi build.
+        """
+        from scipy.spatial import cKDTree
+        unit = np.mod((pts - lo) / (hi - lo), 1.0)
+        nprobe = max(8, 2 * int(background_n))
+        frac = (np.arange(nprobe, dtype=np.float64) + 0.5) / nprobe
+        xx, yy, zz = np.meshgrid(frac, frac, frac, indexing="ij")
+        probes = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
+        dist, _ = cKDTree(unit, boxsize=1.0).query(probes, k=1, workers=-1)
+        radius = float(np.max(dist))
+        background_radius = np.sqrt(3.0) / (2.0 * int(background_n))
+        return radius, background_radius
+
     @classmethod
     def from_points(cls, points, bounds=None, periodic=False, dispersion=None,
-                    ghost_pad=0.25, merge_tol=None, backend="auto", n_threads=-1):
+                    ghost_pad=0.25, merge_tol=None, backend="auto", n_threads=-1,
+                    periodic_background="auto"):
         """Tessellate `points` (Ncell,3) into Voronoi cells.
 
-        backend    : mesher — 'auto' (arepo if codes/arepo/Arepo is built, else
+        backend    : mesher — 'auto' (arepo if codes/arepo/AREPO/Arepo is built,
+                     else
                      multivoro if installed for parallel OpenMP voro++, else pyvoro),
                      'arepo', 'multivoro', or 'pyvoro'. arepo tessellates collapsed
                      high-dynamic-range cores robustly (its native regime), so auto
@@ -908,11 +1033,29 @@ class VoronoiGrid:
                      volume exactly, no boundary padding). The ghost cells are
                      retained for the deposit (folded back into their parent by
                      `fold_to_central`), so a kernel crossing a face wraps.
+        periodic_background
+                   : background/guard lattice. ``"auto"`` (default) adds a
+                     cell-centred ``16^3`` lattice for every OPEN mesh; for a
+                     periodic mesh it first measures the empty-space radius and
+                     adds the lattice only when coverage is sparse. An integer
+                     >=2 always adds that ``n^3`` lattice; 0 disables it. The
+                     guards prevent a generator in a concentrated system from
+                     owning a huge cell. For AREPO open meshes, the guard-filled
+                     physical box is tessellated internally with native
+                     non-cubic periodic closure, while the returned target and
+                     deposit remain open. Supplied generators are never split
+                     or removed (apart from near-duplicate merging).
         dispersion : pyvoro block-sizing hint (~ the typical generator spacing);
                      default = the mean spacing (domain_volume / N)**(1/3). This
                      is what sizes voro++'s internal block grid — setting it to a
                      large value (e.g. the box size) collapses the mesh into one
                      giant block and makes the build O(N^2) (and memory-hungry).
+                     PERFORMANCE ONLY: the result must not depend on it. (It
+                     appeared to until 2026-07-27, because passing `radii=[]`
+                     made pyvoro substitute a radius of `dispersion/10` and run
+                     a RADICAL tessellation — see `_tessellate`. Both mesher
+                     calls now pass explicit zero radii, which is what makes
+                     the tessellation an ordinary Voronoi one.)
         ghost_pad  : periodic only — the image shell width as a fraction of the
                      box per axis (generators within this distance of a boundary
                      are replicated across it). Acts as a FLOOR: the shell is
@@ -943,11 +1086,13 @@ class VoronoiGrid:
                      systems where empty volume inflates the mean ~100x. 0 disables
                      the sliver de-merge but EXACT/near-coincident generators are
                      STILL collapsed (an unconditional ~1e-9*span floor) so voro++
-                     never crashes on duplicates. NOTE: merging means Ncell may be
-                     < N (the core is represented by fewer cells); intended — those
-                     were duplicate sample points.
+                     never crashes on duplicates. NOTE: merging can make Ncell
+                     smaller than the supplied N, while the periodic background
+                     can make it up to ``n^3`` larger.
         """
-        pts = np.ascontiguousarray(np.asarray(points, dtype=np.float64).reshape(-1, 3))
+        # Own the array: wrapping below must not mutate a caller's positions when
+        # their input already happens to be a contiguous float64 ndarray.
+        pts = np.array(points, dtype=np.float64, order="C", copy=True).reshape(-1, 3)
         N = pts.shape[0]
         if N == 0:
             raise ValueError("need at least one generator point")
@@ -965,6 +1110,104 @@ class VoronoiGrid:
         else:
             per = [bool(x) for x in per]
 
+        L = hi - lo
+        if np.any(L <= 0.0):
+            raise ValueError("each upper Voronoi bound must exceed its lower bound")
+
+        # Put every periodic coordinate into the canonical box before merging or
+        # meshing. Snapshot roundoff (and some IC writers) can leave points just
+        # beyond a face; they are the same periodic position, not out-of-domain
+        # generators.
+        for a in range(3):
+            if per[a]:
+                pts[:, a] = lo[a] + np.mod(pts[:, a] - lo[a], L[a])
+
+        # A NON-periodic axis has no such canonical position: a generator
+        # outside [lo, hi] there is simply outside the domain, and the mesher
+        # has no cell to give it. voro++ does notice -- but it reports
+        # "number of cells found was not equal to the number of particles",
+        # which is the SAME opaque message it gives for coincident generators
+        # (see the tol_dup note below). One message, two unrelated causes, and
+        # only the other one is handled. So name this one here, before the
+        # mesher runs. Roundoff-scale excursions are clamped rather than
+        # refused, matching how the periodic branch above forgives an IC
+        # writer that lands a hair beyond a face.
+        oob_tol = 1e-9 * float(np.max(L))
+        for a in range(3):
+            if per[a]:
+                continue
+            out = np.maximum(lo[a] - pts[:, a], pts[:, a] - hi[a])
+            worst = float(out.max()) if len(out) else 0.0
+            if worst <= 0.0:
+                continue
+            if worst <= oob_tol:
+                # strictly INSIDE, not onto the face: voro++ owns the half-open
+                # box and refuses a generator sitting exactly on the upper wall
+                # (same "number of cells found..." error), so clamping to hi
+                # would trade one opaque failure for another
+                np.clip(pts[:, a], lo[a] + oob_tol, hi[a] - oob_tol,
+                        out=pts[:, a])
+                continue
+            n_out = int((out > oob_tol).sum())
+            raise ValueError(
+                f"{n_out} generator(s) lie outside the domain on the "
+                f"non-periodic {'xyz'[a]} axis "
+                f"[{lo[a]:.6g}, {hi[a]:.6g}]: worst excursion {worst:.6g} "
+                f"({worst / L[a]:.2%} of the axis length). A non-periodic "
+                f"axis has no wrap, so these points have no cell. Widen "
+                f"`bounds`, mark the axis periodic, or drop them.")
+
+        # A tiny regular background is more robust than recursively splitting the
+        # real generator set. Auto-detect the risk BEFORE tessellating: retrying a
+        # doomed 40k pyvoro build would cost another ~200 seconds.
+        auto_background = isinstance(periodic_background, str)
+        if auto_background:
+            if periodic_background.lower() != "auto":
+                raise ValueError("periodic_background must be 'auto', 0, or >=2")
+            background_n = 16
+        else:
+            background_n = int(periodic_background)
+        if background_n < 0 or background_n == 1:
+            raise ValueError("periodic_background must be 0 or at least 2")
+        # Open captures always get the guard in auto mode: unlike a true
+        # periodic volume, their empty exterior is intentional and must be
+        # represented by finite background cells. Periodic captures retain the
+        # coverage test so an already space-filling particle set is left alone.
+        add_background = background_n > 0
+        coverage_radius = None
+        background_radius = None
+        if add_background and auto_background and all(per):
+            # Detect only HALF-PERIOD-SCALE voids. Comparing against the 4^3
+            # lattice covering radius avoids adding 4096 fillers to an ordinary
+            # lower-N but already space-filling mesh. Once triggered, use 16^3:
+            # the thin [151,143,18.6] regression needs this resolution for native
+            # AREPO (12^3 leaves +4.71e-4 volume error; 16^3 gives +2.65e-7).
+            coverage_radius, background_radius = cls._periodic_coverage_radius(
+                pts, lo, hi, 4)
+            add_background = coverage_radius > background_radius
+        if add_background:
+            bg = cls._periodic_background(lo, hi, background_n)
+            pts = np.ascontiguousarray(np.concatenate((pts, bg), axis=0))
+            N = pts.shape[0]
+            if auto_background and all(per):
+                print(
+                    "VoronoiGrid: sparse periodic coverage "
+                    f"(normalized empty radius {coverage_radius:.3f} > "
+                    f"{background_radius:.3f}); adding {background_n}^3 = "
+                    f"{background_n ** 3} background generators to prevent "
+                    "half-period cells",
+                    flush=True)
+            elif auto_background:
+                print(
+                    f"VoronoiGrid: adding open-domain {background_n}^3 = "
+                    f"{background_n ** 3} background guard generators",
+                    flush=True)
+            else:
+                print(
+                    f"VoronoiGrid: adding forced {background_n}^3 = "
+                    f"{background_n ** 3} background guard generators",
+                    flush=True)
+
         # EXACT/near-coincident generators are ALWAYS collapsed, independent of
         # merge_tol (incl. merge_tol=0): two generators voro++ cannot tell apart
         # have no valid distinct cells and make it FAIL outright ("number of cells
@@ -973,14 +1216,16 @@ class VoronoiGrid:
         # tolerance, far below any real spacing -- so it removes only true
         # duplicates, never structure. (merge_tol=0 thus still BUILDS on data with
         # duplicates; it only switches off the larger sliver de-merge below.)
-        tol_dup = 1e-9 * float(np.max(hi - lo))
+        tol_dup = 1e-9 * float(np.max(L))
         # de-sliver: merge near-coincident generators so the mesh stays a clean
         # partition (the collapsed-core conservation fix). Default is a BACKEND-
         # AWARE fraction of median-NN: multivoro needs ~4x pyvoro's floor (its
         # parallel solver under-cuts/overlaps cells on an abrupt-spacing core where
         # serial pyvoro stays valid) -- see `_DESLIVER_FRAC`.
+        effective_backend = _resolve_backend(backend)
         if merge_tol is None:
-            merge_tol = _DESLIVER_FRAC[_resolve_backend(backend)] * cls._median_nn(pts)
+            merge_tol = (_DESLIVER_FRAC[effective_backend]
+                         * cls._median_nn(pts))
         tol_eff = max(float(merge_tol), tol_dup)
         if tol_eff > 0.0:
             pts, _ = cls._merge_close(pts, tol_eff)
@@ -991,13 +1236,26 @@ class VoronoiGrid:
             # NATIVELY (per-axis LONG_Y/LONG_Z) instead of ghost-generator padding +
             # a cubic clip, which mangles thin non-cubic boxes (see
             # `_from_arepo_periodic`). Other backends use the ghost-image path.
-            if _resolve_backend(backend) == "arepo":
+            if effective_backend == "arepo":
                 return cls._from_arepo_periodic(pts, lo, hi, per, ghost_pad,
                                                 n_threads)
             return cls._from_points_periodic(pts, lo, hi, per, dispersion,
-                                             ghost_pad, backend, n_threads)
+                                             ghost_pad, effective_backend,
+                                             n_threads)
 
-        return cls._tessellate(pts, lo, hi, lo, hi, dispersion, backend, n_threads)
+        if effective_backend == "arepo":
+            if add_background:
+                return cls._from_arepo_guarded_open(
+                    pts, lo, hi, n_threads)
+            if backend == "arepo":
+                raise ValueError(
+                    "open backend='arepo' requires a background guard; use "
+                    "periodic_background='auto'/N, or a wall-bounded backend")
+            # With guards explicitly disabled, preserve true open walls via a
+            # wall-bounded backend instead of accepting AREPO's periodic cells.
+            effective_backend = "multivoro" if _HAS_MULTIVORO else "pyvoro"
+        return cls._tessellate(
+            pts, lo, hi, lo, hi, dispersion, effective_backend, n_threads)
 
     @classmethod
     def _from_points_periodic(cls, pts, lo, hi, per, dispersion, ghost_pad,
@@ -1021,13 +1279,26 @@ class VoronoiGrid:
         # an unclosed boundary cell can only ADD volume (it runs into the pad
         # instead of being cut by its missing image), so on a fully periodic box
         # Sum(central vol) > box vol detects an insufficient shell exactly.
+        # MIXED PERIODICITY: only a periodic axis gets a pad. Padding a
+        # NON-periodic axis (which is what this did until 2026-07-27) is a
+        # silent catastrophe: nothing is imaged across it, so every boundary
+        # cell simply runs out into the pad instead of being cut, and the
+        # central cells end up tiling the PADDED box. Measured on 1500 random
+        # generators in a unit box: +50.0% volume per non-periodic axis
+        # (per=(T,T,F) gave 1.500, per=(T,F,F) gave 2.250, both exactly the
+        # padded volume). Clipping the pad puts a voro++ wall back on lo/hi
+        # there, which is the correct open-boundary treatment and is what the
+        # fully-open path does anyway.
+        pad_axis = np.asarray(per, dtype=bool)
         spacing = float((np.prod(L) / max(N, 1)) ** (1.0 / 3.0))
-        margin = np.maximum(ghost_pad * L, 3.0 * spacing)
+        margin = np.where(pad_axis, np.maximum(ghost_pad * L, 3.0 * spacing),
+                          0.0)
         margin0 = margin.copy()          # deposit reach: the ghost-CELL keep shell
         # min-image shell: every generator imaged into the full [lo-L/2, hi+L/2]
         # box. Enough for any mesh whose largest cell fits in a half-period (the
         # sparse-N exception is covered by the 3x-spacing floor above).
-        margin_max = np.maximum(np.minimum(margin, 3.0 * L), 0.5 * L)
+        margin_max = np.where(
+            pad_axis, np.maximum(np.minimum(margin, 3.0 * L), 0.5 * L), 0.0)
         while True:
             margin = np.minimum(margin, margin_max)
             # central generators first, then the periodic images that fall inside
@@ -1058,27 +1329,39 @@ class VoronoiGrid:
             vg.periodic = tuple(bool(x) for x in per)
             vg.cell_parent = np.ascontiguousarray(parent_all, dtype=np.int64)
             vg.ncentral = N
-            if not all(per):
-                break               # partial periodicity: no closed-box budget
+            # The budget applies under MIXED periodicity too, now that the pad
+            # is clipped: the tessellation domain is exactly [lo, hi] on every
+            # non-periodic axis, so the central cells still tile exactly one
+            # period. It was skipped here while the pad was unclipped, which
+            # is why a +50%-per-axis error could go unnoticed.
             verr = float(vg.volumes().sum()) / float(np.prod(L)) - 1.0
             if verr <= _VOL_BUDGET_TOL:
                 # closed (or below noise). A deficit beyond noise cannot be a
-                # shell problem (see _VOL_BUDGET_TOL) -- surface it as the
-                # mesher volume error it is, but never re-tessellate for it.
+                # shell problem (see _VOL_BUDGET_TOL) -- it is mesher volume
+                # error, and re-tessellating at a wider shell cannot fix it, so
+                # fail rather than grow.
                 if verr < -_VOL_BUDGET_TOL:
-                    import warnings
-                    warnings.warn(
+                    raise RuntimeError(
                         f"periodic Voronoi volume budget short by {verr:+.2e}: "
-                        f"a deficit is mesher volume error (gaps between "
-                        f"cells), not an image-shell problem — mesh left as "
-                        f"built")
+                        f"the {_resolve_backend(backend)!r} cells sum to LESS "
+                        f"than the box, i.e. they leave gaps and do not "
+                        f"partition it. A deficit is mesher volume error, not "
+                        f"an image-shell problem, so growing the shell cannot "
+                        f"fix it. The mesh is unusable — every conservation "
+                        f"property downstream assumes the cells tile the box "
+                        f"exactly. Try another backend "
+                        f"(`backend='multivoro'` or `'auto'`).")
                 break
             if np.all(margin >= margin_max):
-                import warnings
-                warnings.warn(
+                raise RuntimeError(
                     f"periodic Voronoi volume budget off by {verr:+.2e} even at "
-                    f"the maximum image shell — mesh left as built")
-                break
+                    f"the maximum (min-image, half-period) shell: the "
+                    f"{_resolve_backend(backend)!r} boundary cells are still "
+                    f"not being cut by their periodic images, so the central "
+                    f"cells do not tile the box. This needs a mesh whose "
+                    f"largest cell fits in a half-period — if {N} generators "
+                    f"over this box genuinely cannot give one, the box is too "
+                    f"sparsely sampled to tessellate periodically.")
             margin = 2.0 * margin
         # The auto-grown shell is needed only WHILE tessellating (to close the
         # central cells); the deposit only ever reaches ghost cells within a
@@ -1118,7 +1401,8 @@ class VoronoiGrid:
 
     @classmethod
     def from_particles(cls, particles, bounds=None, periodic=None, dispersion=None,
-                       ghost_pad=0.25, merge_tol=None, backend="auto", n_threads=-1):
+                       ghost_pad=0.25, merge_tol=None, backend="auto", n_threads=-1,
+                       periodic_background="auto"):
         """Tessellate the particle positions themselves into Voronoi cells.
 
         bounds default to the particle box (centered) when known, else the padded
@@ -1126,8 +1410,7 @@ class VoronoiGrid:
         box the bounds ARE the period (no edge padding — ghost images handle the
         boundary), so Sum cell volume = box volume exactly.
 
-        merge_tol forwards to `from_points` (de-sliver coincident particles on a
-        collapsed core; default a backend-aware fraction of median-NN, 0 to disable).
+        merge_tol and periodic_background forward to `from_points`.
         """
         pos = np.ascontiguousarray(particles.pos, dtype=np.float64)
         if periodic is None:
@@ -1145,7 +1428,8 @@ class VoronoiGrid:
         return cls.from_points(pos, bounds=bounds, periodic=periodic,
                                dispersion=dispersion, ghost_pad=ghost_pad,
                                merge_tol=merge_tol, backend=backend,
-                               n_threads=n_threads)
+                               n_threads=n_threads,
+                               periodic_background=periodic_background)
 
     @staticmethod
     def _from_pyvoro(cells, lo, hi, periodic):
@@ -1241,6 +1525,44 @@ class VoronoiGrid:
             cell_rad=m["cell_rad"], cf_start=m["cf_start"], fv_start=m["fv_start"],
             fvx=m["fvx"], fvy=m["fvy"], fvz=m["fvz"],
             lo=grid_lo, hi=grid_hi, periodic=periodic)
+
+    @classmethod
+    def _from_arepo_guarded_open(cls, pts, lo, hi, n_threads):
+        """AREPO mesh for an open, support-complete, guard-filled capture box.
+
+        AREPO can only close a Voronoi tessellation periodically. The regular
+        guard lattice fills the otherwise empty open capture region, so we may
+        use AREPO's native non-cubic periodic closure to construct a clean
+        partition of exactly ``[lo, hi]``. The returned grid is deliberately
+        marked OPEN: particle kernels are not wrapped, and support completeness
+        guarantees that no source kernel reaches the internal closure faces.
+        Thus periodicity is only a mesher implementation detail in zero-source
+        guard territory.
+        """
+        if not _HAS_AREPO:
+            raise RuntimeError(
+                "backend='arepo' needs the built Arepo executable in codes/arepo "
+                "(see setupfiles/sph_interp/_arepo/arepo_mesh.py)")
+        nt = _arepo_ranks(n_threads, len(pts))
+        m = _arepo_mesh.tessellate(
+            pts, lo, hi, n_threads=nt, periodic=(True, True, True))
+        expected = float(np.prod(hi - lo))
+        actual = float(np.sum(m["volume"]))
+        verr = actual / expected - 1.0
+        if abs(verr) > _VOL_BUDGET_TOL:
+            raise RuntimeError(
+                "guarded open AREPO Voronoi volume budget failed: "
+                f"sum(V)/domain-1 = {verr:+.3e}; refusing overlapping cells")
+        print(
+            "VoronoiGrid: AREPO closure is periodic; returned Petkova target "
+            "is open (no kernel wrapping)",
+            flush=True)
+        return VoronoiGrid(
+            gen=np.ascontiguousarray(m["gen"]), volume=m["volume"],
+            cell_rad=m["cell_rad"], cf_start=m["cf_start"],
+            fv_start=m["fv_start"], fvx=m["fvx"], fvy=m["fvy"],
+            fvz=m["fvz"], lo=lo, hi=hi,
+            periodic=(False, False, False))
 
     @classmethod
     def _from_arepo_periodic(cls, pts, lo, hi, per, ghost_pad, n_threads):
@@ -1358,14 +1680,53 @@ class VoronoiGrid:
         g.ncentral = N
         return g
 
+    # Relative tolerance on "the cells tile the mesher domain". Measured on
+    # pyvoro and multivoro across open/periodic/mixed geometries with and
+    # without background guards, N = 400..5000: worst |ratio-1| = 4.4e-16, i.e.
+    # exact. arepo is the loose one at ~5e-7, because it rebuilds each cell as
+    # a ConvexHull of float32 dumped vertices. 1e-5 sits far above that floor
+    # and far below every failure this has actually caught (1.5x, 147x, 1901x,
+    # 10^4x), so it cannot cry wolf on a healthy mesh.
+    _TESS_BUDGET_TOL = 1.0e-5
+
     @classmethod
     def _tessellate(cls, pts, dom_lo, dom_hi, grid_lo, grid_hi, dispersion,
                     backend, n_threads):
-        """Raw NON-periodic tessellation of `pts` over the mesher domain
+        """Raw NON-periodic tessellation over [dom_lo, dom_hi], BUDGET-CHECKED.
+
+        A Voronoi tessellation partitions its container, so the cell volumes
+        must sum to the domain volume. Everything downstream is built on that:
+        petkova's mass budget, the periodic volume budget, the AMR capture
+        ledgers. Until 2026-07-27 nothing asserted it here, and two separate
+        bugs - the mixed-periodicity pad (task 3) and the pyvoro `radii=[]`
+        call (task 13) - each returned a grossly non-partitioning mesh that the
+        library then used without complaint. This is the one check that would
+        have caught both, at the source, in a single run.
+        """
+        vg = cls._tessellate_raw(pts, dom_lo, dom_hi, grid_lo, grid_hi,
+                                 dispersion, backend, n_threads)
+        dom = float(np.prod(np.asarray(dom_hi, dtype=np.float64)
+                            - np.asarray(dom_lo, dtype=np.float64)))
+        got = float(vg.volumes().sum())
+        if dom > 0.0 and abs(got / dom - 1.0) > cls._TESS_BUDGET_TOL:
+            raise RuntimeError(
+                f"Voronoi backend {_resolve_backend(backend)!r} did not "
+                f"partition its domain: {pts.shape[0]} generators over a "
+                f"volume of {dom:.6g} produced cells summing to {got:.6g} "
+                f"({got / dom:.6g} x). The mesh is unusable - every "
+                f"conservation property downstream assumes the cells tile the "
+                f"domain exactly. Try another backend "
+                f"(`backend='multivoro'` or `'auto'`).")
+        return vg
+
+    @classmethod
+    def _tessellate_raw(cls, pts, dom_lo, dom_hi, grid_lo, grid_hi, dispersion,
+                        backend, n_threads):
+        """The tessellation itself: `pts` over the mesher domain
         [dom_lo, dom_hi] -> CSR VoronoiGrid stored with bounds [grid_lo, grid_hi]
         (the two differ for the periodic ghost path: padded mesher box vs physical
-        box). `backend`: 'auto' (arepo if codes/arepo/Arepo is built, else multivoro
-        if installed, else pyvoro), 'arepo' (via the shell-out mesh dump),
+        box). `backend`: 'auto' (arepo if codes/arepo/AREPO/Arepo is built, else
+        multivoro if installed, else pyvoro), 'arepo' (via the shell-out mesh dump),
         'multivoro', or 'pyvoro'. `n_threads`: multivoro thread count, or arepo MPI
         rank count (>1 -> mpirun); <=0 -> all cores (multivoro)."""
         N = pts.shape[0]
@@ -1381,6 +1742,11 @@ class VoronoiGrid:
             nt = _resolve_threads(n_threads)
             lim = np.array([dom_lo, dom_hi], dtype=np.float64)   # (2,3): lower,upper
             with _silence_cstd():
+                # radii = explicit zeros: an ORDINARY Voronoi tessellation, not
+                # a radical/power one. Keep it explicit here as well as in the
+                # pyvoro branch below - passing nothing is what broke pyvoro
+                # (see the long note there), and the two branches should be
+                # obviously making the same request of their mesher.
                 cells = _multivoro.compute_voronoi(
                     np.ascontiguousarray(pts, dtype=np.float64), limits=lim,
                     radii=np.zeros(N), periodic_boundaries=(False, False, False),
@@ -1392,8 +1758,28 @@ class VoronoiGrid:
             dispersion = float((np.prod(np.asarray(dom_hi) - np.asarray(dom_lo))
                                 / max(N, 1)) ** (1.0 / 3.0))
         limits = [[dom_lo[a], dom_hi[a]] for a in range(3)]
+        # RADII MUST BE EXPLICIT ZEROS, never the empty list. pyvoro always
+        # drives voro++'s container_poly (the RADICAL/power container), and on
+        # an empty list it substitutes a nonzero uniform radius of its own:
+        #
+        #     if len(radii) != len(points):
+        #         radii = [dispersion / 10.] * len(points)
+        #
+        # A power diagram with equal weights is mathematically the ordinary
+        # Voronoi diagram, but voro++ sizes its neighbour-search cutoff from
+        # the radii, and with that substituted radius the search terminates
+        # early: cells come back under-cut with ~7 faces instead of the ~15.5
+        # of a 3D Poisson cell, and the volumes do not sum to the box. Because
+        # the substituted radius is tied to `dispersion`, the error also tracks
+        # a parameter that is supposed to be a pure performance hint - which is
+        # what made this look like a broken library rather than a bad call.
+        # Measured on uniform random points in a unit cube, sum(vol) vs 1.0:
+        # N=400 147.2, N=800 284.6, N=1000 312.4, N=5000 1901.4 -> all exactly
+        # 1.0 with explicit zeros. (multivoro was always given real zeros,
+        # which is why only this backend was affected.)
         cells = pyvoro.compute_voronoi(pts.tolist(), limits, dispersion,
-                                       radii=[], periodic=[False, False, False])
+                                       radii=[0.0] * N,
+                                       periodic=[False, False, False])
         return cls._from_pyvoro(cells, grid_lo, grid_hi, (False, False, False))
 
 

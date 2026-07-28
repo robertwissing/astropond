@@ -113,6 +113,7 @@ def from_tipsy(snap, fields=("rho",), nsmooth=64, periodic=True, box=None):
         h = smth.getsmooth2(mass, rho, nsmooth)
     h = np.asarray(h, dtype=np.float64).ravel()[:ngas]
 
+    inferred_box = False
     if box is None:
         box = _read_param_box(snap)          # gasoline .param dxPeriod (preferred)
     if box is None:
@@ -121,6 +122,7 @@ def from_tipsy(snap, fields=("rho",), nsmooth=64, periodic=True, box=None):
         lo = pos.min(axis=0)
         hi = pos.max(axis=0)
         box = hi - lo
+        inferred_box = True
 
     # The gasoline .param bPeriodic is authoritative for periodicity (as the box
     # above is for the period): an isolated IC (bPeriodic=0, e.g. evrard) must NOT
@@ -129,6 +131,23 @@ def from_tipsy(snap, fields=("rho",), nsmooth=64, periodic=True, box=None):
     pp = read_param_periodic(snap)
     if pp is not None:
         periodic = pp
+
+    # An INFERRED box is the particle EXTENT, which is a poor period: the two
+    # extreme particles then sit exactly one period apart, i.e. on top of each
+    # other under the minimum image, and everything within a kernel of a face
+    # wraps onto the opposite face that no particle actually reaches. Harmless
+    # for an isolated run (nothing consults the period), wrong for a periodic
+    # one — and it only happens when neither the .param nor the .log gave a
+    # period, so the caller has no way to know it is being guessed at.
+    if inferred_box and (periodic if np.isscalar(periodic) else any(periodic)):
+        import warnings
+        warnings.warn(
+            f"from_tipsy({snap!r}): no dxPeriod in the .param and no BOX "
+            f"PARAMETERS in the .log, so the period was inferred from the "
+            f"particle extent ({np.array2string(np.asarray(box), precision=4)})"
+            f" while the run is periodic. That makes the extreme particles "
+            f"coincident under the minimum image. Pass box=... explicitly.",
+            stacklevel=2)
 
     col = {"rho": 7, "t": 8, "temp": 8, "vx": 4, "vy": 5, "vz": 6,
            "metals": 10, "phi": 11}

@@ -17,13 +17,17 @@ analog of `from_tipsy`.
 """
 
 from .particles import Particles, from_tipsy
-from .domain import OPEN_PADDING_MODES, open_domain_bounds
+from .domain import (OPEN_PADDING_MODES, open_domain_bounds,
+                     cubic_domain_bounds, kernel_support_bounds)
 from .targets import (UniformGrid, AMRGrid, VoronoiGrid, Projection2D,
                       refine_smoothing_length, refine_mass, refine_count,
-                      refine_band, refine_any, grade_2to1)
+                      refine_band, refine_any, refine_all, refine_occupied,
+                      grade_2to1)
 from .interpolate import interpolate, GridResult
 from .export import (to_cell_table, to_structured_array, to_ramses,
                      to_arepo, particles_to_arepo,
+                     to_polaris, read_polaris, polaris_data_ids,
+                     POLARIS_DATA_IDS, POLARIS_GRID_ID_OCTREE,
                      RAMSES_HYDRO_VARS, RAMSES_MHD_VARS)
 from .solenoidal import project_solenoidal, project_solenoidal_open
 from .magnetic import (FaceMagneticTable, capture_periodic_face_field,
@@ -49,16 +53,22 @@ from .spline_derham import (SplineDeRham, spline_derham_curl,
                             curl_coeffs, div_coeffs)
 from .kernels import wkernel, cnorm3D
 from .visualise import (visualise, field_image, sample_at_particles,
-                        draw_cells, draw_cells_3d)
+                        draw_cells, draw_cells_3d,
+                        density_pdf_panel, grid_vs_particle_panel)
+from . import synthetic
 
 __all__ = [
     "Particles", "from_tipsy", "OPEN_PADDING_MODES", "open_domain_bounds",
+    "cubic_domain_bounds", "kernel_support_bounds",
     "UniformGrid", "AMRGrid", "VoronoiGrid", "Projection2D",
     "refine_smoothing_length", "refine_mass", "refine_count",
-    "refine_band", "refine_any", "grade_2to1",
+    "refine_band", "refine_any", "refine_all", "refine_occupied",
+    "grade_2to1",
     "interpolate", "GridResult",
     "to_cell_table", "to_structured_array", "to_ramses",
     "to_arepo", "particles_to_arepo",
+    "to_polaris", "read_polaris", "polaris_data_ids",
+    "POLARIS_DATA_IDS", "POLARIS_GRID_ID_OCTREE",
     "RAMSES_HYDRO_VARS", "RAMSES_MHD_VARS", "project_solenoidal",
     "project_solenoidal_open",
     "FaceMagneticTable", "capture_periodic_face_field",
@@ -77,5 +87,6 @@ __all__ = [
     "SplineDeRham", "spline_derham_curl", "curl_coeffs", "div_coeffs",
     "wkernel", "cnorm3D",
     "visualise", "field_image", "sample_at_particles", "draw_cells",
-    "draw_cells_3d",
+    "draw_cells_3d", "density_pdf_panel", "grid_vs_particle_panel",
+    "synthetic",
 ]

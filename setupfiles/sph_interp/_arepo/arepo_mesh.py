@@ -26,15 +26,19 @@ Dump files (RestartFlag 14, little-endian, in OutputDir):
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import numpy as np
 
 from .arepo_param import write_mesh_param
 
 _HERE = os.path.dirname(__file__)
-# Arepo executable lives in the repo at codes/arepo/Arepo (built with the periodic,
-# HDF5, OUTPUT_VOLUME config; SYSTYPE "stornext").
-_AREPO_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "..", "codes", "arepo"))
+# The public checkout lives below codes/arepo/AREPO and build_arepo.sh leaves
+# executables inside that checkout. Keeping `AREPO/` and `Arepo` beside one
+# another is impossible on the default case-insensitive macOS filesystem.
+_AREPO_ROOT = os.path.normpath(
+    os.path.join(_HERE, "..", "..", "..", "codes", "arepo"))
+_AREPO_DIR = os.path.join(_AREPO_ROOT, "AREPO")
 _AREPO_EXE = os.path.join(_AREPO_DIR, "Arepo")
 
 # Non-cubic PERIODIC boxes need AREPO's per-axis periods baked in at COMPILE time
@@ -134,6 +138,71 @@ def has_arepo():
     return os.path.isfile(_AREPO_EXE) and os.access(_AREPO_EXE, os.X_OK)
 
 
+def _missing_shared_libraries(exe):
+    """Absolute shared-library dependencies that no longer exist.
+
+    Homebrew keeps the stable ``opt`` directory but changes a library's ABI
+    filename on upgrades (for example HDF5 ``310`` -> ``320``).  A previously
+    built AREPO then still looks executable while dyld cannot launch it.
+    """
+    if not os.path.isfile(exe):
+        return []
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["otool", "-L", exe], capture_output=True, text=True,
+                timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        missing = []
+        for line in result.stdout.splitlines()[1:]:
+            library = line.strip().split(" (compatibility version", 1)[0]
+            # Current macOS keeps Apple libraries in the dyld shared cache, so
+            # /usr/lib entries can launch even though stat() cannot see them.
+            apple_library = library.startswith(("/usr/lib/", "/System/"))
+            if (os.path.isabs(library) and not apple_library
+                    and not os.path.exists(library)):
+                missing.append(library)
+        return missing
+    if sys.platform.startswith("linux"):
+        try:
+            result = subprocess.run(
+                ["ldd", exe], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return [line.strip().split(" => not found", 1)[0]
+                for line in result.stdout.splitlines()
+                if " => not found" in line]
+    return []
+
+
+def _run_arepo_build(exe, config, build_dir, reason):
+    """Build/relink one AREPO executable and verify its runtime dependencies."""
+    helper = os.path.join(_AREPO_ROOT, "build_arepo.sh")
+    if not os.path.isfile(helper):
+        raise RuntimeError(
+            f"AREPO executable is unusable ({reason}), and build helper "
+            f"{helper} is missing")
+    env = os.environ.copy()
+    env.update(AREPO_CONFIG=os.path.basename(config),
+               AREPO_BUILD_DIR=build_dir,
+               AREPO_EXEC=os.path.basename(exe),
+               AREPO_REBUILD="1",
+               JOBS=str(os.cpu_count() or 4))
+    result = subprocess.run(
+        [helper], cwd=_AREPO_ROOT, env=env, capture_output=True, text=True)
+    missing = _missing_shared_libraries(exe)
+    if (result.returncode != 0 or not os.path.isfile(exe)
+            or not os.access(exe, os.X_OK) or missing):
+        detail = (result.stderr or result.stdout)[-2000:]
+        if missing:
+            detail += "\nstill missing: " + ", ".join(missing)
+        raise RuntimeError(
+            f"failed to rebuild AREPO ({reason}):\n{detail.strip()}")
+    print(f"  rebuilt AREPO ({reason}) -> {exe}")
+    return exe
+
+
 def _aspect_tag(ly, lz):
     """Aspect tag matching runtest.sh: '%.4f_%.4f' % (LY, LZ) with '.'->'p'."""
     return ("%.4f_%.4f" % (ly, lz)).replace(".", "p")
@@ -148,28 +217,33 @@ def _ensure_arepo_binary(ly, lz):
         if not has_arepo():
             raise RuntimeError("backend='arepo' needs the built Arepo executable "
                                "at %s" % _AREPO_EXE)
+        missing = _missing_shared_libraries(_AREPO_EXE)
+        if missing:
+            config = os.path.join(_AREPO_DIR, "Config.sh")
+            return _run_arepo_build(
+                _AREPO_EXE, config, "build",
+                "missing " + ", ".join(missing))
         return _AREPO_EXE
     tag = _aspect_tag(ly, lz)
     exe = os.path.join(_AREPO_DIR, "Arepo_asp%s" % tag)
-    if os.path.isfile(exe) and os.access(exe, os.X_OK):
-        return exe
     base_cfg = os.path.join(_AREPO_DIR, "Config.sh")
     if not os.path.isfile(base_cfg):
         raise RuntimeError("cannot build Arepo_asp%s: %s missing" % (tag, base_cfg))
     cfg = os.path.join(_AREPO_DIR, "Config_asp%s.sh" % tag)
-    with open(base_cfg) as f:
-        cfg_txt = f.read()
-    with open(cfg, "w") as f:
-        f.write(cfg_txt)
-        f.write("\nLONG_Y=%.10g\nLONG_Z=%.10g\n" % (ly, lz))
-    r = subprocess.run(["make", "-j", str(os.cpu_count() or 4),
-                        "CONFIG=Config_asp%s.sh" % tag,
-                        "BUILD_DIR=build_asp%s" % tag, "EXEC=Arepo_asp%s" % tag],
-                       cwd=_AREPO_DIR, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.isfile(exe):
-        raise RuntimeError("failed to build Arepo_asp%s (LONG_Y=%.10g LONG_Z=%.10g):"
-                           "\n%s" % (tag, ly, lz, r.stderr[-1500:]))
-    return exe
+    missing = (_missing_shared_libraries(exe)
+               if os.path.isfile(exe) and os.access(exe, os.X_OK) else [])
+    if os.path.isfile(exe) and os.access(exe, os.X_OK) and not missing:
+        return exe
+    if not os.path.isfile(cfg):
+        with open(base_cfg) as f:
+            cfg_txt = f.read()
+        with open(cfg, "w") as f:
+            f.write(cfg_txt)
+            f.write("\nLONG_Y=%.10g\nLONG_Z=%.10g\n" % (ly, lz))
+    reason = ("missing " + ", ".join(missing) if missing
+              else "aspect-ratio binary not built")
+    return _run_arepo_build(
+        exe, cfg, "build_asp%s" % tag, reason)
 
 
 def _write_snapshot(path, pts, boxsize):
@@ -254,10 +328,7 @@ def tessellate(pts, dom_lo, dom_hi, n_threads=1, keep=False, periodic=None,
     else:
         # LEGACY cubic clip (ghost-image path meshes the padded set here).
         box = np.full(3, float(np.max(dom_hi - dom_lo)))
-        exe = _AREPO_EXE
-        if not has_arepo():
-            raise RuntimeError("backend='arepo' needs the built Arepo executable "
-                               "at %s" % _AREPO_EXE)
+        exe = _ensure_arepo_binary(1.0, 1.0)
         boxsize = float(box[0])
     shifted = np.ascontiguousarray(pts, dtype=np.float64) - dom_lo
     # keep strictly inside (0, box_axis) -- AREPO rejects points on/over the face
@@ -304,12 +375,15 @@ def tessellate(pts, dom_lo, dom_hi, n_threads=1, keep=False, periodic=None,
     fcoord = verts[allidx]                                   # (totfv,3) gathered
     # per-face generator (cellID = ParticleID = shifted index + 1)
     face_g = shifted[fcell - 1]                              # (nface,3)
-    # rigid per-face unwrap: shift each face by the image bringing its centroid to gen
-    fcen = np.add.reduceat(fcoord, fstart[:-1], axis=0) / flens[:, None]  # (nface,3)
-    # per-axis min-image unwrap (box is (3,): cubic L in the legacy path, the
-    # physical per-axis period in the native periodic path).
-    fshift = box * np.round((fcen - face_g) / box)           # (nface,3)
-    fcoord_uw = fcoord - np.repeat(fshift, flens, axis=0)    # unwrapped coords
+    # Unwrap EACH vertex to the minimum image around its cell generator. A face
+    # crossing a periodic boundary can contain raw vertices on opposite stored
+    # images, so shifting the whole face from its arithmetic centroid chooses the
+    # wrong image on thin boxes. This vertex-wise form is unambiguous while every
+    # cell spans less than half a period (enforced for sparse meshes by
+    # VoronoiGrid's periodic background). `box` is per-axis for the native path.
+    vertex_g = np.repeat(face_g, flens, axis=0)
+    delta = fcoord - vertex_g
+    fcoord_uw = fcoord - box * np.round(delta / box)
 
     # group vertices by CELL ID (a Voronoi cell is the convex hull of ALL its
     # vertices, so gathering them across however many rank-blocks reconstructs it)

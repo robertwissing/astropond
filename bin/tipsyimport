@@ -1,0 +1,158 @@
+#!/bin/bash
+# tipsyimport: convert another code's OUTPUT back into gasoline/tipsy snapshots.
+#
+# The reverse of tipsyexport, over the setupfiles/ICconvert_*totipsy.py
+# converters. These read a finished RUN (a directory or series of snapshots),
+# not a single IC, and write one tipsy snapshot per dump plus the usual aux
+# files and a gasoline-style .log, so the analysis pipeline can read them.
+#
+# usage: tipsyimport <input> <output> <idx_interval> [paramfile] --format FMT
+#        tipsyimport --list-formats
+#        tipsyimport --format ramses --help
+#
+#   tipsyimport arepo_run/    run_arepo  10 --format arepo
+#   tipsyimport gizmo_run/    run_gizmo  10 --format gizmo run.param
+#   tipsyimport ramses_run/   run_ram    10 run.param --format ramses
+#   tipsyimport sphexa_run.h5 run_exa    10 --format sphexa
+#
+# idx_interval sets the output numbering: snapshot N becomes
+# <output>.<(N+1)*idx_interval>, so pick it to match the gasoline cadence
+# (10 -> .00010, .00020, ...). Outputs land as <output>/<output>.<idx>.
+#
+# The paramfile is REQUIRED for athena and ramses (they need the gasoline units
+# and box to reconstruct T and h) and optional for the GADGET-family readers.
+#
+# See also: tipsyexport (tipsy -> another code's IC).
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script_for() {
+    case $1 in
+        arepo)       echo "ICconvert_arepototipsy.py" ;;
+        athena)      echo "ICconvert_athenatotipsy.py" ;;
+        gizmo)       echo "ICconvert_gizmototipsy.py" ;;
+        opengadget3) echo "ICconvert_opengadget3totipsy.py" ;;
+        phantom)     echo "ICconvert_phantomtotipsy.py" ;;
+        pkdgrav3)    echo "ICconvert_pkdgrav3totipsy.py" ;;
+        ramses)      echo "ICconvert_ramsestotipsy.py" ;;
+        sphexa)      echo "ICconvert_sphexatotipsy.py" ;;
+        *)           echo "" ;;
+    esac
+}
+
+# formats whose converter REQUIRES the trailing paramfile
+needs_param() {
+    case $1 in athena|ramses) return 0 ;; *) return 1 ;; esac
+}
+
+list_formats() {
+    cat <<'EOF'
+FORMAT       INPUT is           READS                             PARAMFILE
+-----------  -----------------  --------------------------------  ---------
+arepo        run dir            snap_NNN.hdf5 (PartType0 + MHD)   no
+athena       run dir            gridic.out2.NNNNN.athdf (prim)    REQUIRED
+gizmo        run dir            output/snapshot_NNN.hdf5          optional
+opengadget3  run dir            output/snap_NNN.hdf5              optional
+phantom      run dir / prefix   Phantom full dumps                optional
+pkdgrav3     run dir            pkdgrav3 output                   optional
+ramses       run dir            output_NNNNN (RAMSES AMR)         REQUIRED
+sphexa       run .h5            SPH-EXA Step#N + constants.txt    no
+
+  every converter takes:  <input> <output> <idx_interval> [paramfile]
+  tipsyimport --format FMT --help    that converter's own documentation
+EOF
+}
+
+usage() {
+    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    echo
+    list_formats
+}
+
+fmt=""
+args=()
+want_help=0
+while (($#)); do
+    case $1 in
+        -f|--format)
+            [[ $# -ge 2 ]] || { echo "tipsyimport: --format needs a value" >&2; exit 1; }
+            fmt=$2; shift 2 ;;
+        --format=*)  fmt=${1#--format=}; shift ;;
+        --list-formats) list_formats; exit 0 ;;
+        -h|--help)   want_help=1; shift ;;
+        *)           args+=("$1"); shift ;;
+    esac
+done
+
+if [[ -z $fmt ]]; then
+    if ((want_help)) || [[ ${#args[@]} -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+    echo "tipsyimport: --format is required" >&2
+    echo >&2
+    list_formats >&2
+    exit 1
+fi
+
+name=$(script_for "$fmt")
+if [[ -z $name ]]; then
+    echo "tipsyimport: unknown format '$fmt'" >&2
+    echo >&2
+    list_formats >&2
+    exit 1
+fi
+script=$setup/$name
+[[ -f $script ]] || { echo "tipsyimport: cannot find $script" >&2; exit 1; }
+
+# Only two of these converters use argparse; the rest read sys.argv directly and
+# would treat --help as a positional. So --help prints the module docstring
+# (the authoritative usage here) and adds argparse's flag list when there is one.
+if ((want_help)); then
+    python - "$script" <<'PY'
+import ast, sys
+src = open(sys.argv[1]).read()
+print(ast.get_docstring(ast.parse(src)) or '(no module docstring)')
+PY
+    if grep -q argparse "$script"; then
+        echo
+        echo "--- flags ---"
+        env PYTHONPATH=$setup:$glassgen${PYTHONPATH:+:$PYTHONPATH} \
+            python "$script" --help 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+nargs=${#args[@]}
+if ((nargs < 3)); then
+    echo "tipsyimport: --format $fmt needs <input> <output> <idx_interval>" >&2
+    echo "             (got $nargs; see tipsyimport --list-formats)" >&2
+    exit 1
+fi
+if needs_param "$fmt" && ((nargs < 4)); then
+    echo "tipsyimport: --format $fmt also requires a trailing <paramfile>" >&2
+    exit 1
+fi
+# a run is a directory for most formats and a file for sphexa, so test -e
+[[ -e ${args[0]} ]] || {
+    echo "tipsyimport: no such input: ${args[0]}" >&2
+    exit 1
+}
+[[ ${args[2]} =~ ^[0-9]+$ ]] || {
+    echo "tipsyimport: idx_interval must be a positive integer (got '${args[2]}')" >&2
+    echo "             it sets the numbering: snapshot N -> <output>.<(N+1)*interval>" >&2
+    exit 1
+}
+if ((nargs >= 4)) && [[ ! -f ${args[3]} ]]; then
+    echo "tipsyimport: no such paramfile: ${args[3]}" >&2
+    exit 1
+fi
+
+echo "tipsyimport: $fmt  ${args[0]}  ->  tipsy ${args[1]}.* (every ${args[2]})"
+echo "             running $name"
+
+exec env IC_TOOL_NAME="tipsyimport --format $fmt" \
+    PYTHONPATH=$setup:$glassgen${PYTHONPATH:+:$PYTHONPATH} \
+    python "$script" ${args[@]+"${args[@]}"}

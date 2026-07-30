@@ -5,9 +5,10 @@ A thin command-line front end for the `sph_interp` package: read a gasoline/tips
 snapshot (-> Particles via from_tipsy), deposit the requested fields onto a chosen
 TARGET geometry with a chosen METHOD, and serialize the result.
 
-    interpolate_to_grid.sh INPUT OUTPUT [options]
+    bin/interpolatetogrid INPUT OUTPUT [options]
 
-Run with NO positional arguments to be prompted interactively for everything.
+The input snapshot is required. Pass INPUT without OUTPUT to be prompted
+interactively for the remaining choices.
 
 TARGETS (--grid):   uniform | amr | voronoi | projection
 METHODS (--method): petkova (exact, mass-conserving; default) |
@@ -17,31 +18,32 @@ OUTPUT (--output-format): npz | hdf5 | ramses | cell-table | native
 
 Examples
   # 256^3 uniform SPH density grid -> npz
-  interpolate_to_grid.sh run/snap.00100 rho.npz --grid uniform --npx 256
+  bin/interpolatetogrid run/snap.00100 rho.npz --grid uniform --npx 256
 
   # mass-conserving AMR (octree) of rho+|B|, exported to RAMSES HDF5
-  interpolate_to_grid.sh run/snap.00100 mesh.h5 --grid amr --method petkova \
+  bin/interpolatetogrid run/snap.00100 mesh.h5 --grid amr --method petkova \
       --fields rho,vx,vy,vz --output-format ramses
 
   # 50000-cell Voronoi mesh subsampled from the particles, exact deposit
-  interpolate_to_grid.sh run/snap.00100 voro.npz --grid voronoi \
+  bin/interpolatetogrid run/snap.00100 voro.npz --grid voronoi \
       --voronoi-source subsample --ncells 50000 --method petkova
 
   # column-density projection map in the xy plane
-  interpolate_to_grid.sh run/snap.00100 col.npz --grid projection \
+  bin/interpolatetogrid run/snap.00100 col.npz --grid projection \
       --axes xy --project column
 
   # divergence-aware magnetic transfer: face capture + Hodge projection
-  interpolate_to_grid.sh run/snap.00100 mesh.npz --grid amr \
+  bin/interpolatetogrid run/snap.00100 mesh.npz --grid amr \
       --fields rho,Bx,By,Bz --magnetic-projection hodge
 
   # vector-potential capture (div B == 0 pointwise); stores Ax,Ay,Az too
-  interpolate_to_grid.sh run/snap.00100 vecpot.npz --grid uniform --npx 128 \
+  bin/interpolatetogrid run/snap.00100 vecpot.npz --grid uniform --npx 128 \
       --fields Bx,By,Bz --magnetic-projection vector-potential
 """
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -51,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 # --------------------------------------------------------------------------- #
-#  Interactive prompts (used when no positional args are given)
+#  Interactive prompts (used when only the input snapshot is given)
 # --------------------------------------------------------------------------- #
 
 def _ask(prompt, default=None, choices=None):
@@ -71,12 +73,51 @@ def _ask(prompt, default=None, choices=None):
         return ans
 
 
+def _visualise_planes(value):
+    """Parse a comma-separated list of unique diagnostic slice planes."""
+    valid = ("xy", "xz", "yz")
+    planes = tuple(dict.fromkeys(
+        item.strip().lower() for item in str(value).split(",")
+        if item.strip()))
+    bad = [item for item in planes if item not in valid]
+    if not planes or bad:
+        detail = (f"invalid plane(s): {', '.join(bad)}; " if bad else "")
+        raise argparse.ArgumentTypeError(
+            f"{detail}use a comma list drawn from xy,xz,yz")
+    return planes
+
+
+def _boundary_metadata(path):
+    """Periodic flag from a sibling .param or run .log, else None."""
+    from sph_interp.particles import read_param_periodic
+    periodic = read_param_periodic(path)
+    if periodic is not None:
+        return periodic
+    try:
+        from IC_analysis_general import read_log_param
+        stem = re.sub(r"\.\d+$", "", path)
+        logged = read_log_param(stem, "bPeriodic", None)
+        return None if logged is None else bool(int(logged))
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+
+
 def interactive(args):
     """Fill `args` by prompting the user. Returns the populated namespace."""
     print("=" * 64)
     print(" sph_interp : interpolate a tipsy snapshot onto a grid")
     print("=" * 64)
-    args.input = _ask("Input tipsy snapshot")
+    if args.periodic is None:
+        detected = _boundary_metadata(args.input)
+        if detected is None:
+            boundary = _ask(
+                "No .param/.log boundary metadata found; domain",
+                default="open", choices=["open", "periodic"])
+            args.periodic = boundary == "periodic"
+        else:
+            args.periodic = bool(detected)
+            print(f"Boundary conditions from metadata: "
+                  f"{'periodic' if detected else 'open'}")
     args.grid = _ask("Grid / target geometry", default="uniform",
                      choices=["uniform", "amr", "voronoi", "projection"])
     args.method = _ask("Interpolation method", default="petkova",
@@ -87,10 +128,17 @@ def interactive(args):
         args.npx = int(_ask("Cells per axis (npx)", default="128"))
     elif args.grid == "amr":
         args.base_npx = int(_ask("Base grid cells per axis", default="16"))
-        args.npx = int(_ask("Finest resolution / cells per axis (npx)",
-                            default="128"))
-        args.refine = _ask("Refinement criterion", default="mass",
-                           choices=["smoothing", "mass", "count"])
+        default_level = max(
+            0, int(np.ceil(np.log2(max(args.npx, 1) / args.base_npx))))
+        args.max_level = int(_ask(
+            "max_level "
+            "(finest grid = base_npx x 2^max_level)",
+            default=str(default_level)))
+        args.refine = _ask(
+            "Refinement criterion "
+            "(mass: >8 mean-particle masses; count: >8 particles; "
+            "smoothing: cell size > h)",
+            default="mass", choices=["smoothing", "mass", "count"])
     elif args.grid == "voronoi":
         args.voronoi_source = _ask(
             "Voronoi generators from", default="particles",
@@ -118,8 +166,19 @@ def interactive(args):
         args.visualise_field = _ask("  field to visualise",
                                     default=args.fields.split(",")[0].strip())
         if args.grid != "projection":
-            args.visualise_axes = _ask("  slice plane", default="xy",
-                                       choices=["xy", "xz", "yz"])
+            while True:
+                try:
+                    args.visualise_axes = _visualise_planes(_ask(
+                        "  slice plane(s), comma list", default="xy"))
+                    break
+                except argparse.ArgumentTypeError as err:
+                    print(f"  {err}")
+            args.visualise_center = _ask(
+                "  slice centre", default="mass",
+                choices=["mass", "domain", "origin"])
+            args.visualise_view = _ask(
+                "  view", default="central",
+                choices=["central", "domain"])
     print("-" * 64)
     return args
 
@@ -135,6 +194,40 @@ def amr_max_level(args):
         return int(args.max_level)
     import math
     return max(0, math.ceil(math.log2(max(args.npx, 1) / args.base_npx)))
+
+
+def support_domain_audit(p, domain_lo, domain_hi):
+    """Quantify how much full ``2h`` support expands a selected open domain."""
+    from sph_interp import kernel_support_bounds
+    domain_lo = np.asarray(domain_lo, dtype=np.float64)
+    domain_hi = np.asarray(domain_hi, dtype=np.float64)
+    particle_lo = np.min(p.pos, axis=0)
+    particle_hi = np.max(p.pos, axis=0)
+    support_lo, support_hi = kernel_support_bounds(p.pos, p.h)
+    capture_lo = np.minimum(domain_lo, support_lo)
+    capture_hi = np.maximum(domain_hi, support_hi)
+    domain_span = domain_hi - domain_lo
+    capture_span = capture_hi - capture_lo
+    axis_factor = capture_span / domain_span
+    volume_factor = float(np.prod(capture_span) / np.prod(domain_span))
+
+    low_extension = np.maximum(domain_lo - (p.pos - 2.0 * p.h[:, None]), 0.0)
+    high_extension = np.maximum(
+        (p.pos + 2.0 * p.h[:, None]) - domain_hi, 0.0)
+    per_particle = np.maximum(low_extension, high_extension).max(axis=1)
+    culprit = int(np.argmax(per_particle))
+    clipped = bool(
+        np.any(domain_lo > support_lo) or np.any(domain_hi < support_hi))
+    large = bool(np.max(axis_factor) > 1.5 or volume_factor > 2.0)
+    return dict(
+        particle_lo=particle_lo, particle_hi=particle_hi,
+        support_lo=support_lo, support_hi=support_hi,
+        capture_lo=capture_lo, capture_hi=capture_hi,
+        particle_span=particle_hi - particle_lo,
+        domain_span=domain_span, capture_span=capture_span,
+        axis_factor=axis_factor, volume_factor=volume_factor,
+        culprit=culprit, culprit_extension=float(per_particle[culprit]),
+        clipped=clipped, large=large)
 
 
 def target_domain(args, p):
@@ -153,13 +246,85 @@ def target_domain(args, p):
             p.pos, p.mass, p.rho, p.h, mode=args.open_padding,
             nsmooth=args.nsmooth,
             constant_fraction=args.open_pad_fraction)
+    if getattr(args, "cubic", None):
+        # A cubic domain is a hard requirement for some consumers (POLARIS's
+        # single-root octree) and the natural shape whenever equal cells per axis
+        # matter. Only ever expands, so no particle leaves the domain.
+        from sph_interp import cubic_domain_bounds
+        span = np.asarray(hi) - np.asarray(lo)
+        if (any(np.atleast_1d(p.periodic))
+                and not np.allclose(span, span[0], rtol=1e-9)):
+            raise SystemExit(
+                "--cubic on a PERIODIC run would change the period: the domain "
+                f"IS the wrap length and it is "
+                f"{tuple(float(v) for v in np.round(span, 6))}. Fix the box "
+                "(--box) or drop --cubic / --no-periodic.")
+        lo, hi, caudit = cubic_domain_bounds(lo, hi, about=args.cubic)
+        caudit["pad"] = audit.get("pad", 0.0)
+        caudit["mode"] = f"{audit['mode']}+{caudit['mode']}"
+        audit = caudit
+
+    # A very low-density particle can have a large h and extend its compact
+    # kernel far beyond the particle bounding box. This affects every open 3-D
+    # target, not only Voronoi: clipping loses deposited material, whereas
+    # expansion at fixed regular-grid dimensions also coarsens the cells.
+    is_open_3d = (args.grid in ("uniform", "amr", "voronoi")
+                  and not any(np.atleast_1d(p.periodic)))
+    if is_open_3d:
+        support = support_domain_audit(p, lo, hi)
+        mode = getattr(args, "capture_domain", None) or "domain"
+        if support["clipped"] and mode == "domain":
+            i = support["culprit"]
+            qualifier = "substantially " if support["large"] else ""
+            print(f"  WARNING: part of the SPH kernel support lies outside "
+                  f"the selected target domain and would be cut "
+                  f"({qualifier}larger full capture):")
+            print(f"    selected: lo={np.round(lo, 4)}, "
+                  f"hi={np.round(hi, 4)}, "
+                  f"span={np.round(support['domain_span'], 4)}")
+            print(f"    full 2h:  lo={np.round(support['capture_lo'], 4)}, "
+                  f"hi={np.round(support['capture_hi'], 4)}, "
+                  f"span={np.round(support['capture_span'], 4)}")
+            print(f"    per-axis factor "
+                  f"{np.round(support['axis_factor'], 3)}, "
+                  f"volume factor x{support['volume_factor']:.3g}")
+            print(
+                f"    largest reach: particle {i}, rho={p.rho[i]:.6g}, "
+                f"h={p.h[i]:.6g}, pos={np.round(p.pos[i], 4)}, "
+                f"extends {support['culprit_extension']:.6g} beyond the "
+                "selected domain")
+            print("    Continuing with the selected domain. Conservative "
+                  "deposits may lose mass where kernels are cut.")
+            print("    Rerun with --capture-domain full for the smallest exact "
+                  "support-complete region. --open-padding full_pad is also "
+                  "support-complete, but pads every side by the global max(2h) "
+                  "and can be larger.")
+        if mode == "full":
+            lo, hi = support["capture_lo"], support["capture_hi"]
+            audit["mode"] = f"{audit['mode']}+full_2h_capture"
+            args._capture_clipped = False
+            # Full support can expand axes asymmetrically. Restore a requested
+            # cubic contract after that expansion while still containing it all.
+            if getattr(args, "cubic", None):
+                from sph_interp import cubic_domain_bounds
+                lo, hi, _ = cubic_domain_bounds(
+                    lo, hi, about=args.cubic)
+                audit["mode"] = f"{audit['mode']}+recubic"
+        else:
+            args._capture_clipped = support["clipped"]
+        args._capture_domain = mode
+        args._support_audit = support
+
+    audit["lo"] = np.asarray(lo).copy()
+    audit["hi"] = np.asarray(hi).copy()
     args._domain_audit = audit
     return np.asarray(lo), np.asarray(hi)
 
 
 def build_target(args, p):
     from sph_interp import (UniformGrid, AMRGrid, VoronoiGrid, Projection2D,
-                            refine_smoothing_length, refine_mass, refine_count)
+                            refine_smoothing_length, refine_mass, refine_count,
+                            grade_2to1)
     lo, hi = target_domain(args, p)
     box = hi - lo
     audit = args._domain_audit
@@ -178,53 +343,114 @@ def build_target(args, p):
         #     rho_cell >= m_refine(level) * mass_sph / vol_cell
         # i.e. cell_mass >= m_refine * mass_sph, where mass_sph is the gas mass of a
         # single resolution element and m_refine a per-level factor (the example
-        # namelists use 1 for hydro). We take mass_sph = the mean PARTICLE mass and
-        # default m_refine = 1, so a cell refines while it holds more than ~one
-        # particle's worth of mass -> leaves hold ~1 particle (n_leaves ~ N_part, so
-        # the mesh tracks the SPH resolution) and each leaf's deposited mass ~
-        # m_particle (near-uniform). The threshold is identical at every level, so
-        # refinement stops at ~1 particle per cell (constant mass per cell). The
-        # near-uniform masses + quasi-Lagrangian generators also keep the AREPO
-        # Voronoi density consistent (mass/V_voronoi recovers rho without the octree-
-        # vs-Voronoi volume mismatch a few-particles-per-cell mesh would suffer).
-        # Override the absolute threshold with --refine-value (e.g. 2*m_particle for
-        # ~2 particles/cell = coarser, like RAMSES m_refine=2).
+        # We take mass_sph = the mean PARTICLE mass and default m_refine = 8,
+        # matching the reconstruction/POLARIS capture convention: a cell refines
+        # while it holds more than ~8 particles' worth of mass. This keeps the
+        # leaf average supported by several SPH samples instead of encoding
+        # individual-particle noise. The threshold is identical at every level,
+        # so this remains quasi-Lagrangian (approximately constant mass per leaf).
+        # --refine-value overrides it with an absolute cell-mass threshold.
         mass_sph = float(p.mass.sum()) / max(p.n, 1)
+        mass_threshold = (args.refine_value
+                          if args.refine_value is not None
+                          else 8.0 * mass_sph)
+        count_threshold = (int(args.refine_value)
+                           if args.refine_value is not None else 8)
         crit = {"smoothing": refine_smoothing_length(),
-                "mass": refine_mass(args.refine_value
-                                    if args.refine_value is not None
-                                    else mass_sph),
-                "count": refine_count(int(args.refine_value)
-                                      if args.refine_value is not None
-                                      else 1)}[args.refine]
-        max_level = amr_max_level(args)
-        fine = args.base_npx * (2 ** max_level)
-        print(f"  target: AMRGrid base {args.base_npx}^3, max_level "
-              f"{max_level}, refine={args.refine}")
-        print(f"          adaptive: finest level resolves like {fine}^3 "
-              f"(= base_npx x 2^max_level, derived from --npx {args.npx}); "
-              "coarse in voids, fine only where the data warrants it")
-        g = AMRGrid.build(p, base_npx=args.base_npx, max_level=max_level,
+                "mass": refine_mass(mass_threshold),
+                "count": refine_count(count_threshold)}[args.refine]
+        level_cap = amr_max_level(args)
+        source = (f"explicit cap from --max-level {args.max_level}"
+                  if args.max_level is not None
+                  else f"cap derived from --npx {args.npx}")
+        print(f"  building AMRGrid base {args.base_npx}^3, "
+              f"refine={args.refine}, max_level cap={level_cap} "
+              f"({source}) ...")
+        grade_status = ("enabled (default; disable with --no-grade)"
+                        if args.grade else "disabled by --no-grade")
+        print(f"          2:1 grading: {grade_status}")
+        if args.refine == "mass":
+            default_tag = (f" = 8 x mean particle mass ({mass_sph:.6g})"
+                           if args.refine_value is None else
+                           " (explicit --refine-value)")
+            print(f"          mass refinement threshold={mass_threshold:.6g}"
+                  f"{default_tag}")
+        elif args.refine == "count":
+            default_tag = (" (default)" if args.refine_value is None else
+                           " (explicit --refine-value)")
+            print(f"          count refinement threshold={count_threshold} "
+                  f"particles{default_tag}")
+        g = AMRGrid.build(p, base_npx=args.base_npx, max_level=level_cap,
                           criterion=crit, lo=lo, hi=hi)
-        dense = fine ** 3
+        if getattr(args, "grade", False):
+            before = g.ncell
+            print("          applying --grade (2:1 balance) ...")
+            g = grade_2to1(g, p)
+            added = g.ncell - before
+            if added:
+                print(f"          grading added {added} leaves "
+                      f"({100.0 * added / max(before, 1):.2f}%)")
+            else:
+                print("          mesh was already 2:1 balanced")
+        reached = (int(np.max(g.cell_level)) if g.ncell else 0)
+        fine_reached = args.base_npx * (2 ** reached)
+        dense_reached = fine_reached ** 3
+        print(f"  target: AMRGrid base {args.base_npx}^3, "
+              f"max_level reached={reached} (cap={level_cap}), "
+              f"refine={args.refine}, "
+              f"grade={'2:1' if getattr(args, 'grade', False) else 'off'}")
+        print(f"          adaptive: finest occupied leaf level corresponds to "
+              f"base_npx x 2^max_level = {fine_reached}^3; "
+              "coarse in voids, fine only where the data warrants it")
         print(f"          -> {g.ncell} leaf cells "
-              f"({dense/max(g.ncell,1):.0f}x fewer than a dense {fine}^3 grid)")
+              f"({dense_reached/max(g.ncell,1):.0f}x fewer than a dense "
+              f"{fine_reached}^3 grid at the reached level)")
         return g
 
     if args.grid == "voronoi":
         # Periodic box -> bounds ARE the period (ghost images give exact periodic
-        # cells, Sum volume = box volume); non-periodic -> pad past the box.
+        # cells, Sum volume = box volume). Open support handling was resolved in
+        # the common target-domain path above.
         vper = p.periodic if any(np.atleast_1d(p.periodic)) else False
         if vper:
             bounds = [[lo[a], hi[a]] for a in range(3)]
             ptag = " (periodic, ghost images)"
         else:
-            pad = args.voronoi_pad
-            bounds = [[lo[a] - pad, hi[a] + pad] for a in range(3)]
-            ptag = ""
+            if args.voronoi_pad < 0.0:
+                raise ValueError("--voronoi-pad must be non-negative")
+            cap_lo = lo - args.voronoi_pad
+            cap_hi = hi + args.voronoi_pad
+            mode = getattr(args, "_capture_domain", "domain")
+            ptag = (f" (open, {mode} capture)"
+                    if mode == "full" else
+                    " (open, selected domain; kernel support may be cut)")
+            bounds = [[cap_lo[a], cap_hi[a]] for a in range(3)]
+            print(
+                f"  Voronoi capture: {mode}, "
+                f"lo={np.round(cap_lo, 4)}, hi={np.round(cap_hi, 4)}")
+        vkwargs = dict(
+            bounds=bounds, periodic=vper,
+            backend=args.voronoi_backend,
+            periodic_background=args.voronoi_background)
+
+        def finish_voronoi(grid):
+            expected = float(np.prod(
+                np.array([b[1] - b[0] for b in bounds])))
+            actual = float(np.sum(grid.volumes()))
+            error = actual / expected - 1.0
+            print(
+                f"          -> {grid.ncell} cells; volume budget "
+                f"sum(V)/domain-1 = {error:+.3e}")
+            if abs(error) > 1.0e-5:
+                raise RuntimeError(
+                    "Voronoi cells do not partition the requested domain "
+                    f"(volume error {error:+.3e}); refusing interpolation")
+            return grid
+
         if args.voronoi_source == "particles":
             print(f"  target: VoronoiGrid from {p.n} particles{ptag}")
-            return VoronoiGrid.from_particles(p, bounds=bounds, periodic=vper)
+            return finish_voronoi(
+                VoronoiGrid.from_particles(p, **vkwargs))
         if args.voronoi_source == "grid":
             nx = args.npx
             axes = [(lo[a] + (np.arange(nx) + 0.5) * (box[a] / nx))
@@ -233,7 +459,8 @@ def build_target(args, p):
             pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
             print(f"  target: VoronoiGrid from a {nx}^3 = {nx**3} regular "
                   f"lattice (cubic cells){ptag}")
-            return VoronoiGrid.from_points(pts, bounds=bounds, periodic=vper)
+            return finish_voronoi(
+                VoronoiGrid.from_points(pts, **vkwargs))
         ncells = args.npx ** 3                     # npx per-axis-equivalent count
         rng = np.random.default_rng(args.seed)
         if args.voronoi_source == "random":
@@ -246,7 +473,8 @@ def build_target(args, p):
             pts = p.pos[idx]
             print(f"  target: VoronoiGrid from {n} subsampled particles "
                   f"(target {args.npx}^3={ncells}){ptag}")
-        return VoronoiGrid.from_points(pts, bounds=bounds, periodic=vper)
+        return finish_voronoi(
+            VoronoiGrid.from_points(pts, **vkwargs))
 
     if args.grid == "projection":
         a1, a2 = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}[args.axes]
@@ -367,11 +595,17 @@ def report_mass(res, p):
         return
     # sph-scatter and petkova are mass-conserving; only the sph-gather estimate
     # (kernel density AT the cell centre) is approximate.
-    tag = ("  [approx: sph-gather density estimate, not mass-conserving; "
-           "edge/padding cells inflate sum(rho*vol)]"
-           if res.method == "sph-gather" else "")
+    rel = gm / pm - 1.0
+    if res.method == "sph-gather":
+        tag = ("  [approx: sph-gather density estimate, not mass-conserving; "
+               "edge/padding cells inflate sum(rho*vol)]")
+    elif abs(rel) > 1.0e-5:
+        tag = ("  [WARNING: conservative deposit did not close; the target "
+               "likely cuts kernel support or has invalid cell geometry]")
+    else:
+        tag = ""
     print(f"  mass check: grid {gm:.6g} vs particles {pm:.6g}  "
-          f"({100*(gm/pm - 1):+.3f}%){tag}")
+          f"({100*rel:+.3f}%){tag}")
 
 
 # --------------------------------------------------------------------------- #
@@ -519,11 +753,13 @@ def report_magnetic(res, p, bnames):
 
 def build_parser():
     pa = argparse.ArgumentParser(
-        prog="interpolate_to_grid",
+        # the bin/ wrapper passes its own name, so --help names the command
+        # the user actually typed; falls back when run directly
+        prog=os.environ.get("IC_TOOL_NAME", "interpolatetogrid"),
         description="Interpolate a tipsy SPH snapshot onto a grid (sph_interp). "
-                    "Run with no arguments for an interactive prompt.",
+                    "Pass INPUT without OUTPUT for interactive options.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    pa.add_argument("input", nargs="?", help="input tipsy snapshot")
+    pa.add_argument("input", help="input tipsy snapshot")
     pa.add_argument("output", nargs="?", help="output file/prefix")
 
     pa.add_argument("--grid", choices=["uniform", "amr", "voronoi", "projection"],
@@ -553,6 +789,23 @@ def build_parser():
                          "the input particle count, or 0.1*max(span) per side")
     pa.add_argument("--open-pad-fraction", type=float, default=0.1,
                     help="fraction of max particle span for constant_pad")
+    pa.add_argument("--capture-domain", "--voronoi-capture",
+                    dest="capture_domain", choices=["full", "domain"],
+                    default="domain",
+                    help="open 3-D target bounds (uniform/amr/voronoi): full "
+                         "union(pos +/- 2h), or the selected --open-padding/"
+                         "--box domain (may cut kernels and lose deposited "
+                         "mass). Default: selected domain, with a warning and "
+                         "the exact full-capture bounds when support is cut. "
+                         "--voronoi-capture is a backward-compatible alias")
+    pa.add_argument("--cubic", nargs="?", const="domain",
+                    choices=["domain", "origin"], default=None,
+                    help="force a CUBIC target domain (every geometry): grow the "
+                         "short axes to the longest span. 'domain' (the bare "
+                         "flag) keeps the domain centre; 'origin' centres the "
+                         "cube on 0. Required by the POLARIS octree export; "
+                         "rejected on a periodic run whose box is not already "
+                         "cubic, since the domain there IS the wrap length.")
     g = pa.add_mutually_exclusive_group()
     g.add_argument("--periodic", dest="periodic", action="store_true")
     g.add_argument("--no-periodic", "--open", dest="periodic",
@@ -562,9 +815,8 @@ def build_parser():
     # resolution (single knob): cells per axis
     pa.add_argument("--npx", type=int, default=128,
                     help="cells per axis (THE resolution knob). uniform/"
-                         "projection: grid/image resolution. amr: the FINEST "
-                         "target resolution -> max_level is derived so "
-                         "base_npx x 2^max_level >= npx (AMR is adaptive). "
+                         "projection: grid/image resolution. amr: fallback "
+                         "finest target resolution when --max-level is omitted. "
                          "voronoi: lattice size for --voronoi-source grid.")
     # projection
     pa.add_argument("--axes", choices=["xy", "xz", "yz"], default="xy",
@@ -575,14 +827,29 @@ def build_parser():
     # amr
     pa.add_argument("--base-npx", type=int, default=16, help="AMR base grid/axis")
     pa.add_argument("--max-level", type=int, default=None,
-                    help="AMR max level (default: derived from --npx and "
-                         "--base-npx). Set to override the npx-derived depth.")
+                    help="AMR refinement depth; finest grid = base_npx x "
+                         "2^max_level (default: derived from --npx and "
+                         "--base-npx)")
     pa.add_argument("--refine", choices=["smoothing", "mass", "count"],
-                    default="mass", help="AMR refinement criterion (default: "
-                    "mass = quasi-Lagrangian, like RAMSES: refine a cell whose "
-                    "gas mass exceeds --refine-value, default mean base-cell mass)")
+                    default="mass", help="AMR refinement criterion: mass "
+                    "refines above 8 x mean gas-particle mass by default; "
+                    "count refines above 8 particles by default; smoothing "
+                    "refines while cell size exceeds local h")
     pa.add_argument("--refine-value", type=float, default=None,
-                    help="threshold for --refine mass/count")
+                    help="threshold for --refine: absolute cell mass for mass "
+                         "(default 8 x mean gas-particle mass), or particle "
+                         "count for count (default 8)")
+    grade = pa.add_mutually_exclusive_group()
+    grade.add_argument(
+        "--grade", dest="grade", action="store_true",
+        default=True,
+        help="2:1-balance the final AMR leaf set before deposition, so no "
+             "face/edge/corner neighbour differs by more than one level "
+             "(enabled by default)")
+    grade.add_argument(
+        "--no-grade", dest="grade", action="store_false",
+        default=argparse.SUPPRESS,
+        help="leave the criterion-built AMR mesh ungraded")
     # voronoi
     pa.add_argument("--voronoi-source",
                     choices=["particles", "random", "subsample", "grid"],
@@ -591,8 +858,18 @@ def build_parser():
                          "resolution fixed by the data), or subsample / random / "
                          "grid which use --npx (npx^3 cells: subsampled particles, "
                          "random points, or a regular lattice)")
-    pa.add_argument("--voronoi-pad", type=float, default=0.05,
-                    help="pad cell domain past the box (keeps boundary kernels in)")
+    pa.add_argument("--voronoi-pad", type=float, default=0.0,
+                    help="optional extra clearance around the resolved open "
+                         "Voronoi capture domain; ignored for periodic domains")
+    pa.add_argument("--voronoi-background", default="auto",
+                    type=lambda s: s if s.lower() == "auto" else int(s),
+                    help="Voronoi background guard lattice per axis: auto adds "
+                         "16^3 guards for open/sparse-periodic domains, 0 disables, "
+                         "or an integer >=2 forces N^3")
+    pa.add_argument("--voronoi-backend", default="auto",
+                    choices=["auto", "pyvoro", "multivoro", "arepo"],
+                    help="Voronoi mesher; auto prefers AREPO and uses the "
+                         "background-guarded physical box for open captures")
     pa.add_argument("--seed", type=int, default=0, help="RNG seed (voronoi)")
 
     # magnetic components (Bx,By,Bz in --fields)
@@ -622,13 +899,25 @@ def build_parser():
                     const="", default=None,
                     help="write a diagnostic figure comparing the SPH particle "
                          "field to the interpolated grid (geometry-aware slice, "
-                         "density PDFs, per-particle grid-vs-SPH scatter, mass "
-                         "conservation). Optionally pass a path; default is "
+                         "weighted field probability densities, per-particle "
+                         "grid-vs-SPH scatter, mass conservation). Optionally "
+                         "pass a path; default is "
                          "<output>_visualise.pdf.")
     pa.add_argument("--visualise-field", default=None,
                     help="which field to visualise (default: first of --fields)")
-    pa.add_argument("--visualise-axes", choices=["xy", "xz", "yz"], default="xy",
-                    help="slice/projection plane for --visualise (3D targets)")
+    pa.add_argument("--visualise-axes", type=_visualise_planes, default="xy",
+                    metavar="PLANES",
+                    help="comma-separated slice planes for --visualise, drawn "
+                         "from xy,xz,yz. Multiple planes become pages of one "
+                         "PDF, or suffixed files for other formats")
+    pa.add_argument("--visualise-center",
+                    choices=["mass", "domain", "origin"], default="mass",
+                    help="3D diagnostic slice centre: gas mass centre, target "
+                         "domain centre, or coordinate origin")
+    pa.add_argument("--visualise-view",
+                    choices=["central", "domain"], default="central",
+                    help="top-row diagnostic extent: robust central gas region "
+                         "or the full target domain")
 
     # ramses
     pa.add_argument("--hydro-fields", default=None,
@@ -656,11 +945,10 @@ def main(argv=None):
     pa = build_parser()
     args = pa.parse_args(argv)
 
-    # No positional args at all -> interactive mode.
-    if args.input is None and args.output is None:
+    # INPUT is required; without OUTPUT, prompt for the remaining choices.
+    args._interactive = args.output is None
+    if args.output is None:
         args = interactive(args)
-    elif args.input is None or args.output is None:
-        pa.error("provide BOTH input and output, or NEITHER (interactive)")
 
     if args.output_format is None:
         args.output_format = "ramses" if args.grid == "amr" else "npz"
@@ -747,6 +1035,13 @@ def main(argv=None):
         return
 
     target = build_target(args, p)
+    from sph_interp.visualise import resolution_text
+    restext = resolution_text(target, p)
+    if restext is not None:
+        print(f"  {restext}")
+        print("    (h_p05 is the small-h robust scale: 95% of particles "
+              "have h >= h_p05; ratios > 1 warn that sharp density peaks "
+              "can be grid-smoothed)")
     print(f"  depositing with method={args.method} ...")
     deposit_values = [f for f in fields if not (magnetic and f in bnames)]
     if deposit_values or not magnetic:
@@ -765,9 +1060,35 @@ def main(argv=None):
         from sph_interp import visualise
         vfield = args.visualise_field or fields[0]
         vpath = args.visualise or os.path.splitext(args.output)[0] + "_visualise.pdf"
-        plane = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}[args.visualise_axes]
-        print(f"  visualising field '{vfield}' ({args.visualise_axes}) ...")
-        visualise(res, p, field=vfield, out=vpath, plane=plane)
+        plane_map = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}
+        planes = args.visualise_axes
+        if len(planes) > 1 and os.path.splitext(vpath)[1].lower() == ".pdf":
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_pdf import PdfPages
+            with PdfPages(vpath) as pdf:
+                for label in planes:
+                    print(f"  visualising field '{vfield}' ({label}) ...")
+                    fig = visualise(
+                        res, p, field=vfield, plane=plane_map[label],
+                        center=args.visualise_center,
+                        view=args.visualise_view,
+                        title=(f"{type(res.target).__name__} / {res.method} — "
+                               f"field '{vfield}' — {label} plane"))
+                    pdf.savefig(fig, dpi=130)
+                    plt.close(fig)
+            print(f"  wrote {len(planes)}-plane visualisation -> {vpath}")
+        else:
+            root, ext = os.path.splitext(vpath)
+            for label in planes:
+                out = (vpath if len(planes) == 1
+                       else f"{root}_{label}{ext}")
+                print(f"  visualising field '{vfield}' ({label}) ...")
+                visualise(
+                    res, p, field=vfield, out=out, plane=plane_map[label],
+                    center=args.visualise_center, view=args.visualise_view,
+                    title=(None if len(planes) == 1 else
+                           f"{type(res.target).__name__} / {res.method} — "
+                           f"field '{vfield}' — {label} plane"))
 
     print("done.")
 

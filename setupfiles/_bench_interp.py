@@ -6,12 +6,21 @@ deposits. This script times mesh BUILD and INTERP per (dataset x geometry x
 method x backend) and verifies the conservation budgets, so a perf or accuracy
 regression shows up as a diffable number instead of a slow demo.
 
-Datasets (canonical, resolved relative to this script):
-  early     mhdcollapse .00100 -- mild contrast, near-uniform spacing
-  core      mhdcollapse .00820 -- collapsed core, high dynamic range
-  clustered SELF-GENERATED merger-like set: two Gaussian clumps + sparse halo
-            in a periodic box (seeded; h from cKDTree kNN, rho consistent) --
-            no snapshot needed, exercises the clustered/ghost-shell paths.
+Datasets -- ALL SELF-GENERATED, no snapshot files (changed 2026-07-28; the
+canonical mhdcollapse snapshots are not on this machine and are NOT being
+restored, so the bench now stands on `sph_interp.synthetic` instead):
+  clustered the historical baseline set: two Gaussian clumps + sparse halo in a
+            periodic box (seeded; h from cKDTree kNN, rho consistent). KEPT
+            unchanged -- every stored perf number in SPH_INTERP_PLAN task 14
+            is on this set, so replacing it would break comparability.
+  <family>  any of `sph_interp.synthetic.FAMILIES`, calibrated against the real
+            ICs in test_cases/isolated_galaxy (plan task 15):
+              uniform lattice closepacked glass slab1d slab2d
+              disk merger cosmo collapse
+            `glass` replaces the old `early` (mild contrast, near-uniform) and
+            `collapse` replaces `core` (high dynamic range). disk/merger/cosmo
+            are OPEN captures and exercise the padded-domain path the snapshot
+            datasets never did.
 
 Budgets asserted by --check (timings are informational, never asserted):
   sph-scatter deposited mass  == total particle mass   (rel tol 1e-12)
@@ -22,11 +31,12 @@ Budgets asserted by --check (timings are informational, never asserted):
   sph-gather  is NOT mass-conserving by construction: reported, never checked.
 
 Usage:
-  python _bench_interp.py                       # full table, all available
+  python _bench_interp.py                       # full table, default datasets
   python _bench_interp.py --check               # exit 1 on any budget breach
   python _bench_interp.py --json out.json       # machine-readable, for diffing
   python _bench_interp.py --quick               # small sizes (smoke/CI)
   python _bench_interp.py --datasets clustered --backends multivoro,pyvoro
+  python _bench_interp.py --datasets disk,merger,cosmo --check   # open domains
 """
 
 import argparse
@@ -40,20 +50,26 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sph_interp import (from_tipsy, interpolate, UniformGrid, AMRGrid,
-                        VoronoiGrid)
+from sph_interp import (interpolate, UniformGrid, AMRGrid, VoronoiGrid,
+                        synthetic)
 from sph_interp.particles import Particles
 from sph_interp.targets import _resolve_backend
 try:
     from sph_interp.targets import _VOL_BUDGET_TOL
 except ImportError:                      # older targets.py: pre-noise-tol check
     _VOL_BUDGET_TOL = 1e-9
+# Domain bounds live in ONE place: the scaling bench owns `domain_bounds`
+# (periodic -> the particle box; open -> `open_domain_bounds(rho_edge_pad)`)
+# and `_npx_for` (cubic cells on a thin box). Importing them rather than
+# re-deriving keeps the two benches from drifting apart -- this bench used to
+# hand-roll a 2% pad on non-periodic input, which is exactly the mistake that
+# made `merger` petkova report -3.1e-3.
+from _bench_scaling import domain_bounds, _npx_for
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_RUN = os.path.join(_HERE, "..", "test_cases", "mhdcollapse",
-                    "mhdcollapse32_N64glassmu10rd360Erat0.04amrnew2GASOLINE",
-                    "mhdcollapse32_N64glassmu10rd360Erat0.04amrnew2GASOLINE")
-SNAPSHOTS = {"early": _RUN + ".00100", "core": _RUN + ".00820"}
+
+DATASETS = ("clustered",) + synthetic.FAMILIES
+DEFAULT_DATASETS = "clustered,glass,collapse"
 
 GEOMETRIES = ("uniform", "amr", "voronoi")
 METHODS = ("sph-gather", "sph-scatter", "petkova")
@@ -69,8 +85,22 @@ MASS_TOL = {
     ("petkova", "amr"): 1e-8,
     ("petkova", "voronoi"): 1e-4,
 }
+# OPEN captures relax the petkova ceiling: `rho_edge_pad` sizes the pad from
+# the FAINT-END h rather than max(h), so a little kernel support crosses the
+# wall and a conserving deposit legitimately loses it. Measured on `merger`,
+# -1.14e-6 at N=12.5k falling to -4.6e-8 at N=50k. This is physics leaving an
+# open boundary, not a defect -- `--open-pad full_pad` in _bench_scaling.py
+# restores machine precision at 1.7x the domain volume. sph-scatter keeps its
+# 1e-12: it deposits to the nearest cell and never straddles the wall.
+MASS_TOL_OPEN = {"petkova": 1e-5}
 VOL_TOL = {"pyvoro": _VOL_BUDGET_TOL, "multivoro": _VOL_BUDGET_TOL,
            "arepo": 1e-5}
+
+
+def mass_tol(method, geometry, periodic):
+    if not periodic and method in MASS_TOL_OPEN:
+        return max(MASS_TOL_OPEN[method], MASS_TOL.get((method, geometry), 0.0))
+    return MASS_TOL.get((method, geometry))
 
 
 def make_clustered(n, seed=42):
@@ -99,13 +129,10 @@ def make_clustered(n, seed=42):
 
 
 def load_dataset(name, args):
+    n = 20000 if args.quick else args.nparticles
     if name == "clustered":
-        n = 20000 if args.quick else args.nclustered
         return make_clustered(n)
-    snap = SNAPSHOTS[name]
-    if not os.path.exists(snap):
-        return None
-    return from_tipsy(snap, fields=("rho",))
+    return synthetic.make(name, n, seed=42)
 
 
 def subsample(p, n, seed=0):
@@ -120,14 +147,16 @@ def subsample(p, n, seed=0):
 
 
 def build_target(geometry, p, args, backend=None, warmup=False):
-    half = 0.5 * np.asarray(p.box, dtype=np.float64).reshape(3)
+    lo, hi = domain_bounds(p)
+    span = hi - lo
     if geometry == "uniform":
         npx = 16 if warmup else args.npx
-        return UniformGrid.centered(p.box, npx)
+        return UniformGrid(lo=lo, hi=hi, npx=_npx_for(span, npx))
     if geometry == "amr":
         if warmup:
-            return AMRGrid.build(p, base_npx=4, max_level=2)
-        return AMRGrid.build(p, base_npx=args.base_npx, max_level=args.max_level)
+            return AMRGrid.build(p, base_npx=4, max_level=2, lo=lo, hi=hi)
+        return AMRGrid.build(p, base_npx=args.base_npx,
+                             max_level=args.max_level, lo=lo, hi=hi)
     if geometry == "voronoi":
         ngen = 1500 if warmup else args.voronoi_ncells
         if ngen and ngen < p.n:
@@ -136,14 +165,22 @@ def build_target(geometry, p, args, backend=None, warmup=False):
         else:
             pts = p.pos
         per = p.periodic if any(np.atleast_1d(p.periodic)) else False
-        if per:
-            bounds = [[-half[a], half[a]] for a in range(3)]
-        else:
-            bounds = [[-half[a] - 0.02 * p.box[a], half[a] + 0.02 * p.box[a]]
-                      for a in range(3)]
+        bounds = [[lo[a], hi[a]] for a in range(3)]
         return VoronoiGrid.from_points(pts, bounds=bounds, periodic=per,
-                                       backend=backend or "auto")
+                                       backend=effective_backend(backend, p))
     raise ValueError(geometry)
+
+
+def effective_backend(backend, p):
+    """Resolve `auto` BY DOMAIN TYPE. arepo is the only backend with native
+    per-axis periodicity, so it keeps the periodic sets; but on a padded OPEN
+    domain its guarded-open path fails its own volume budget (+9.3e-5 against
+    1e-5 -- the float32 ConvexHull floor amplified by the cell-size spread a
+    pad creates; see plan task 6), and `auto` prefers arepo and so would refuse
+    outright rather than fall back. An explicit --backends choice still wins."""
+    if backend in (None, "auto") and not any(np.atleast_1d(p.periodic)):
+        return "multivoro"
+    return backend or "auto"
 
 
 def deposited_mass(res, grid):
@@ -163,14 +200,20 @@ def deposited_mass(res, grid):
 
 
 def volume_error(grid, p):
-    """Voronoi volume budget: Sum(central cell vol)/box vol - 1 (fully
-    periodic boxes only -- a partial/non-periodic mesh has no closed budget)."""
+    """Voronoi volume budget: Sum(central cell vol) / the TARGET's own domain
+    volume - 1.
+
+    The reference is `grid.lo/hi`, not the particle box. An open mesh is still
+    a closed region -- it is built on padded bounds plus a background guard
+    lattice, and it tiles THOSE bounds. Comparing it to the particle box would
+    report a false error, which is why this check used to bail out on anything
+    non-periodic and so never ran on an open capture at all. For a periodic
+    mesh grid.lo/hi IS the box, so the periodic numbers are unchanged."""
     if not isinstance(grid, VoronoiGrid):
         return None
-    if not all(np.atleast_1d(grid.periodic)):
-        return None
-    box = np.asarray(p.box, dtype=np.float64).reshape(3)
-    return float(grid.volumes().sum()) / float(np.prod(box)) - 1.0
+    span = np.asarray(grid.hi, dtype=np.float64) - np.asarray(grid.lo,
+                                                              dtype=np.float64)
+    return float(grid.volumes().sum()) / float(np.prod(span)) - 1.0
 
 
 def ncells(grid):
@@ -186,10 +229,7 @@ def run_bench(args):
     rows, warmed = [], set()
     for ds in args.datasets:
         p = load_dataset(ds, args)
-        if p is None:
-            print(f"[skip] dataset {ds}: snapshot not found ({SNAPSHOTS[ds]})",
-                  file=sys.stderr)
-            continue
+        per = bool(all(np.atleast_1d(p.periodic)))
         mtot = float(p.mass.sum())
         pw = subsample(p, 5000)
         print(f"# dataset {ds}: N={p.n} box={np.asarray(p.box).tolist()} "
@@ -221,12 +261,14 @@ def run_bench(args):
                     res = interpolate(p, grid, method=method, values=["rho"])
                     t_interp = time.perf_counter() - t0
                     merr = deposited_mass(res, grid) / mtot - 1.0
-                    tol = MASS_TOL.get((method, geometry))
-                    vtol = (VOL_TOL[_resolve_backend(be or "auto")]
+                    tol = mass_tol(method, geometry, per)
+                    ebe = effective_backend(be, p) if be else None
+                    vtol = (VOL_TOL[_resolve_backend(ebe or "auto")]
                             if verr is not None else None)
                     rows.append({
                         "dataset": ds, "geometry": geometry,
-                        "backend": (_resolve_backend(be) if be else None),
+                        "periodic": per,
+                        "backend": (_resolve_backend(ebe) if ebe else None),
                         "method": method, "ncell": ncells(grid),
                         "t_build": round(t_build, 4),
                         "t_interp": round(t_interp, 4),
@@ -266,8 +308,8 @@ def main(argv=None):
         prog="_bench_interp",
         description=__doc__.split("\n")[0],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    pa.add_argument("--datasets", default="early,core,clustered",
-                    help="comma list of: early, core, clustered")
+    pa.add_argument("--datasets", default=DEFAULT_DATASETS,
+                    help="comma list of: " + ", ".join(DATASETS))
     pa.add_argument("--geometries", default=",".join(GEOMETRIES),
                     help="comma list of: uniform, amr, voronoi")
     pa.add_argument("--methods", default=",".join(METHODS),
@@ -283,8 +325,9 @@ def main(argv=None):
                     help="AMR max refinement level (finest = base * 2**level)")
     pa.add_argument("--voronoi-ncells", type=int, default=40000,
                     help="Voronoi generators (subsampled); 0 = all particles")
-    pa.add_argument("--nclustered", type=int, default=200000,
-                    help="particle count of the synthetic clustered set")
+    pa.add_argument("--nparticles", "--nclustered", type=int, default=200000,
+                    dest="nparticles",
+                    help="particle count for every generated dataset")
     pa.add_argument("--quick", action="store_true",
                     help="small sizes for a fast smoke run (npx 32, AMR base 8 "
                          "level 2, 4000 generators, 20k clustered particles)")
@@ -299,8 +342,8 @@ def main(argv=None):
     args.geometries = [s.strip() for s in args.geometries.split(",") if s.strip()]
     args.methods = [s.strip() for s in args.methods.split(",") if s.strip()]
     for ds in args.datasets:
-        if ds not in ("early", "core", "clustered"):
-            pa.error(f"unknown dataset {ds!r}")
+        if ds not in DATASETS:
+            pa.error(f"unknown dataset {ds!r} (choose from {', '.join(DATASETS)})")
     if args.quick:
         args.npx = 32
         args.base_npx = 8

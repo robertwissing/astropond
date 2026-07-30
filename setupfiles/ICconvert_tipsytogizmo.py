@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from IC_interpolate_to_grid import main as interp_main
 from sph_interp._gizmo.gizmo_param import write_run_param
 from sph_interp.export import scale_hdf5_bfield, MU0_CODE_TO_GAUSS
-from ICconvert_common import has_nonzero_b
+from ICconvert_common import (find_sibling_param, gadget_particle_argv,
+                              has_nonzero_b)
 
 
 def _boxsize_from_ic(hdf5_path):
@@ -46,22 +47,10 @@ def _boxsize_from_ic(hdf5_path):
         return None
 
 
-def _find_gasoline_param(tipsy_input):
-    base = tipsy_input
-    if "." in os.path.basename(base):
-        base = base.rsplit(".", 1)[0]
-    cand = base + ".param"
-    return cand if os.path.exists(cand) else None
 
 
 def build_argv(args):
-    # 1:1 particle copy -> GADGET type-0 HDF5 (the GIZMO IC). The "arepo" output
-    # format is the GADGET writer; --voronoi-particles selects the copy path.
-    argv = [args.input, args.output, "--output-format", "arepo",
-            "--voronoi-particles", "--fields", args.fields]
-    if args.tu_fac is not None:
-        argv += ["--tu-fac", str(args.tu_fac)]
-    return argv
+    return gadget_particle_argv(args)
 
 
 def parse(argv=None):
@@ -98,7 +87,7 @@ def parse(argv=None):
 def write_param(args):
     if not args.param_out:
         return
-    gas_param = _find_gasoline_param(args.input)
+    gas_param = find_sibling_param(args.input)
     if gas_param is None:
         print("WARNING: no gasoline .param beside %r; cannot write parameterfile."
               % args.input)

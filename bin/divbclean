@@ -1,0 +1,49 @@
+#!/bin/bash
+# divbclean: statically clean div B on an existing tipsy IC's magnetic field.
+#
+# Tricco & Price constrained hyperbolic/parabolic cleaning applied with the
+# particles FROZEN (v = 0, rho fixed), so only (B, psi) evolve - a pure
+# pre/post-processing pass usable on any tipsy IC carrying a BField aux.
+#
+# usage: divbclean <tipsy.NNNNN> [-o OUT] [--box L | --open] [options]
+#
+#   divbclean ic.00000                            # domain from a sibling .param
+#   divbclean ic.00000 -o ic_clean.00000 --box 1.0 --steps 500
+#   divbclean galaxy.00000 --open --target-mean 1e-3 --steps 2000
+#   divbclean ic.00000 --flavour rho2-own --sigma 1.0 --dt 0.2
+#
+# The operator pair (difference divergence + its energy-conjugate symmetric
+# gradient) comes from the glassgen.flavours registry, so --flavour must match
+# whatever the field was BUILT with for the IC to be clean in the same measure:
+#   gdforce (default) = the gasolinemhd/GDSPH convention
+#   rho2-own          = the Tricco & Price / Phantom convention
+# setbfield --clean runs exactly this code with the flavour already matched.
+#
+# Stopping: --steps is the budget; --target-mean / --target-max stop early once
+# the dimensionless divergence error h|divB|/|B| reaches the target (a warning
+# is printed if the budget runs out first).
+#
+# Writes OUT (default: _Bclean before the .NNNNN), OUT.BField in the input's
+# packed layout, any BFieldx/y/z component twins, every other sibling aux
+# copied alongside, and a human-readable OUT_divclean.txt with the SPH flavour,
+# run configuration, stopping criteria, and convergence trace. Pass --no-audit
+# to suppress that text file.
+#
+# Run with --help for the full flag list.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script=$glassgen/mhd_divBclean.py
+export SETUP=$setup
+
+ic_require_script divbclean "$script"
+
+if [ $# -lt 1 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
+    ic_exec divbclean "$script" "$glassgen" --help
+fi
+
+ic_require_snapshot divbclean "$@"
+
+ic_exec divbclean "$script" "$glassgen" "$@"

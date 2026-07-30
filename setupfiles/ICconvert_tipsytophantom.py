@@ -25,6 +25,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ICconvert_common import read_gasoline_param
 from sph_interp import from_tipsy
 from sph_interp._phantom.phantom_dump import write_phantom_fulldump
 
@@ -37,15 +38,9 @@ def _find_param(tipsy_input):
 
 
 def _param_dict(path):
-    vals = {}
-    if path and os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.split("#")[0]
-                if "=" in line:
-                    k, _, v = line.partition("=")
-                    vals[k.strip()] = v.strip()
-    return vals
+    """Thin delegate to the shared parser (CONSOLIDATION_PLAN D1).
+    Kept as a module-level name because other modules import it."""
+    return read_gasoline_param(path)
 
 
 def _f(vals, key, default=None):

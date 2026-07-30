@@ -28,26 +28,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sph_interp.gridic import write_grid_ic, read_grid_ic
-from ICconvert_common import has_nonzero_b as _has_nonzero_b
+from ICconvert_common import find_sibling_param, read_gasoline_param, has_nonzero_b as _has_nonzero_b
 
 
-def _find_param(tipsy_input):
-    base = tipsy_input.rsplit(".", 1)[0] if "." in os.path.basename(tipsy_input) \
-        else tipsy_input
-    cand = base + ".param"
-    return cand if os.path.exists(cand) else None
 
 
 def _param(path):
-    vals = {}
-    if path and os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.split("#")[0]
-                if "=" in line:
-                    k, _, v = line.partition("=")
-                    vals[k.strip()] = v.strip()
-    return vals
+    """Thin delegate to the shared parser (CONSOLIDATION_PLAN D1).
+    Kept as a module-level name because other modules import it."""
+    return read_gasoline_param(path)
 
 
 def _f(vals, key, default=None):
@@ -163,7 +152,7 @@ def main(argv=None):
                          "ngridmax in the namelist")
     args = pa.parse_args(argv)
 
-    gas = _param(_find_param(args.input))
+    gas = _param(find_sibling_param(args.input))
     gamma = _f(gas, "dConstGamma", 5.0 / 3.0)
     boxlen = args.boxsize if args.boxsize is not None else _f(gas, "dxPeriod", 1.0)
 

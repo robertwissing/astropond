@@ -70,6 +70,15 @@ _DESLIVER_FRAC = {"pyvoro": 0.05, "multivoro": 0.20, "arepo": 0.0}
 # 40k generators).
 _VOL_BUDGET_TOL = 1e-5
 
+# Refinement budget for a periodic mesh whose cells are too big to unwrap (see
+# `_periodic_cell_rad_limit`). One round is normally enough -- the limit is a
+# geometric bound, not an iteration -- so the rounds only cover refinement
+# opening up a neighbouring cell. The growth cap is what keeps a very thin box
+# from silently turning a 1500-cell request into a 100k-cell mesh; past it the
+# ghost-image path takes over and meshes the original generators exactly.
+_REFINE_ROUNDS = 3
+_REFINE_MAX_GROWTH = 8.0
+
 
 def _resolve_backend(backend):
     """Map the requested backend to the effective mesher. 'auto' prefers AREPO when
@@ -967,6 +976,144 @@ class VoronoiGrid:
         return np.ascontiguousarray(newpts), n - m
 
     @staticmethod
+    def _periodic_cell_rad_limit(L, per):
+        """Largest cell circumradius a periodic min-image unwrap can resolve.
+
+        A cell is rebuilt around its generator by unwrapping each vertex to its
+        nearest image, so the resolvable quantity is the cell's DIAMETER, not its
+        radius: two vertices of one cell more than a half-period apart have no
+        consistent unwrap and the reconstructed volume is wrong. Hence
+        2*cell_rad <= L/2, i.e. cell_rad <= L/4 -- a QUARTER period, not a half.
+
+        Measured on the thin synthetic boxes (native AREPO, 1500..40000
+        generators over 1x0.094x0.094 and 1x1x0.094): the budget is still open at
+        max cell_rad = 0.66 half-periods (+1.5e-04) and closes to +1e-06 by 0.54,
+        so the closure sits at ~L/4 and not at the L/2 the old comments assumed.
+        Refining to the L/2 bound is what left slab2d stuck at +0.50%.
+        """
+        pl = [float(L[a]) for a in range(3) if per[a]]
+        return 0.25 * min(pl) if pl else float("inf")
+
+    @classmethod
+    def _insert_for_half_period(cls, pts, lo, hi, per, mesh, limit, h):
+        """Add generators to the cells that are too big for the periodic unwrap.
+
+        Returns ``(points, n_added)``. `mesh` is anything carrying this class's
+        CSR geometry (`gen`, `cell_rad`, `cf_start`, `fv_start`, `fvx/fvy/fvz`)
+        -- a VoronoiGrid or the raw dict from the AREPO mesher.
+
+        TWO strategies, cheapest first:
+
+        1. LATTICE. Candidates are a cell-centred cubic lattice of spacing `h`
+           (cubic in PHYSICAL space -- an n^3 lattice over a thin box has
+           anisotropic spacing and would refine the wrong axis), kept where they
+           fall inside an offending cell's circumsphere and dropped within h/2 of
+           an existing generator so the insertion cannot make slivers. A lattice
+           of spacing h has covering radius 0.87h, so h = limit bounds the
+           refined cells at 0.87*limit. Regular spacing is what makes this the
+           CHEAP option: every inserted generator uses its full radius, so it
+           needs the fewest cells to get under the bound (measured on the
+           1500-generator slabs: 5.4x the cells, against 7.9x for strategy 2).
+
+        2. SPLIT. The circumsphere in (1) is a superset of the cell, so on a
+           SLIVER -- large circumradius, small volume, neighbours packed close --
+           every candidate can be dropped for sitting on an existing generator,
+           and (1) returns nothing. Splitting cannot: it inserts at the midpoint
+           between the offending cell's generator and each of its far vertices.
+           A Voronoi cell is convex and both endpoints lie in it, so the midpoint
+           does too, and the nearest generator to a point inside a cell is that
+           cell's own -- at cell_rad/2 > limit/2, so a split can no more make a
+           sliver than the lattice can. Every offending cell has a vertex beyond
+           `limit` by definition, so this ALWAYS yields at least one point.
+
+        This REFINES the mesh rather than reproducing the caller's generator set:
+        the returned tessellation has more cells than points supplied. That is
+        the same trade `periodic_background` already makes, and it is the only
+        fix available for a cell that is too big -- no image shell can shrink it.
+        """
+        L = hi - lo
+        gen = np.asarray(mesh["gen"] if isinstance(mesh, dict) else mesh.gen)
+        cell_rad = np.asarray(
+            mesh["cell_rad"] if isinstance(mesh, dict) else mesh.cell_rad)
+        n_in = len(pts)
+        gen, cell_rad = gen[:n_in], cell_rad[:n_in]
+        bad = np.where(cell_rad > limit)[0]
+        if bad.size == 0:
+            return pts, 0
+
+        from scipy.spatial import cKDTree
+        n = np.maximum(1, np.ceil(L / float(h)).astype(np.int64))
+        ax = [lo[a] + (np.arange(n[a]) + 0.5) * (L[a] / n[a]) for a in range(3)]
+        cand = np.stack(np.meshgrid(*ax, indexing="ij"), axis=-1).reshape(-1, 3)
+        # Wrapped coordinates so the "near an existing generator" test sees
+        # across periodic faces; a mixed-periodicity box falls back to the plain
+        # tree (it can only keep a candidate it should have dropped, which the
+        # h/2 spacing test then handles on the next round).
+        cu = np.mod(cand - lo, L)
+        kw = {"boxsize": L} if all(bool(x) for x in per) else {}
+        d_bad, j = cKDTree(np.mod(gen[bad] - lo, L), **kw).query(
+            cu, k=1, workers=-1)
+        keep = d_bad <= cell_rad[bad][j]
+        d_gen, _ = cKDTree(np.mod(gen - lo, L), **kw).query(cu, k=1, workers=-1)
+        keep &= d_gen >= 0.5 * float(h)
+        if keep.any():
+            return (np.ascontiguousarray(
+                np.concatenate((pts, cand[keep]), axis=0)), int(keep.sum()))
+        return cls._split_oversize_cells(pts, lo, hi, mesh, limit, bad)
+
+    @staticmethod
+    def _split_oversize_cells(pts, lo, hi, mesh, limit, bad, kmax=2,
+                              cos_sep=0.5):
+        """Strategy 2 of `_insert_for_half_period`: midpoint splits inside the
+        offending cells.
+
+        Splits go along the cell's ELONGATION, which is what de-slivers it: the
+        farthest vertex is by definition the long axis, and a generator halfway
+        out puts the new bisector across that axis at cell_rad/4. Vertices are
+        taken farthest-first, and the 2nd..kth are accepted only if they point
+        at least 60 degrees (cos_sep) off every direction already taken -- a
+        genuinely DIFFERENT long axis, not another point down the same one. On a
+        needle, where every far vertex points the same way, that correctly
+        yields the single split the cell needs instead of stacking generators
+        along the spike.
+
+        kmax=2 measured cheapest on the thin slabs (1 costs an extra round, >2
+        over-inserts without closing sooner); the angular rule beats a plain
+        distance rule at every kmax (slab2d, kmax=3: 9.2x the cells vs 10.3x).
+        """
+        L = hi - lo
+        g = mesh["gen"] if isinstance(mesh, dict) else mesh.gen
+        cf = mesh["cf_start"] if isinstance(mesh, dict) else mesh.cf_start
+        fv = mesh["fv_start"] if isinstance(mesh, dict) else mesh.fv_start
+        vx = mesh["fvx"] if isinstance(mesh, dict) else mesh.fvx
+        vy = mesh["fvy"] if isinstance(mesh, dict) else mesh.fvy
+        vz = mesh["fvz"] if isinstance(mesh, dict) else mesh.fvz
+        add = []
+        for i in bad:
+            # faces of a cell are contiguous, so its vertex block is too
+            v0, v1 = int(fv[cf[i]]), int(fv[cf[i + 1]])
+            V = np.column_stack((vx[v0:v1], vy[v0:v1], vz[v0:v1]))
+            rel = V - g[i]
+            d = np.linalg.norm(rel, axis=1)
+            far = np.argsort(d)[::-1]
+            dirs = []
+            for j in far[d[far] > limit]:
+                u = rel[j] / d[j]
+                if any(float(u @ w) >= cos_sep for w in dirs):
+                    continue                  # same long axis, already split
+                dirs.append(u)
+                add.append(g[i] + 0.5 * rel[j])
+                if len(dirs) >= kmax:
+                    break
+        if not add:
+            return pts, 0
+        # A cell whose unwrap already failed can have vertices outside the box;
+        # wrap so an inserted generator is always a point of the domain.
+        add = np.mod(np.asarray(add) - lo, L) + lo
+        return (np.ascontiguousarray(np.concatenate((pts, add), axis=0)),
+                len(add))
+
+    @staticmethod
     def _periodic_background(lo, hi, n):
         """Return an ``n^3`` cell-centred guard lattice spanning the domain.
 
@@ -1259,7 +1406,7 @@ class VoronoiGrid:
 
     @classmethod
     def _from_points_periodic(cls, pts, lo, hi, per, dispersion, ghost_pad,
-                              backend="auto", n_threads=-1):
+                              backend="auto", n_threads=-1, _refine_left=2):
         """Periodic Voronoi by GHOST IMAGES: replicate near-boundary generators
         into their periodic images, tessellate the lot non-periodically over a
         padded box, keep the N central cells as the real (periodic) cells and the
@@ -1294,18 +1441,39 @@ class VoronoiGrid:
         margin = np.where(pad_axis, np.maximum(ghost_pad * L, 3.0 * spacing),
                           0.0)
         margin0 = margin.copy()          # deposit reach: the ghost-CELL keep shell
-        # min-image shell: every generator imaged into the full [lo-L/2, hi+L/2]
-        # box. Enough for any mesh whose largest cell fits in a half-period (the
-        # sparse-N exception is covered by the 3x-spacing floor above).
-        margin_max = np.where(
-            pad_axis, np.maximum(np.minimum(margin, 3.0 * L), 0.5 * L), 0.0)
+        # Shell ceiling: ONE full period per padded axis -- the point at which
+        # the image set is COMPLETE. Every generator has then been replicated
+        # into all 26 neighbouring boxes, so a wider shell can only add images of
+        # images, which say nothing new about a mesh whose cells fit in a box.
+        # A half-period cap (what this was until 2026-07-29) is wrong twice over
+        # on a high-aspect box. It assumes the largest cell fits in a
+        # half-period, which a quasi-1D box breaks -- slab1d is 1 x 0.094 x
+        # 0.094, so the thin axes hold only ~5 generator spacings and a boundary
+        # cell's Voronoi reach runs past L/2; at 1500 generators the budget stuck
+        # at +2.3e-05 and closed to EXACTLY 0 only once the shell reached ~L.
+        # Worse, the cap was `max(min(margin, 3L), 0.5L)`, and there the
+        # 3x-spacing floor (0.054) already exceeded 0.5L (0.047) -- so
+        # margin_max came out EQUAL to the starting margin, the doubling loop
+        # could not grow by even one step on those axes, and the first iteration
+        # raised "even at the maximum shell" having never actually widened it.
+        # The starting margin is still honoured if it is wider than a period (a
+        # nearly-empty box, where 3*spacing alone exceeds L); dense meshes start
+        # at 3*spacing << L and stop long before the ceiling either way.
+        margin_max = np.where(pad_axis, np.maximum(margin, L), 0.0)
         while True:
             margin = np.minimum(margin, margin_max)
             # central generators first, then the periodic images that fall inside
             # the padded box [lo-margin, hi+margin].
             gens = [pts]
             parents = [np.arange(N, dtype=np.int64)]
-            offs = [(-1, 0, 1) if per[a] else (0,) for a in range(3)]
+            # Image ORDER follows the margin: +-1 period reaches only margin = L,
+            # so a wider shell has to replicate further out or it is padded but
+            # unpopulated -- the cells run into empty pad exactly as if the shell
+            # had never grown, which is the failure the growth loop is trying to
+            # fix. ceil(margin/L) is the smallest order that fills the pad.
+            offs = [tuple(range(-k, k + 1)) if per[a] else (0,)
+                    for a, k in ((a, max(1, int(np.ceil(margin[a] / L[a]))))
+                                 for a in range(3))]
             for ox in offs[0]:
                 for oy in offs[1]:
                     for oz in offs[2]:
@@ -1353,15 +1521,33 @@ class VoronoiGrid:
                         f"(`backend='multivoro'` or `'auto'`).")
                 break
             if np.all(margin >= margin_max):
+                # Last resort: REFINE. Growing the shell is the exact fix and is
+                # tried first -- it tessellates the caller's generators and
+                # nothing else -- but a cell that is genuinely bigger than the
+                # shell ceiling cannot be closed by any shell, and there the
+                # only move left is to make the cells smaller. Cost is why this
+                # is second, not first: it changes the returned mesh.
+                if _refine_left > 0:
+                    lim = cls._periodic_cell_rad_limit(L, per)
+                    new, nadd = cls._insert_for_half_period(
+                        pts, lo, hi, per, vg, lim, lim)
+                    if nadd:
+                        print(f"VoronoiGrid: ghost-image budget {verr:+.2e} at "
+                              f"the maximum shell; adding {nadd} generators "
+                              f"inside the over-large cells and rebuilding",
+                              flush=True)
+                        return cls._from_points_periodic(
+                            new, lo, hi, per, dispersion, ghost_pad, backend,
+                            n_threads, _refine_left - 1)
                 raise RuntimeError(
                     f"periodic Voronoi volume budget off by {verr:+.2e} even at "
-                    f"the maximum (min-image, half-period) shell: the "
+                    f"the maximum (one-period) image shell {margin_max}: the "
                     f"{_resolve_backend(backend)!r} boundary cells are still "
                     f"not being cut by their periodic images, so the central "
                     f"cells do not tile the box. This needs a mesh whose "
-                    f"largest cell fits in a half-period — if {N} generators "
-                    f"over this box genuinely cannot give one, the box is too "
-                    f"sparsely sampled to tessellate periodically.")
+                    f"largest cell fits within one period — if {N} "
+                    f"generators over this box genuinely cannot give one, the "
+                    f"box is too sparsely sampled to tessellate periodically.")
             margin = 2.0 * margin
         # The auto-grown shell is needed only WHILE tessellating (to close the
         # central cells); the deposit only ever reaches ghost cells within a
@@ -1565,6 +1751,50 @@ class VoronoiGrid:
             periodic=(False, False, False))
 
     @classmethod
+    def _arepo_refine_to_budget(cls, pts, lo, hi, per, m, verr, nt):
+        """Insert generators into the over-large cells until the native periodic
+        budget closes. Returns ``(points, mesh, verr)`` -- the last mesh built,
+        which the caller re-checks (an unclosed budget then takes the fallback).
+
+        Each round targets `_periodic_cell_rad_limit` and re-meshes; the limit is
+        a hard geometric bound, so one round normally does it (measured on the
+        1500-generator coarse meshes: slab1d +1.36% -> +1e-06 with 261 points
+        added, slab2d +12.88% -> +0.00% with 6612). The extra rounds cover the
+        case where refining one region opens a neighbouring cell up.
+
+        `_REFINE_MAX_GROWTH` is the escape hatch: a very high aspect box can need
+        more cells than the caller could possibly want (the count needed scales
+        as (L_long/L_short)^2 for a quasi-2D box), and silently returning a mesh
+        20x the requested size is worse than handing the job to the ghost path,
+        which tessellates the ORIGINAL generators exactly.
+        """
+        L = hi - lo
+        limit = cls._periodic_cell_rad_limit(L, per)
+        n_in = len(pts)
+        h = limit
+        for _ in range(_REFINE_ROUNDS):
+            new, nadd = cls._insert_for_half_period(
+                pts, lo, hi, per, m, limit, h)
+            if nadd == 0:
+                break
+            if len(new) > _REFINE_MAX_GROWTH * n_in:
+                print(f"VoronoiGrid: native AREPO refinement would need "
+                      f"> {_REFINE_MAX_GROWTH:g}x the {n_in} generators "
+                      f"supplied; leaving it to the ghost-image path",
+                      flush=True)
+                break
+            pts = new
+            m = _arepo_mesh.tessellate(pts, lo, hi, n_threads=nt, periodic=per)
+            verr = float(np.sum(m["volume"])) / float(np.prod(L)) - 1.0
+            print(f"VoronoiGrid: native AREPO budget {verr:+.3%} after adding "
+                  f"{nadd} generators inside cells wider than the periodic "
+                  f"unwrap limit ({len(pts)} cells now)", flush=True)
+            if abs(verr) <= _VOL_BUDGET_TOL:
+                break
+            h *= 0.7
+        return pts, m, verr
+
+    @classmethod
     def _from_arepo_periodic(cls, pts, lo, hi, per, ghost_pad, n_threads):
         """NATIVE periodic AREPO Voronoi. Unlike the ghost-generator path
         (`_from_points_periodic`), AREPO meshes the PHYSICAL non-cubic box directly
@@ -1595,12 +1825,26 @@ class VoronoiGrid:
         # ghost path) because a bad unwrap can move volume either way.
         if all(per):
             verr = float(np.sum(m["volume"])) / float(np.prod(hi - lo)) - 1.0
+            # A cell too big for the unwrap is a MESH problem, and no amount of
+            # re-meshing the same generators fixes it -- so refine: insert
+            # generators into the offending cells until every cell fits, and keep
+            # the native per-axis-period tessellation. Switching to the ghost
+            # path (what this did unconditionally until 2026-07-29) abandons
+            # AREPO's correct thin-box periods for a backend whose cubic-clip
+            # history on thin boxes is exactly why the native path exists.
+            # Refinement CHANGES the mesh -- more cells come back than
+            # generators went in -- so it is capped and the ghost path stays as
+            # the fallback for the case where the refinement would explode.
+            if abs(verr) > _VOL_BUDGET_TOL:
+                pts, m, verr = cls._arepo_refine_to_budget(
+                    pts, lo, hi, per, m, verr, nt)
             if abs(verr) > _VOL_BUDGET_TOL:
                 import warnings
                 backend = "multivoro" if _HAS_MULTIVORO else "pyvoro"
                 warnings.warn(
                     f"native AREPO periodic mesh volume budget off by {verr:+.3%} "
-                    f"(cell-spanning-half-period unwrap limit); rebuilding via the "
+                    f"(cell-spanning-half-period unwrap limit) and refinement "
+                    f"did not close it; rebuilding via the "
                     f"ghost-image path [{backend}]")
                 # re-apply the FALLBACK backend's de-sliver floor: the arepo
                 # entry path merged with _DESLIVER_FRAC["arepo"]=0.0, and

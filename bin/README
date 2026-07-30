@@ -1,0 +1,123 @@
+bin/ - IC generation and editing tools
+=====================================
+
+Add this directory to your PATH and every tool below is callable from
+anywhere; each one resolves the repository location from its own path, so no
+environment setup is needed.
+
+    export PATH=$PWD/bin:$PATH
+
+Every tool takes --help.
+
+IC editing (setupfiles/)
+------------------------
+
+  setbfield     Apply a magnetic field to a tipsy IC. A field is
+                profile x strength x direction x kind, so configurations are
+                combinations rather than menu entries. --kind potential builds
+                a vector potential A and reads B = curl A with a chosen
+                glassgen flavour; --clean then removes div B with the SAME
+                operator family, so the IC is clean in the measure it was
+                built in.
+                  -> setupfiles/IC_setBField.py
+
+  setquantity   Edit quantities: chainable operations over particles AND aux
+                in one pass, with one --where selection vocabulary shared by
+                all of them.
+                  ops: set velocity center remove keep rotate permute time
+                       bfield spin add
+                  -> setupfiles/IC_setQuantity.py
+
+  setimpact     Two-body impact / merger from one or two snapshots (one =
+                clone). Masses measured from the particles, centre-of-mass
+                frame, keplerian or simple orbit parameterisation.
+                  -> setupfiles/IC_setup_impact.py
+
+  divbclean     Statically clean div B on an existing IC (particles frozen,
+                only B and psi evolve). --flavour must match whatever the
+                field was built with; setbfield --clean runs this same code
+                with the flavour already matched.
+                  -> icgenerator/glassgen_python/mhd_divBclean.py
+
+Export / interpolation (setupfiles/)
+------------------------------------
+
+  tipsyexport   Convert a tipsy IC into another code's IC format. One entry
+                point over the seven ICconvert_tipsyto*.py converters:
+                  arepo athena gizmo opengadget3 phantom ramses sphexa
+                Flags after --format pass straight through, and
+                `--format FMT --help` shows that converter's own options.
+                  tipsyexport --list-formats
+                  -> setupfiles/ICconvert_tipsyto<fmt>.py
+
+  interpolatetogrid
+                Resample an SPH snapshot onto a structured target - uniform
+                grid, AMR octree, Voronoi mesh or projection map - and export
+                it (npz | hdf5 | ramses | cell-table | native). Use this when
+                you want a MESH of the fields; use tipsyexport when you want a
+                runnable IC for a specific code.
+                  -> setupfiles/IC_interpolate_to_grid.py
+
+  tipsyimport   The reverse: convert another code's finished RUN back into
+                tipsy snapshots for the analysis pipeline. Eight formats:
+                  arepo athena gizmo opengadget3 phantom pkdgrav3 ramses sphexa
+                Each takes <input> <output> <idx_interval> [paramfile]; the
+                paramfile is REQUIRED for athena and ramses.
+                  tipsyimport --list-formats
+                  -> setupfiles/ICconvert_<fmt>totipsy.py
+
+Not wrapped: POLARIS export - IC_export_polaris.py takes a galaxy CUTOUT
+(.npz from _polaris_locate_galaxy.py) and --out-dir, not a tipsy snapshot, so
+it does not share this shape. Run it directly.
+
+Glass generation and resampling (icgenerator/glassgen_python/)
+--------------------------------------------------------------
+
+  glassrelax    Relax a particle distribution toward a target density.
+  glassresample Resample a snapshot: --op split | merge | reconstruct.
+                This is where split/merge live - setquantity does NOT do them.
+  glasstable    Build/inspect the density table the reconstruction uses.
+
+These three are thin forwarders to the scripts of the same name in
+icgenerator/glassgen_python/, which resolve their package root from their own
+location; a symlink or a move would break that, so the forwarder exec's them
+in place.
+
+Typical chain
+-------------
+
+    setquantity  ic.00000 -o cen.00000 center --on potential-min
+    glassresample cen.00000 --op split --ntimes 2 -o fine
+    setbfield    fine.00000 -o fine_B.00000 \
+                 --profile rho --direction azi --strength beta-th --value 50 \
+                 --kind potential --flavour gdforce --clean --target-mean 1e-3
+    setimpact    fine_B.00000 -o merger.00000 \
+                 --orbit keplerian --separation 217 --pericentre 20 --ecc 1.0
+    interpolatetogrid merger.00000 mesh.h5 --grid amr \
+                 --fields rho,vx,vy,vz --output-format ramses
+    tipsyexport  merger.00000 merger_gizmo.hdf5 --format gizmo --mhd
+
+...and after that run finishes, bring it back for analysis:
+
+    tipsyimport  gizmo_rundir run_giz 10 run.param --format gizmo
+
+Note tipsyimport re-centres the particles into the gasoline [-L/2, L/2] box
+(per-axis, on the .param periods; on the data centroid when no .param is
+given), so a round trip differs from the original by a rigid translation
+unless the input was already box-centred. That is deliberate - the analysis
+framework expects centred snapshots.
+
+(divbclean is not in that chain because setbfield --clean already ran it; use
+it standalone on an IC whose field came from somewhere else.)
+
+Notes
+-----
+
+  * setbfield/setquantity/setimpact write a JSON audit beside the output
+    (OUT_setBField.json, OUT_impact.json) recording the configuration and the
+    resulting diagnostics.
+  * Aux files are carried through every operation: removing particles drops
+    their aux rows, and rotations turn the packed vector aux together with its
+    scalar component twins (BFieldx/y/z, wx/wy/wz).
+  * mhd_divBclean.py (icgenerator/glassgen_python/) cleans div B on an
+    existing IC as a standalone pass; setbfield --clean calls the same code.

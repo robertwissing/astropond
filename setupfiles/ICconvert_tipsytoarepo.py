@@ -35,6 +35,8 @@ the old approach of sed-editing AREPO's noh_3d example file.
 """
 import argparse
 import os
+
+from ICconvert_common import find_sibling_param
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,14 +47,6 @@ from sph_interp._arepo.arepo_bggrid import regrid_amr_petkova
 from sph_interp.export import scale_hdf5_bfield, MU0_CODE_TO_GAUSS
 
 
-def _find_gasoline_param(tipsy_input):
-    """The gasoline `.param` beside a tipsy snapshot `<name>.NNNNN`: try
-    `<name>.param` (strip the snapshot index)."""
-    base = tipsy_input
-    if "." in os.path.basename(base):
-        base = base.rsplit(".", 1)[0]
-    cand = base + ".param"
-    return cand if os.path.exists(cand) else None
 
 
 def build_argv(args, output=None):
@@ -149,7 +143,7 @@ def write_param(args):
     """Write the AREPO simulation param.txt for this conversion (if requested)."""
     if not args.param_out:
         return
-    gas_param = _find_gasoline_param(args.input)
+    gas_param = find_sibling_param(args.input)
     if gas_param is None:
         print("WARNING: no gasoline .param found beside %r; cannot write "
               "param.txt." % args.input)

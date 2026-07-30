@@ -13,6 +13,8 @@ for the mapping and the SPH unit caveat.
 """
 import argparse
 import os
+
+from ICconvert_common import find_sibling_param
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,12 +22,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sph_interp._pkdgrav3.pkdgrav3_param import write_run_param
 
 
-def _find_gasoline_param(tipsy_input):
-    base = tipsy_input
-    if "." in os.path.basename(base):
-        base = base.rsplit(".", 1)[0]
-    cand = base + ".param"
-    return cand if os.path.exists(cand) else None
 
 
 def main(argv=None):
@@ -38,7 +34,7 @@ def main(argv=None):
                     help="gravity-only run (omit the SPH hydro_model block)")
     args = pa.parse_args(argv)
 
-    gas_param = _find_gasoline_param(args.tipsy_ic)
+    gas_param = find_sibling_param(args.tipsy_ic)
     if gas_param is None:
         sys.exit("FATAL: no gasoline .param found beside %r" % args.tipsy_ic)
     # pkdgrav3 runs from the testsuite cwd, so achInFile is the IC path as given;

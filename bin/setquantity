@@ -1,0 +1,43 @@
+#!/bin/bash
+# setquantity: edit quantities in a tipsy IC - particles and aux together.
+#
+# Operations CHAIN: several apply in one pass, in the order given, so a whole
+# IC-prep recipe is one reproducible command. Every operation takes --type and
+# repeatable --where selections over the same vocabulary (r, rcyl, x, y, z,
+# absz, v, rho, temp, mass, metals, eps, phi, tform, index).
+#
+# usage: setquantity [tipsy.NNNNN] [-o OUT] <op> [flags] [<op> [flags] ...]
+#
+#   setquantity                                  # interactive menu
+#   setquantity ic.00000 --list-ops              # what the ops are
+#   setquantity ic.00000 -o out.00000 \
+#       center --on potential-min \
+#       set --field temp --value 1e4 \
+#       remove --type gas --where 'r>50' \
+#       rotate --axis x --angle 30
+#   setquantity ic.00000 -o out.00000 bfield --op over-rho
+#   setquantity ic.00000 -o out.00000 \
+#       bfield --op smooth --nsmooth 64 --passes 2
+#   setquantity ic.00000 --dry-run remove --type dark --where 'r>200'
+#
+# ops: set velocity center remove keep rotate permute time bfield spin add
+#      (<op> --help for one operation's flags)
+#
+# Aux files ride along: removing particles drops their aux rows, appending
+# zero-fills them, and a rotation turns the packed vector aux AND its scalar
+# component twins (BFieldx/y/z, wx/wy/wz) together.
+#
+# SPLIT/MERGE ARE NOT HERE - glassresample does them for all particle types
+# with proper aux and .param handling:
+#     icgenerator/glassgen_python/glassresample ic.00000 --op split --ntimes 3
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script=$setup/IC_setQuantity.py
+
+ic_require_script setquantity "$script"
+ic_require_snapshot setquantity "$@"
+
+ic_exec setquantity "$script" "$setup:$glassgen" "$@"

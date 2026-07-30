@@ -1,4 +1,4 @@
-setupfiles/IC_setup_mti.py#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Created on Fri Apr 27 14:57:12 2018
@@ -8,8 +8,9 @@ Created on Fri Apr 27 14:57:12 2018
 
 ## Setup for ORZAG-TANG
 import numpy as np
-if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
-    np.trapz = np.trapezoid
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
+# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import IC_distribute as distribute
 import IC_fixdens as fixdens
 import IC_smoothlength as smth
@@ -117,7 +118,7 @@ class setup_mti(object):
         self.npart=len(self.x)
         self.ngas=self.npart
 
-        totmass = np.trapz(self.getrho_vec(zgrid),zgrid)*self.dxbound*self.dybound;
+        totmass = _trapezoid(self.getrho_vec(zgrid),zgrid)*self.dxbound*self.dybound;
         print("Numerically integrated mass " , totmass)
         ntab=10000
         dimtab=1

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+IC_analysis_sedov.py #!/usr/bin/env python3
 """
 Analysis for the Sedov-Taylor blast wave test (IC_setup_sedov).
 
@@ -36,8 +36,9 @@ import os
 import sys
 
 import numpy as np
-if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
-    np.trapz = np.trapezoid
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
+# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import readtipsy as tip
 from scipy.integrate import solve_ivp
 
@@ -113,7 +114,7 @@ def _sedov_tables(gamma=GAMMA, xi_min=1e-6, n=4000):
     # Energy integral E = 4 pi R^3 D^2 rho0 I_E, with D=(2/5)R/t:
     #   I_E = int_0^1 [1/2 G V^2 + G Z/(gamma(gamma-1))] xi^2 dxi
     integ = (0.5*G*V**2 + G*Z/(g*(g-1.0))) * xi**2
-    I_E = float(np.trapz(integ, xi))
+    I_E = float(_trapezoid(integ, xi))
     xi0 = (25.0/(16.0*np.pi*I_E))**0.2
     out = (xi, V, G, Z, xi0, I_E)
     _SEDOV_CACHE[key] = out
@@ -151,8 +152,8 @@ def energy_fractions(gamma=GAMMA):
       I_therm = int_0^1 G Z/(gamma(gamma-1)) xi^2 dxi   (E_int = p/(gamma-1))
     and f = I/I_E. For gamma=5/3 spherical: ~0.283 kinetic, ~0.717 thermal."""
     xi, V, G, Z, _xi0, I_E = _sedov_tables(gamma)
-    I_kin = float(np.trapz(0.5 * G * V**2 * xi**2, xi))
-    I_therm = float(np.trapz(G * Z / (gamma * (gamma - 1.0)) * xi**2, xi))
+    I_kin = float(_trapezoid(0.5 * G * V**2 * xi**2, xi))
+    I_therm = float(_trapezoid(G * Z / (gamma * (gamma - 1.0)) * xi**2, xi))
     return I_kin / I_E, I_therm / I_E
 
 

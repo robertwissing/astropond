@@ -9,8 +9,9 @@ Normalization (3D): W(r,h) = cnorm3D(h) * w(q),  cnorm3D(h) = 1 / (pi h^3).
 """
 
 import numpy as np
-if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
-    np.trapz = np.trapezoid
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
+# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 from numba import njit
 
 # Support radius of the cubic spline in units of h, and its square.
@@ -123,7 +124,7 @@ def _build_col_table(ns=COL_NS, nt=4096):
             vals[i] = 0.0
             continue
         t = np.linspace(0.0, tmax, nt)
-        vals[i] = 2.0 * np.trapz(_w_cubic_vec(np.sqrt(si * si + t * t)), t)
+        vals[i] = 2.0 * _trapezoid(_w_cubic_vec(np.sqrt(si * si + t * t)), t)
     return vals
 
 

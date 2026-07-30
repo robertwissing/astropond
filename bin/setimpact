@@ -1,0 +1,48 @@
+#!/bin/bash
+# setimpact: set up a two-body impact / merger from one or two tipsy snapshots.
+#
+# Omitting the second snapshot clones the first (equal-mass merger). Masses are
+# MEASURED from the particles, the pair is placed in its centre-of-mass frame
+# with momentum conservation, and every vector the snapshots carry is rotated
+# with them - positions, velocities, packed vector aux (BField) and scalar
+# component twins (BFieldx/y/z, wx/wy/wz).
+#
+# usage: setimpact <target.NNNNN> [impactor.NNNNN] [-o OUT] --separation R ...
+#
+#   # equal-mass parabolic galaxy merger, impactor inclined 60 deg, retrograde
+#   setimpact galaxy.00000 -o merger.00000 \
+#       --orbit keplerian --separation 217 --pericentre 20 --ecc 1.0 \
+#       --incline-impactor x 60 --spin-flip
+#
+#   # unequal-mass planetary impact at 0.4 impact parameter
+#   setimpact target.00000 impactor.00000 -o impact.00000 \
+#       --orbit simple --separation 5 --vinf 0 --impact-parameter 0.4
+#
+# Two orbit parameterisations:
+#   --orbit keplerian --separation R --pericentre RP --ecc E
+#       the exact two-body solution (p = rp(1+e), L = sqrt(GMp), vis-viva),
+#       split into tangential and inward radial parts, so the pair really is
+#       on that orbit and will reach that pericentre. e=1 parabolic (default),
+#       <1 bound, >1 hyperbolic. Impossible requests are refused, not NaN'd.
+#   --orbit simple --separation R --vinf V --impact-parameter B
+#       v = sqrt(v_esc^2 + vinf^2) along the line of centres with a transverse
+#       offset B (fraction of the separation; --impact-parameter-abs for a
+#       length). The impact-angle convention.
+#
+# G defaults to 1 (gasoline code units); --G to change. Masses default to the
+# particle total - --mass-within R measures inside a radius (e.g. a virial
+# radius), --mass-types restricts which types count. Writes OUT plus its aux
+# and OUT_impact.json (orbit, masses, resulting vectors).
+#
+# Run with --help for the full flag list.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script=$setup/IC_setup_impact.py
+
+ic_require_script setimpact "$script"
+ic_require_snapshot setimpact "$@"
+
+ic_exec setimpact "$script" "$setup:$glassgen" "$@"

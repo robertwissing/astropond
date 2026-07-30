@@ -1,4 +1,4 @@
-../../setupfiles/_validate_magnetic_reconstruction.py#!/usr/bin/env python
+#!/usr/bin/env python
 """Periodic magnetic reconstruction resolution matrix.
 
 This is the synthetic first gate for the face-field -> particle path.  Source

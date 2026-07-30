@@ -1,0 +1,135 @@
+#!/bin/bash
+# tipsyexport: convert a tipsy IC into another code's initial-conditions format.
+#
+# One entry point over the setupfiles/ICconvert_tipsyto*.py converters, so you
+# pick a target with --format instead of remembering seven script names. Every
+# flag after --format is passed straight through to that converter, and
+# `--format FMT --help` prints its full option list.
+#
+# usage: tipsyexport <input.NNNNN> <output> --format FMT [converter options]
+#        tipsyexport --list-formats
+#        tipsyexport --format ramses --help
+#
+#   tipsyexport run.00000 run_gizmo.hdf5   --format gizmo --mhd
+#   tipsyexport run.00000 run_arepo.hdf5   --format arepo voronoi petkova
+#   tipsyexport run.00000 ramses_rundir    --format ramses --levelmax 9
+#   tipsyexport run.00000 athena_rundir    --format athena --npx 256
+#   tipsyexport run.00000 run_phantom      --format phantom
+#   tipsyexport run.00000 run_sphexa       --format sphexa    # -> run_sphexa.h5
+#
+# The matching gasoline .param must normally sit beside the input: box size,
+# gamma, EOS and gravity are read from it.
+#
+# NOT here:
+#   * POLARIS export - IC_export_polaris.py takes a galaxy CUTOUT (.npz from
+#     _polaris_locate_galaxy.py) and --out-dir, not a tipsy snapshot, so it
+#     does not share this shape. Run it directly.
+#   * Generic grid/mesh resampling (uniform, AMR, Voronoi, projection ->
+#     npz/hdf5/ramses/cell-table) - that is `interpolatetogrid`.
+#   * The reverse direction: setupfiles/ICconvert_*totipsy.py convert arepo,
+#     athena, gizmo, opengadget3, phantom, pkdgrav3, ramses and sphexa output
+#     back INTO tipsy.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+# format -> converter script, what the OUTPUT argument means, and a one-liner
+formats=(arepo athena gizmo opengadget3 phantom ramses sphexa)
+script_for() {
+    case $1 in
+        arepo)       echo "ICconvert_tipsytoarepo.py" ;;
+        athena)      echo "ICconvert_tipsytoathena.py" ;;
+        gizmo)       echo "ICconvert_tipsytogizmo.py" ;;
+        opengadget3) echo "ICconvert_tipsytoopengadget3.py" ;;
+        phantom)     echo "ICconvert_tipsytophantom.py" ;;
+        ramses)      echo "ICconvert_tipsytoramses.py" ;;
+        sphexa)      echo "ICconvert_tipsytosphexa.py" ;;
+        *)           echo "" ;;
+    esac
+}
+
+list_formats() {
+    cat <<'EOF'
+FORMAT       OUTPUT is    PRODUCES                                REQUIRED / NOTABLE
+-----------  -----------  --------------------------------------  --------------------
+arepo        file.hdf5    AREPO moving-mesh IC                    [mode] [method]
+                                                                  mode: particles |
+                                                                  voronoi | amr |
+                                                                  uniform | arepo-grid
+athena       rundir       Athena++ GridIC + athinput.gridic       --npx N   (required)
+gizmo        file.hdf5    GIZMO type-0 HDF5 + parameterfile       --mhd --boxsize
+opengadget3  file.hdf5    OpenGadget3 type-0 HDF5 + param         --mhd --boxsize
+phantom      prefix       Phantom full dump (prefix_00000) + .in  --tu-fac
+ramses       rundir       RAMSES GridIC + namelist                --levelmax L (required)
+sphexa       prefix       SPH-EXA Step#0 HDF5 (writes prefix.h5)  .param must sit beside
+
+  tipsyexport --format FMT --help    full option list for one converter
+EOF
+}
+
+usage() {
+    sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    echo
+    list_formats
+}
+
+fmt=""
+args=()
+want_help=0
+while (($#)); do
+    case $1 in
+        -f|--format)
+            [[ $# -ge 2 ]] || { echo "tipsyexport: --format needs a value" >&2; exit 1; }
+            fmt=$2; shift 2 ;;
+        --format=*)  fmt=${1#--format=}; shift ;;
+        --list-formats) list_formats; exit 0 ;;
+        -h|--help)   want_help=1; args+=("$1"); shift ;;
+        *)           args+=("$1"); shift ;;
+    esac
+done
+
+if [[ -z $fmt ]]; then
+    # no format: with --help (or nothing at all) show the overview, else complain
+    if ((want_help)) || [[ ${#args[@]} -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+    echo "tipsyexport: --format is required" >&2
+    echo >&2
+    list_formats >&2
+    exit 1
+fi
+
+script=$(script_for "$fmt")
+if [[ -z $script ]]; then
+    echo "tipsyexport: unknown format '$fmt'" >&2
+    echo >&2
+    list_formats >&2
+    exit 1
+fi
+script=$setup/$script
+[[ -f $script ]] || { echo "tipsyexport: cannot find $script" >&2; exit 1; }
+
+# validate the input snapshot unless we are only asking for help
+if ((!want_help)); then
+    [[ ${#args[@]} -ge 1 ]] || {
+        echo "tipsyexport: need <input> and <output> for --format $fmt" >&2
+        exit 1
+    }
+    [[ -f ${args[0]} ]] || {
+        echo "tipsyexport: no such snapshot: ${args[0]}" >&2
+        exit 1
+    }
+    [[ ${#args[@]} -ge 2 ]] || {
+        echo "tipsyexport: --format $fmt also needs an output argument" >&2
+        echo "             (see: tipsyexport --list-formats)" >&2
+        exit 1
+    }
+    echo "tipsyexport: $fmt  <-  ${args[0]}  ->  ${args[1]}"
+    echo "             running $(basename "$script")"
+fi
+
+exec env IC_TOOL_NAME="tipsyexport --format $fmt" \
+    PYTHONPATH=$setup:$glassgen${PYTHONPATH:+:$PYTHONPATH} \
+    python "$script" ${args[@]+"${args[@]}"}

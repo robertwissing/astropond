@@ -12,8 +12,9 @@ import scipy.integrate as integrate
 #from mpmath import *
 import mpmath as mp
 import numpy as np
-if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
-    np.trapz = np.trapezoid
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
+# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import scipy.optimize as optimize
 import numba
 from scipy.optimize import curve_fit
@@ -522,7 +523,7 @@ class varpoly(eos):
     
     def getisotrope(self,rho,T):
         self.calculate_P(rho,T)
-        us=np.trapz(self.P/rho**2,rho)
+        us=_trapezoid(self.P/rho**2,rho)
         return us
 
 ## Get isentrope from gruneisen    
@@ -559,7 +560,7 @@ class varpoly(eos):
             self.grun_int = np.zeros_like(self.rho)
             self.grun_int2 = np.zeros_like(self.rho)
             for i in range(len(self.rho)):
-                    #self.grun_int[i]=np.trapz(self.grun[:(i+1)]/self.rho[:(i+1)],self.rho[:(i+1)])
+                    #self.grun_int[i]=_trapezoid(self.grun[:(i+1)]/self.rho[:(i+1)],self.rho[:(i+1)])
                     integ=integrate.quad(self.test.grun_integrand, 0.0000001 ,self.rho[i])
                     #integ2=integrate.quad(self.test.grun_integrand, self.rho[-1],self.rho[i])
                     self.grun_int[i]=integ[0]
@@ -581,7 +582,7 @@ class varpoly(eos):
             grun_integrand_values[:i+1] = self.test.grun_integrand(self.rho[:i+1])
     
             # Calculate the integral using trapezoidal rule
-            self.grun_int[i] = np.trapz(grun_integrand_values[:i+1], self.rho[:i+1])
+            self.grun_int[i] = _trapezoid(grun_integrand_values[:i+1], self.rho[:i+1])
     
         # Alternatively, if you need to use the quadrature method for some reason
         # Replace np.trapz with quad if necessary, and ensure the results are handled correctly.

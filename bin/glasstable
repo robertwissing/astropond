@@ -1,0 +1,13 @@
+#!/bin/bash
+# glasstable: glasstable: density-TABLE GENERATOR. On a snapshot it captures the RAW
+#
+# Thin forwarder to icgenerator/glassgen_python/glasstable, which holds the real
+# implementation and usage text - run `glasstable --help`. Kept as a forwarder rather
+# than a move or a symlink because that script resolves its package root from
+# its own location ($0), which both would break.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+ic_forward glasstable "$glassgen/glasstable" "$@"

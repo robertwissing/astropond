@@ -38,8 +38,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sph_interp.gridic import write_grid_ic
-from ICconvert_tipsytoramses import _find_param, _param, _f
-from ICconvert_common import has_nonzero_b as _has_nonzero_b
+# NB `_param`/`_f` are still private imports from the ramses converter -
+# they are the .param PARSER, which CONSOLIDATION_PLAN D1 unifies next.
+from ICconvert_tipsytoramses import _param, _f
+from ICconvert_common import find_sibling_param, has_nonzero_b as _has_nonzero_b
 
 
 def _axis_blocks(n):
@@ -144,7 +146,7 @@ def main(argv=None):
                          "where the axis allows)")
     args = pa.parse_args(argv)
 
-    gas = _param(_find_param(args.input))
+    gas = _param(find_sibling_param(args.input))
     gamma = _f(gas, "dConstGamma", 5.0 / 3.0)
     if args.boxsize is not None:
         box3 = [args.boxsize] * 3

@@ -23,17 +23,54 @@ banauxfiles = ["AHF","grid"]
 vecauxfiles = ["BField","CurlB"]
 
 
-def readtipsy(file_string,endian=1):
+def readtipsy(file_string,endian=1,strict=True):
     fB=open(file_string,'rb')
     time=np.fromfile(fB,dtype=dd,count=1)
     data_header=np.fromfile(fB,dtype=di,count=6)
-    tipsygdata=np.fromfile(fB,dtype=df,count=data_header[2]*12)
-    tipsygdata=np.reshape(tipsygdata,(-1,12))
-    tipsyddata=np.fromfile(fB,dtype=df,count=data_header[3]*9)
-    tipsyddata=np.reshape(tipsyddata,(-1,9))
-    tipsysdata=np.fromfile(fB,dtype=df,count=data_header[4]*11)
-    tipsysdata=np.reshape(tipsysdata,(-1,11))
+    # Whole-file size check. The per-block guard below catches a file that is
+    # too SHORT; only this catches one that is too LONG, i.e. a header that
+    # UNDERSTATES its counts - there every np.fromfile returns exactly what it
+    # asked for, so nothing downstream looks wrong, but the dark read started
+    # partway through the gas block and every array after it is garbage of the
+    # right shape. Header is 32 bytes (f8 time + 6 x i4), then f4 particle
+    # records of 12 / 9 / 11 columns.
+    expect=32+4*(12*int(data_header[2])+9*int(data_header[3])
+                 +11*int(data_header[4]))
+    actual=os.path.getsize(file_string)
+    if actual < expect:
+        fB.close()
+        raise ValueError(
+            "%s: header declares %d/%d/%d gas/dark/star, needing %d bytes, "
+            "but the file is only %d - it is truncated"
+            % (file_string,data_header[2],data_header[3],data_header[4],
+               expect,actual))
+    if actual > expect and strict:
+        fB.close()
+        raise ValueError(
+            "%s: header declares %d/%d/%d gas/dark/star, needing %d bytes, "
+            "but the file is %d (%d extra). The counts are too small for the "
+            "data: reads would silently start mid-block and return "
+            "correctly-shaped garbage. Pass strict=False to read anyway."
+            % (file_string,data_header[2],data_header[3],data_header[4],
+               expect,actual,actual-expect))
+    raw=[]
+    for n,ncol,name in ((data_header[2],12,'gas'),(data_header[3],9,'dark'),
+                        (data_header[4],11,'star')):
+        flat=np.fromfile(fB,dtype=df,count=n*ncol)
+        # A truncated snapshot used to come back SHORTER than its own header
+        # says (np.fromfile returns what it could read and reshape(-1,ncol)
+        # hides it), after which every consumer that trusts data_header
+        # indexes past the end. Check BEFORE reshaping, so the error names the
+        # problem instead of surfacing as a reshape failure.
+        if len(flat) != n*ncol:
+            fB.close()
+            raise ValueError(
+                "%s: header declares %d %s particles (%d values) but only %d "
+                "could be read - the file is truncated or not a tipsy snapshot"
+                % (file_string,n,name,n*ncol,len(flat)))
+        raw.append(np.reshape(flat,(-1,ncol)))
     fB.close()
+    tipsygdata,tipsyddata,tipsysdata=raw
     return tipsygdata,tipsyddata,tipsysdata,data_header,time
     
 def readtipsyaux(file_stringaux,label,binary=1,endian=1):
@@ -125,14 +162,28 @@ def readalltipsyaux(file_string,binary=1,endian=1):
                 print(npart,naux)
                 if(i==0):
                     X=np.zeros((npart[0],naux+vec))
-                if(label[i] in intauxfiles):
-                    X[:,k]=np.fromfile(fB,dtype=di)
+                # `label` grows by THREE entries per vector aux, so label[i]
+                # stopped matching file i after the first vector file and an
+                # iord following a BField was read with the float reader.
+                # The label of file i is the one just appended, i.e. label[k].
+                # a sibling that is not actually an aux file (a stray copy, a
+                # .npz, another snapshot) used to fail as an opaque numpy
+                # broadcast error; name the file instead
+                want=npart[0]*(3 if vecread else 1)
+                payload=np.fromfile(fB,dtype=di if label[k] in intauxfiles
+                                    else df)
+                if len(payload) != want:
+                    fB.close()
+                    raise ValueError(
+                        "%s: expected %d values for %d particles but found %d "
+                        "- this sibling is not an aux file of %s"
+                        % (file_stringaux[i],want,npart[0],len(payload),
+                           file_string))
+                if vecread == 1:
+                    X[:,k:k+3]=payload.reshape((-1, 3))
+                    k=k+2
                 else:
-                    if vecread == 1:
-                        X[:,k:k+3]=(np.fromfile(fB,dtype=df)).reshape((-1, 3))
-                        k=k+2
-                    else:
-                        X[:,k]=np.fromfile(fB,dtype=df)
+                    X[:,k]=payload
                 k=k+1
                 fB.close()
         X=fixendian(X,endian)
@@ -152,30 +203,39 @@ def readalltipsy(file_string,binary=1,endian=1):
     tipsysdata=fixendian(tipsysdata,endian)
     return tipsygdata,tipsyddata,tipsysdata,data_header,time,label
     
-def writetipsyaux(X,label,file_string,binary=1,endian=1):  
+def writetipsyaux(X,label,file_string,binary=1,endian=1):
     file_stringB=file_string + "." + label
-    fB=open(file_stringB,'w');
-    fB=open(file_stringB,'a');
-    B=df.type(X)
+    # Integer aux (iord/igasorder) must be written as i4: readtipsyaux reads
+    # exactly those labels back as i4, so writing them as f4 made them
+    # unreadable - a write/read round trip of an iord returned garbage.
+    B=di.type(X) if label in intauxfiles else df.type(X)
     npart=len(X)
     bnpart=di.type(npart)
+    # was: open(...,'w') immediately followed by open(...,'a'), which leaked
+    # the first handle on every call (one fd per aux file written)
     if(binary==0):
-        fB.write(str(npart))
-        fB.write("\n")
-        np.savetxt(fB,B);
-        fB.close()
+        with open(file_stringB,'w') as fB:
+            fB.write(str(npart))
+            fB.write("\n")
+            np.savetxt(fB,B);
     else:
         B=fixendian(B)
         bnpart=bnpart.byteswap()
-        bnpart.tofile(fB)
-        B.tofile(fB)
-        fB.close()
-        fB=open(file_stringB,'rb')     
-        fB.close()
-        
+        with open(file_stringB,'wb') as fB:
+            bnpart.tofile(fB)
+            B.tofile(fB)
+
 def writetipsy(tipsygdata,tipsyddata,tipsysdata,file_string,data_header,time=np.array([0.0]),endian=1):
-    fbin=open(file_string,'wb');
-    fbin=open(file_string,'ab');
+    # header must agree with what is actually being written, or the file reads
+    # back truncated/over-long (readtipsy now rejects that outright)
+    for arr,n,name in ((tipsygdata,data_header[2],'gas'),
+                       (tipsyddata,data_header[3],'dark'),
+                       (tipsysdata,data_header[4],'star')):
+        if len(arr) != n:
+            raise ValueError(
+                "writetipsy: header says %d %s particles but %d were passed "
+                "(update data_header before writing)" % (n,name,len(arr)))
+    fbin=open(file_string,'wb')
     tipsygdata=df.type(tipsygdata)
     tipsyddata=df.type(tipsyddata)
     tipsysdata=df.type(tipsysdata)
@@ -224,25 +284,21 @@ def writeprepASCII(tipsydata,file_string,data_header,time=np.array([0.0]),endian
     
 def writetipsyVecaux(X,label,file_string,binary=1,endian=1):  
         file_stringB=file_string + "." + label
-        fB=open(file_stringB,'w');
-        fB=open(file_stringB,'a');
         B=df.type(np.dstack((X[:,0],X[:,1],X[:,2])))
         npart=len(X[:,0])
         bnpart=di.type(npart)
         if(binary==0):
             B=df.type(np.hstack((X[:,0],X[:,1],X[:,2])))
-            fB.write(str(npart))
-            fB.write("\n")
-            np.savetxt(fB,B);
-            fB.close()
+            with open(file_stringB,'w') as fB:
+                fB.write(str(npart))
+                fB.write("\n")
+                np.savetxt(fB,B);
         else:
             B=B.byteswap().view(B.dtype.newbyteorder())
             bnpart=bnpart.byteswap()
-            bnpart.tofile(fB)
-            B.tofile(fB)
-            fB.close()
-            fB=open(file_stringB,'rb')     
-            fB.close()
+            with open(file_stringB,'wb') as fB:
+                bnpart.tofile(fB)
+                B.tofile(fB)
             
 def createtipsysplash(file_string,binary=1,endian=1,centering=0):
     tipsygdata,tipsyddata,tipsysdata,data_header,time,label=readalltipsy(file_string)
@@ -351,10 +407,15 @@ def getfiles(endtag="[0-9]"):
 def getgridall(listOfFiles,replace=0):
         tipsydata,cell,time =readgrid(listOfFiles[0])
         nx, ny, nz = (cell[0], cell[1], cell[2])
-        if(os.path.isfile("GridDataAllDumps.npy")):      
+        data=None
+        if(os.path.isfile("GridDataAllDumps.npy")):
             data=np.load("GridDataAllDumps.npy")
             print(ny,len(data[0,0,0,:,0]))
-        if(os.path.isfile("GridDataAllDumps.npy" or "TimeData.npy") and len(data[0,0,:,0,0])==nx and len(data[0,0,0,:,0]) == ny and len(data[0,0,0,0,:]) == nz and replace==0 and len(data[0,:,0,0,0]) == len(listOfFiles)):
+        # was: os.path.isfile("GridDataAllDumps.npy" or "TimeData.npy"), where
+        # the `or` collapses to the first string before isfile ever sees it -
+        # TimeData.npy was never checked, and a missing cache left `data`
+        # undefined instead of falling through to the rebuild.
+        if(data is not None and os.path.isfile("TimeData.npy") and len(data[0,0,:,0,0])==nx and len(data[0,0,0,:,0]) == ny and len(data[0,0,0,0,:]) == nz and replace==0 and len(data[0,:,0,0,0]) == len(listOfFiles)):
             data=np.load("GridDataAllDumps.npy")
             timedata=np.load("TimeData.npy")
         else:
@@ -376,7 +437,13 @@ def getgridall(listOfFiles,replace=0):
         return data,timedata
             
 def fixendian(arr,endian=1):
-    if(arr.dtype.byteorder == "=" or arr.dtype.byteorder == "<" and endian==1):
+    # NB `and` binds tighter than `or`, so the original condition
+    #     bo == "=" or bo == "<" and endian == 1
+    # parsed as  (bo == "=") or ((bo == "<") and endian == 1)  and therefore
+    # byteswapped a NATIVE array even when endian==0 asked it not to. The two
+    # readings agree for endian==1 (the default and effectively all callers),
+    # so this only ever mis-fired on the endian==0 path.
+    if((arr.dtype.byteorder == "=" or arr.dtype.byteorder == "<") and endian==1):
         arr=arr.byteswap().view(arr.dtype.newbyteorder())
     elif(arr.dtype.byteorder == ">" and endian==0):
         arr=arr.byteswap().view(arr.dtype.newbyteorder())

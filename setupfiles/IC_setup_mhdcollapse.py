@@ -1,8 +1,9 @@
 
 ## Setup for MHDCOLLAPSE
 import numpy as np
-if not hasattr(np, "trapz"):        # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4)
-    np.trapz = np.trapezoid
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
+# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import IC_distribute as distribute
 import IC_fixdens as fixdens
 import IC_smoothlength as smth
@@ -138,7 +139,7 @@ class setup_mhdcollapse(object):
              rq = np.linspace(0.0, 0.5*min(self.dxbound, self.dybound,
                                            self.dzbound), 200001)
              totmass = (self.rhoout*self.dxbound*self.dybound*self.dzbound
-                        + np.trapz((self.getrho_vec(rq) - self.rhoout)
+                        + _trapezoid((self.getrho_vec(rq) - self.rhoout)
                                    * 4.0*np.pi*rq**2, rq))
              print("table-integrated total mass ", totmass)
              # 1D radial density table for the glass relaxer, self-describing

@@ -1,0 +1,41 @@
+#!/bin/bash
+# setbfield: apply a magnetic field configuration to a tipsy IC, optionally by
+# constructing a vector potential A and taking its SPH curl, and optionally
+# cleaning div B afterwards.
+#
+# A field is four orthogonal choices - profile x strength x direction x kind -
+# so the old setBField.py menu entries are combinations rather than special
+# cases. The input snapshot is required; unspecified options are prompted for.
+#
+# usage: setbfield tipsy.NNNNN [options]
+#
+#   setbfield ic.00000                          # ask for options
+#   setbfield ic.00000 -o ic_B.00000 \
+#       --profile uniform --direction z --strength gauss --value 1e-6 \
+#       --kind field
+#   setbfield galaxy.00000 -o galaxy_B.00000 \
+#       --profile rho --rho-power 0.6667 --direction azi \
+#       --strength beta-th --value 50 --kind potential \
+#       --flavour gdforce --clean --target-mean 1e-3
+#
+# --kind potential builds A and reads B = curl A with the chosen glassgen
+# flavour (gdforce, rho2, gdforce-own, rho2-own) - the SAME operator family
+# the cleaning uses, so the IC is clean in the measure it was built in.
+# Potential mode always writes B to BField and A to AField.
+#
+# Units come from a sibling .param when one exists, else --kpc-unit /
+# --msol-unit / --gamma / --mu, else the prompt. Writes OUT plus its aux and
+# OUT_setBField.json (configuration + diagnostics).
+#
+# Run with --help for the full flag list.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script=$setup/IC_setBField.py
+
+ic_require_script setbfield "$script"
+ic_require_snapshot setbfield "$@"
+
+ic_exec setbfield "$script" "$setup:$glassgen" "$@"

@@ -25,6 +25,8 @@ import sys
 
 import numpy as np
 
+from ICconvert_common import read_gasoline_param
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sph_interp.gridic import cells_to_tipsy
@@ -80,13 +82,7 @@ def convertfile(rundir, output, idx_interval, paramfile, athena_vis=None):
         print(f"No *.out2.NNNNN.athdf under '{rundir}'", file=sys.stderr)
         sys.exit(1)
     os.makedirs(output, exist_ok=True)
-    gas = {}
-    if paramfile and os.path.exists(paramfile):
-        for line in open(paramfile):
-            line = line.split("#")[0]
-            if "=" in line:
-                k, _, v = line.partition("=")
-                gas[k.strip()] = v.strip()
+    gas = read_gasoline_param(paramfile)
     gamma = float(gas.get("dConstGamma", 5.0 / 3.0))
     boxlen = float(gas.get("dxPeriod", 1.0))
     tu_fac = None

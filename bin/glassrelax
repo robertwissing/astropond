@@ -1,0 +1,13 @@
+#!/bin/bash
+# glassrelax: Wrapper used for relaxing a distribution of particles to a glass following an arbitrary density profile.
+#
+# Thin forwarder to icgenerator/glassgen_python/glassrelax, which holds the real
+# implementation and usage text - run `glassrelax --help`. Kept as a forwarder rather
+# than a move or a symlink because that script resolves its package root from
+# its own location ($0), which both would break.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+ic_forward glassrelax "$glassgen/glassrelax" "$@"

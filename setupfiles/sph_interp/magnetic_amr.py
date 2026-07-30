@@ -19,18 +19,16 @@ from dataclasses import dataclass
 import numpy as np
 
 from .interpolate import GridResult, interpolate
+from .magnetic import _component_budget
 from .particles import Particles
 from .targets import AMRGrid
 
-
-def _budget(source, target):
-    source = np.asarray(source, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    delta = target - source
-    scale = max(float(np.linalg.norm(source)), np.finfo(np.float64).tiny)
-    return {"source": source.tolist(), "target": target.tolist(),
-            "delta": delta.tolist(),
-            "relative_norm": float(np.linalg.norm(delta) / scale)}
+# `_component_budget` is shared with the uniform capture path (magnetic.py) -
+# this module used to carry its own `_budget` twin, which had drifted and was
+# missing the per-component `relative` key, so the same diagnostic read
+# differently on the uniform and AMR audits (CONSOLIDATION_PLAN D6/D12-A1,
+# unified 2026-07-29). The AMR audits now gain that key; every consumer reads
+# only `relative_norm`, which is unchanged.
 
 
 @dataclass
@@ -812,9 +810,9 @@ def capture_open_amr_face_field(particles, grid, fields=("Bx", "By", "Bz"),
         "nleaf": int(grid.ncell),
         "nface_patches": int(topology.nface),
         "coarse_fine_patches": int(np.count_nonzero(level_jump)),
-        "particle_to_raw_integral_B": _budget(
+        "particle_to_raw_integral_B": _component_budget(
             source_integral, material_raw_integral),
-        "raw_to_projected_cell_integral_B": _budget(
+        "raw_to_projected_cell_integral_B": _component_budget(
             geometric_raw_integral, projected_integral),
         "residual_raw_integral_B": residual_raw_integral.tolist(),
         "geometric_raw_integral_B": geometric_raw_integral.tolist(),

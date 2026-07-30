@@ -25,6 +25,8 @@ import sys
 import glob
 
 import numpy as np
+
+from ICconvert_common import read_gasoline_param
 import h5py
 
 import readtipsy as tip
@@ -180,13 +182,7 @@ def _periods_from_param(paramfile):
     come from the original IC's .param."""
     if not paramfile or not os.path.exists(paramfile):
         return None
-    vals = {}
-    with open(paramfile) as f:
-        for line in f:
-            line = line.split("#")[0]
-            if "=" in line:
-                k, _, v = line.partition("=")
-                vals[k.strip()] = v.strip()
+    vals = read_gasoline_param(paramfile, missing="raise")
 
     def g(k):
         try:

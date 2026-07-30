@@ -155,11 +155,26 @@ def code_units(run_arg):
 
     Returns a `CodeUnits` namedtuple; multiply a code-unit quantity by the matching
     field (density_gcc, velocity_kms, b_uG, ...) to get cgs. None if dMsolUnit /
-    dKpcUnit are absent from the .log."""
+    dKpcUnit are absent from the .log. Use `code_units_from` when the two unit
+    values come from somewhere else (a '.param', a CLI flag)."""
     msol = read_log_param(run_arg, "dMsolUnit")
     kpc = read_log_param(run_arg, "dKpcUnit")
     if msol is None or kpc is None:
         return None
+    return code_units_from(msol, kpc)
+
+
+def code_units_from(msol, kpc):
+    """`code_units` for explicitly supplied dMsolUnit / dKpcUnit.
+
+    THE single derivation of the gasoline G=1 unit system in this suite -- other
+    consumers (the POLARIS SI layer in `polaris_units.py`) build on this rather
+    than re-deriving the constants.
+    """
+    msol, kpc = float(msol), float(kpc)
+    if not (msol > 0.0 and kpc > 0.0):
+        raise ValueError(f"dMsolUnit and dKpcUnit must be positive, got "
+                         f"{msol}, {kpc}")
     M, L = msol * _MSOL_G, kpc * _KPC_CM
     v_cms = np.sqrt(_G_CGS * M / L)
     rho_gcc = M / L ** 3

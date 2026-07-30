@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Interpolate a tipsy SPH snapshot onto a grid via the sph_interp package.
+#
+#   interpolatetogrid INPUT OUTPUT [options]
+#   interpolatetogrid INPUT          # prompt for remaining choices
+#   interpolatetogrid --help
+#
+# Thin wrapper: puts setupfiles/ on PYTHONPATH and runs the Python CLI.
+# Lives in bin/, so the repository root is one level up.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/setupfiles/_bin_common.sh"
+
+script=$setup/IC_interpolate_to_grid.py
+
+ic_require_script interpolatetogrid "$script"
+
+ic_exec interpolatetogrid "$script" "$setup" "$@"

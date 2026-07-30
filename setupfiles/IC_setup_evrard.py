@@ -1,4 +1,4 @@
-setupfiles/IC_setup_evrard.py ## Setup for ORZAG-TANG
+## Setup for ORZAG-TANG
 import numpy as np
 import IC_distribute as distribute
 import IC_fixdens as fixdens

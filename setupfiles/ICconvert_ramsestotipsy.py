@@ -32,6 +32,8 @@ import sys
 
 import numpy as np
 
+from ICconvert_common import read_gasoline_param
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sph_interp.gridic import cells_to_tipsy
@@ -132,13 +134,7 @@ def convertfile(rundir, output, idx_interval, paramfile, amr2cell=None,
         sys.exit(1)
     if amr2cell is None:
         amr2cell = os.environ.get("AMR2CELL", "amr2cell")
-    gas = {}
-    if paramfile and os.path.exists(paramfile):
-        for line in open(paramfile):
-            line = line.split("#")[0]
-            if "=" in line:
-                k, _, v = line.partition("=")
-                gas[k.strip()] = v.strip()
+    gas = read_gasoline_param(paramfile)
     gamma = float(gas.get("dConstGamma", 5.0 / 3.0))
     boxlen = float(gas.get("dxPeriod", 1.0))
     # read_param_tufac takes a SNAPSHOT stem (it appends .param itself);

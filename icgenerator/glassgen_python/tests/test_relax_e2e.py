@@ -2,6 +2,10 @@ import numpy as np
 
 from glassgen import CallableDensity, TableDensity, relax
 
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias; the
+# conftest global monkeypatch this used to rely on is gone (D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 
 def test_uniform_glass_periodic():
     rng = np.random.default_rng(11)
@@ -33,7 +37,7 @@ def test_sigmoid_profile_along_x():
     pos = rng.uniform(-0.5, 0.5, (n, 3))
     # equal-mass particles: total mass must integrate the target profile
     xq = np.linspace(-0.5, 0.5, 20001)
-    mtot = np.trapz(sigmoid_profile(xq), xq)
+    mtot = _trapezoid(sigmoid_profile(xq), xq)
     mass = np.full(n, mtot / n)
     xt = np.linspace(-0.5, 0.5, 2001)
     dens = TableDensity((xt,), sigmoid_profile(xt), mapping='signed_x')

@@ -1,4 +1,4 @@
-"""Native particle split / merge for multi-resolution glass relaxation.
+glassgen/resample.py """Native particle split / merge for multi-resolution glass relaxation.
 
 Ports the geometry of SPH_methods.split_particless / merge_my_neighbor
 (setupfiles/SPH_methods.py) but operates directly on glassgen's (pos, mass,
@@ -608,7 +608,8 @@ def _split_once(pos, mass, aux, box, nsmooth, margin, dist, halve,
 
 
 def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
-          dist=0.4, halve_fields=None, orient='k1jitter', scale='nn'):
+          dist=0.4, halve_fields=None, orient='k1jitter', scale='nn',
+          progress=None):
     """Split every particle, multiplying the count by `factor` (a power of 2).
 
     orient selects the dumbbell-axis algorithm (all perpendicular to the
@@ -647,7 +648,9 @@ def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
     (3,) periodic lengths or None (open). Returns (pos2, mass2, aux2) with
     N*factor rows. Total mass is conserved (each child carries mass/2^p). The
     SPH smoothing length h is NOT stored/derived here - it is a runtime quantity
-    (density / nSmooth k-nearest); the caller scales the softening eps."""
+    (density / nSmooth k-nearest); the caller scales the softening eps.
+    `progress(pass_number, count_before, count_after)` is called after every
+    binary split pass when supplied."""
     if aux is None:
         aux = {}
     halve = HALVE_FIELDS if halve_fields is None else frozenset(halve_fields)
@@ -658,9 +661,12 @@ def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
     pos = np.array(pos, dtype=np.float64)
     mass = np.array(mass, dtype=np.float64)
     aux = {k: np.array(v) for k, v in aux.items()}
-    for _ in range(passes):
+    for p in range(1, passes + 1):
+        n_before = len(pos)
         pos, mass, aux = _split_once(pos, mass, aux, box, nsmooth, margin,
                                      dist, halve, orient=orient, scale=scale)
+        if progress is not None:
+            progress(p, n_before, len(pos))
     return pos, mass, aux
 
 

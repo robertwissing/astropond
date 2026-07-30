@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from glassgen.flavours import FLAVOUR_SPECS
-from mhd_divBclean import clean_divergence
+from mhd_divBclean import _cleaning_plan, _write_audit_text, clean_divergence
 
 
 def _jittered(n_side=8, seed=0, box=1.0):
@@ -13,6 +13,50 @@ def _jittered(n_side=8, seed=0, box=1.0):
     pos += rng.uniform(-0.2, 0.2, pos.shape) * (box / n_side)
     n = len(pos)
     return pos, np.full(n, 1.0 / n)
+
+
+def test_cleaning_plan_reports_budget_without_target():
+    assert _cleaning_plan(500) == (
+        'cleaning plan: 500 iterations (no divBerr target)')
+
+
+def test_cleaning_plan_reports_enabled_targets():
+    assert _cleaning_plan(2000, target_mean=1e-3, target_max=5e-2) == (
+        'cleaning plan: up to 2000 iterations; target divBerr '
+        'mean <= 0.001 and max <= 0.05 (both required)')
+
+
+def test_text_audit_is_self_describing(tmp_path):
+    trace = {
+        'step': np.array([0, 25]),
+        'eps_mean': np.array([0.1, 0.01]),
+        'eps_p95': np.array([0.2, 0.02]),
+        'eps_max': np.array([0.5, 0.05]),
+        'eps_min': np.array([1e-6, 1e-7]),
+        'e_b': np.array([4.0, 3.0]),
+        'e_psi': np.array([0.0, 0.1]),
+    }
+    audit = {
+        'trace': trace, 'e_b_before': 4.0, 'steps_budget': 500,
+        'steps': 25, 'every': 25, 'tol': 0.0, 'sigma': 1.0, 'dt': 0.2,
+        'nsmooth': 64, 'flavour': 'gdforce', 'target_mean': 1e-3,
+        'target_max': 0.0, 'target_reached': False,
+    }
+    path = tmp_path / 'clean_divclean.txt'
+    _write_audit_text(path, audit, 'input.00000', 'output.00000',
+                      np.array([1.0, 2.0, 3.0]))
+
+    text = path.read_text()
+    assert '# SPH flavour: gdforce' in text
+    assert '# iteration budget: 500' in text
+    assert '# target divBerr mean: 0.001' in text
+    assert '# target divBerr max: disabled' in text
+    assert ('# divBerr definition: '
+            'h*abs(divB)/max(|B|,1e-12*Brms)') in text
+    assert '# domain: periodic box 1 2 3' in text
+    data = np.loadtxt(path)
+    assert data.shape == (2, 9)
+    np.testing.assert_allclose(data[:, 7], [0.0, 1.0])  # EClean
 
 
 @pytest.mark.parametrize('flavour', sorted(FLAVOUR_SPECS))

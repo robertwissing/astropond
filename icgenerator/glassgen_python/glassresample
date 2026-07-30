@@ -15,8 +15,10 @@
 # Defaults derived from the input name (overridden by passing the flag
 # yourself):
 #   --param <input minus .NNNNN>.param   (when that file exists)
-# The output defaults to <input minus .NNNNN>_<op>.00000 and the operation
-# is asked for interactively when --op is omitted (both handled by the CLI).
+# Split/merge output defaults to
+# <input minus .NNNNN>_<op>_<factor>x.00000 (factor=2**ntimes);
+# reconstruct uses _recon.00000.
+# The operation is asked for interactively when --op is omitted.
 # Everything else (--particletype, --op, --ntimes, -s, --dist, ...)
 # is passed straight to glassgen.resample_cli; run with --help to list.
 set -euo pipefail
@@ -38,7 +40,9 @@ base=$infile
 
 args=("$@")
 have_box=0
-for a in "${args[@]}"; do
+# Iterate over the positional parameters directly: on macOS's Bash 3.2,
+# expanding an empty array under `set -u` raises "args[@]: unbound variable".
+for a in "$@"; do
     case $a in
         --param|--param=*|--box|--open) have_box=1 ;;
     esac

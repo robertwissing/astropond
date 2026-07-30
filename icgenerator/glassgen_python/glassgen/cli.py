@@ -1,4 +1,4 @@
-glassgen/cli.py"""CLI: functional replacement for the gasoline.gdicgen invocation in
+"""CLI: functional replacement for the gasoline.gdicgen invocation in
 runtest.sh (tipsy pre-IC + density table in -> relaxed tipsy glass out).
 
 Example, mirroring runtest.sh ICCONFIG:

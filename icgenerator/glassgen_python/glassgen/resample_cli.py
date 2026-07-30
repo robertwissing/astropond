@@ -75,6 +75,13 @@ _TYPE_HALVE = {'gas': set(), 'dark': set(), 'star': set()}
 _TYPE_EPS = {'gas': ['eps'], 'dark': ['eps'], 'star': ['eps']}
 
 
+def _default_output_prefix(infile, op, ntimes):
+    """Default output name, including the actual split/merge count factor."""
+    stem = re.sub(r'\.\d+$', '', infile)
+    suffix = 'recon' if op == 'reconstruct' else f'{op}_{2 ** ntimes}x'
+    return stem + '_' + suffix
+
+
 def _read_aux(infile):
     """Read all aux sibling files of `infile`. Each aux file spans every
     particle ([gas|dark|star] concatenated under a single count header).
@@ -149,7 +156,8 @@ def main(argv=None):
     ap.add_argument('-I', dest='infile', required=True, help='input tipsy')
     ap.add_argument('-o', dest='out', default=None,
                     help='output prefix (writes ${out}.00000 + aux). '
-                         'Default: <input minus .NNNNN>_<op>')
+                         'Default: <input minus .NNNNN>_<op>_<factor>x for '
+                         'split/merge, or <input>_recon for reconstruct')
     ap.add_argument('--particletype', nargs='+', default=None,
                     choices=('gas', 'dark', 'star'),
                     help='particle type(s) to resample (one or more). '
@@ -357,8 +365,7 @@ def main(argv=None):
         args.orient = 'jr96'
 
     if args.out is None:
-        suffix = 'recon' if args.op == 'reconstruct' else args.op
-        args.out = re.sub(r'\.\d+$', '', args.infile) + '_' + suffix
+        args.out = _default_output_prefix(args.infile, args.op, args.ntimes)
         print(f'no -o given: writing to {args.out}.00000', flush=True)
 
     import readtipsy as tip
@@ -554,11 +561,22 @@ def main(argv=None):
                     flush=True)
         elif args.op == 'split':
             print(f'splitting {n_in} {ptype} particles '
+                  f'in {args.ntimes} pass'
+                  f'{"es" if args.ntimes > 1 else ""} '
                   f'(orient {args.orient})...', flush=True)
+            split_pass_t = [time.perf_counter()]
+
+            def split_progress(p, na, nb):
+                now = time.perf_counter()
+                print(f'  split {p}/{args.ntimes}: {na} -> {nb} particles '
+                      f'({now - split_pass_t[0]:.0f}s)', flush=True)
+                split_pass_t[0] = now
+
             pos2, mass2, aux2 = resample.split(
                 pos, mass, aux, box=box, factor=factor,
                 nsmooth=args.nsmooth, dist=args.dist, halve_fields=halve,
-                orient=args.orient, scale=args.scale)
+                orient=args.orient, scale=args.scale,
+                progress=split_progress)
         else:
             # coarsen (not merge): iterate to EXACTLY count//factor
             print(f'merging {n_in} {ptype} particles (mutual-nearest '

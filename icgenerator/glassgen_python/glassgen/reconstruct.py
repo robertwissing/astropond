@@ -1323,54 +1323,23 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     return pos_f, mass_f, aux_f, is_filler, a
 
 
-def gather_fields(qpos, src_pos, src_mass, src_rho, fields, box=None,
-                  nsmooth=64):
-    """SPH-gather fields from source particles onto query positions,
-    Shepard-normalized so a constant field is reproduced exactly:
-        f(x) = sum_j w_j f_j / sum_j w_j,  w_j = (m_j/rho_j) W(r_j/H)
-    with H = the nsmooth-th source-neighbour distance and W a Wendland-C2
-    shape. `fields` maps name -> (Nsrc,) or (Nsrc,ncomp); returns name ->
-    (Nq,) / (Nq,ncomp). Gives relaxed / filler particles physical
-    vel/u/B/temperature from the INPUT snapshot (tasks 8, 9, 11)."""
-    from scipy.spatial import cKDTree
-    qpos = np.ascontiguousarray(qpos, dtype=np.float64).reshape(-1, 3)
-    src_pos = np.ascontiguousarray(src_pos, dtype=np.float64).reshape(-1, 3)
-    src_mass = np.asarray(src_mass, dtype=np.float64)
-    src_rho = np.asarray(src_rho, dtype=np.float64)
-    k = min(nsmooth, len(src_pos))
-    if box is not None:
-        box = np.asarray(box, dtype=np.float64)
-        lo = np.minimum(qpos.min(0), src_pos.min(0))
-        tree = cKDTree(np.mod(src_pos - lo, box), boxsize=box)
-        dist, nn = tree.query(np.mod(qpos - lo, box), k=k, workers=-1)
-    else:
-        tree = cKDTree(src_pos)
-        dist, nn = tree.query(qpos, k=k, workers=-1)
-    if k == 1:
-        dist, nn = dist[:, None], nn[:, None]
-    H = dist[:, -1:]
-    H = np.where(H > 0.0, H, 1.0)
-    q = np.clip(dist / H, 0.0, 1.0)
-    W = (1.0 - q) ** 4 * (1.0 + 4.0 * q)          # Wendland C2 (shape only)
-    wj = (src_mass / src_rho)[nn] * W             # (Nq, k)
-    wsum = wj.sum(1)
-    wsum = np.where(wsum > 0.0, wsum, 1.0)
-    out = {}
-    for name, arr in fields.items():
-        arr = np.asarray(arr, dtype=np.float64)
-        if arr.ndim == 1:
-            out[name] = (wj * arr[nn]).sum(1) / wsum
-        else:
-            out[name] = (wj[:, :, None] * arr[nn]).sum(1) / wsum[:, None]
-    return out
+# NB the Shepard SPH gather that used to live here (`gather_fields`, the
+# pre-M22 step 5) was REMOVED 2026-07-29 (CONSOLIDATION_PLAN D4): M22 replaced
+# it with the scatter below, M23 replaced that with the table imprint, and by
+# then nothing called it - no caller, no test, no `--field-transfer gather`, not
+# exported from __init__. It survived only as a "comparison control" that there
+# was no longer any way to invoke. Recover from git history or
+# backup_20260729_d4_gatherfields/ if a Shepard-gather control is ever wanted
+# again.
 
 
 def scatter_fields(qpos, m_out, src_pos, src_mass, src_rho, fields,
                    rho_edge=None, box=None, nsmooth=64):
     """Conservative donor-normalized SCATTER of input fields onto the
-    survivors - THE default field transfer (RECONSTRUCT_PLAN M22,
-    2026-07-19; replaces the Shepard gather above, which is kept for
-    comparison/tests).
+    survivors (RECONSTRUCT_PLAN M22, 2026-07-19). Was THE default when it
+    landed, replacing the pre-M22 Shepard gather; M23 then made the table
+    imprint the default (2026-07-24), so this is now the reachable CONTROL /
+    fallback - `--field-transfer scatter`, kept deliberately.
 
     Every INPUT particle in the resolved region (src_rho >= rho_edge)
     donates its conserved content m_i*A_i to the receivers its kernel

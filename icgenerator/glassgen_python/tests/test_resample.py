@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from glassgen import resample
+from glassgen.resample_cli import _default_output_prefix
 
 
 def _setup(n=400, seed=0):
@@ -15,6 +16,18 @@ def _setup(n=400, seed=0):
     return pos, mass, aux, box
 
 
+def test_default_output_name_includes_count_factor():
+    infile = '/data/galaxy_Bclean.00000'
+    assert _default_output_prefix(infile, 'merge', 10) == (
+        '/data/galaxy_Bclean_merge_1024x')
+    assert _default_output_prefix(infile, 'split', 3) == (
+        '/data/galaxy_Bclean_split_8x')
+    assert _default_output_prefix(infile, 'split', 1) == (
+        '/data/galaxy_Bclean_split_2x')
+    assert _default_output_prefix(infile, 'reconstruct', 1) == (
+        '/data/galaxy_Bclean_recon')
+
+
 def test_split_count_and_mass_conservation():
     pos, mass, aux, box = _setup()
     n = len(pos)
@@ -23,6 +36,16 @@ def test_split_count_and_mass_conservation():
         assert len(p2) == n * factor
         assert np.isclose(m2.sum(), mass.sum())          # total mass conserved
         assert np.allclose(m2, mass[0] / factor)         # per-child = parent/factor
+
+
+def test_split_reports_each_binary_pass():
+    pos, mass, aux, box = _setup(n=100)
+    events = []
+    p2, _, _ = resample.split(
+        pos, mass, aux, box=box, factor=8, nsmooth=32,
+        progress=lambda p, n0, n1: events.append((p, n0, n1)))
+    assert events == [(1, 100, 200), (2, 200, 400), (3, 400, 800)]
+    assert len(p2) == 800
 
 
 def test_split_rejects_non_power_of_two():

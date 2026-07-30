@@ -2,13 +2,17 @@ import numpy as np
 
 from glassgen.kernels import dw_wc2, w_wc2, W0
 
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias; the
+# conftest global monkeypatch this used to rely on is gone (D5).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 
 def test_unit_volume_integral():
     # int W dV = (1/pi h^3) * 4 pi int w(q) q^2 h^3 dq = 4 int w(q) q^2 dq = 1
     # (the Wendland C2 normalization 21/16 is baked into w_wc2 for exactly this)
     q = np.linspace(0.0, 2.0, 200001)
     w = np.array([w_wc2(x * x) for x in q])
-    integral = 4.0 * np.trapz(w * q * q, q)
+    integral = 4.0 * _trapezoid(w * q * q, q)
     assert abs(integral - 1.0) < 1e-6
 
 

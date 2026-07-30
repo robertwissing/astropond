@@ -11,3 +11,11 @@ __pycache__/
 
 # Build products (icgenerator/gasoline)
 *.o
+
+# Third-party source trees fetched by the get_*.sh scripts (not vendored)
+/icgenerator/music/MUSIC/
+/utilities/polaris/POLARIS/
+/codes/arepo/AREPO/
+
+# Third-party build products
+/codes/arepo/Arepo*

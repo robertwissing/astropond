@@ -197,8 +197,8 @@ To resample an SPH snapshot from particles onto a structured target (e.g. to
 hand off to a grid code, or for visualisation/analysis) use the sph_interp
 package via its wrapper:
 
-  ./interpolate_to_grid.sh INPUT OUTPUT [options]
-  ./interpolate_to_grid.sh              # no args -> interactive prompts
+  bin/interpolatetogrid INPUT OUTPUT [options]
+  bin/interpolatetogrid              # no args -> interactive prompts
 
   TARGETS (--grid):          uniform | amr | voronoi | projection
   METHODS (--method):        petkova (exact, mass-conserving; default) | sph
@@ -207,14 +207,14 @@ package via its wrapper:
 
 Examples:
   # 256^3 uniform SPH density grid -> npz
-  ./interpolate_to_grid.sh run/snap.00100 rho.npz --grid uniform --npx 256
+  bin/interpolatetogrid run/snap.00100 rho.npz --grid uniform --npx 256
 
   # mass-conserving AMR octree of rho+velocity, exported as RAMSES HDF5
-  ./interpolate_to_grid.sh run/snap.00100 mesh.h5 --grid amr --method petkova \
+  bin/interpolatetogrid run/snap.00100 mesh.h5 --grid amr --method petkova \
       --fields rho,vx,vy,vz --output-format ramses
 
   # xy column-density projection map
-  ./interpolate_to_grid.sh run/snap.00100 col.npz --grid projection \
+  bin/interpolatetogrid run/snap.00100 col.npz --grid projection \
       --axes xy --project column
 
 To see every target geometry rendered side by side on one snapshot, run

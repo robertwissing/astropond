@@ -12,7 +12,7 @@ export SPHEXA_DIR="${SPHEXA_DIR:-$codes_dir/sphexa/sphexa/build/main/src/sphexa/
 
 export GASOLINE_DIR="${GASOLINE_DIR:-$codes_dir/gasoline/gasoline-public}"
 export CHANGA_DIR="${CHANGA_DIR:-$codes_dir/changa/changa-public/}"
-export AREPO_DIR="${AREPO_DIR:-$codes_dir/arepo/}"
+export AREPO_DIR="${AREPO_DIR:-$codes_dir/arepo/AREPO/}"
 export RAMSES_DIR="${RAMSES_DIR:-$codes_dir/ramses/ramses/bin/}"
 export GIZMO_DIR="${GIZMO_DIR:-$codes_dir/gizmo/gizmo/}"
 export PHANTOM_DIR="${PHANTOM_DIR:-$codes_dir/phantom/phantom/bin/}"
@@ -1343,11 +1343,12 @@ mkdir initruns
 	    # softening params. Build Arepo_grav on demand.
 	    coderun=Arepo_grav
 	    AREPOICMODE=arepo-grid
-	    if [ ! -x "$dir/$coderun" ]; then
-		echo "Building self-gravity AREPO -> $coderun (Config_grav.sh)"
-		( cd "$dir" && make -j8 CONFIG=Config_grav.sh BUILD_DIR=build_grav EXEC="$coderun" )
-		if [ ! -x "$dir/$coderun" ]; then echo "Error: Arepo_grav build failed (see codes/arepo/Config_grav.sh)."; exit 1; fi
-	    fi
+		if [ ! -x "$dir/$coderun" ]; then
+		    echo "Building self-gravity AREPO -> $coderun (Config_grav.sh)"
+		    ( AREPO_CONFIG=Config_grav.sh AREPO_BUILD_DIR=build_grav \
+		      AREPO_EXEC="$coderun" JOBS=8 "$codes_dir/arepo/build_arepo.sh" )
+		    if [ ! -x "$dir/$coderun" ]; then echo "Error: Arepo_grav build failed (see codes/arepo/Config_grav.sh)."; exit 1; fi
+		fi
 	else
 	    dxP=$(get_param dxPeriod)
 	    dyP=$(get_param dyPeriod)
@@ -1375,7 +1376,8 @@ mkdir initruns
 		    cfg="Config_asp${tag}.sh"
 		    cp "$dir/Config.sh" "$dir/$cfg"
 		    printf "\nLONG_Y=%s\nLONG_Z=%s\n" "$LONGY" "$LONGZ" >> "$dir/$cfg"
-		    ( cd "$dir" && make -j8 CONFIG="$cfg" BUILD_DIR="build_asp${tag}" EXEC="$coderun" )
+		    ( AREPO_CONFIG="$dir/$cfg" AREPO_BUILD_DIR="build_asp${tag}" \
+		      AREPO_EXEC="$coderun" JOBS=8 "$codes_dir/arepo/build_arepo.sh" )
 		    if [ ! -x "$dir/$coderun" ]; then echo "Error: AREPO LONG build failed."; exit 1; fi
 		fi
 		echo "Non-cubic box [$dxP,$dyP,$dzP] -> using $coderun (LONG_Y=$LONGY LONG_Z=$LONGZ)"

@@ -78,8 +78,16 @@ print_support_matrix() {
 #mpirun=""
 mpirun="mpirun "
 
+# Intel MPI (oneapi 2021.17) on this cluster segfaults inside MPI_Init while
+# libfabric *probes* providers: the verbs probe dies in libibverbs
+# try_all_drivers (bundled provider vs rdma-core 2507mlnx). Any MPI binary -
+# gasoline, AREPO, RAMSES, even a hello-world - dumps core before main(), with
+# or without mpirun. Pinning a provider skips the broken probe; mlx keeps full
+# IB and is multi-node safe (use shm or tcp on nodes without IB).
+export I_MPI_OFI_PROVIDER="${I_MPI_OFI_PROVIDER:-mlx}"
+
 #An extra word added at the end of the simulation output files and directory
-EXTRANAME="amrnew3"
+EXTRANAME="testnewreonshock0b"
 
 #An extra word added to the glass file names (e.g. to tag the code used to relax)
 GLASSNAME=""
@@ -122,8 +130,8 @@ ICCONFIGPY="-n 4800 -oi 0 --icr0 1.0 --icrloop0 0.5 --rhopow 2.0 --icr0rate 1.5"
 
 #Extra condition during runtime
 #EXTRACONDALL=" -facQ 1.0 -fch 1.0 -psidecfac 1.0 -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -nInitCorrIter 50 -smin 32 -smax 40000 "
-EXTRACONDALL=" -thermaldiff 0.1 -alpha 0.5 -beta 8.0 "
-
+#EXTRACONDALL=" -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -magdifflin 0.0 -magdiffturb 0.0 -magdiffshock 2.0 "
+EXTRACONDALL=" -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -alphaB 0.0 "
 
 #Extra runtime conditions and output fields specific to SPH-EXA (code=2)
 EXTRACONDSPHEXA=" --prop std "
@@ -583,6 +591,11 @@ setup_polytrope() {
         prefile_extra=""
         glassfile_extra="${GLASSNAME}"
         runname_extra=""
+        # dICdensprofile=8 (Lane-Emden), which the Python glassgen backend
+        # cannot evaluate analytically -> relax against the radial density
+        # table the rand pre-IC writes (test_cases/polytrope/densitytable.npz,
+        # the glass step's cwd). Self-describing: r_sph mapping in its header.
+        GLASSMODE="--table densitytable.npz"
 }
 
 # Function for static blobs (force test) setup with generic parameters
@@ -691,6 +704,10 @@ setup_mti() {
     prefile_extra=""
     glassfile_extra="${GLASSNAME}"
     runname_extra=""
+    # dICdensprofile=8 (stratified atmosphere) - not analytic in the Python
+    # glassgen backend; relax against the table the rand pre-IC writes
+    # (mapping='z', carried in the table header).
+    GLASSMODE="--table densitytable.npz"
 }
 
 # Function for isolated MHD wave setup with generic parameters
@@ -741,6 +758,9 @@ setup_planet() {
     prefile_extra="$planet"
     glassfile_extra="$planet${GLASSNAME}"
     runname_extra="$planet"
+    # dICdensprofile=8 (layered planet profile) - not analytic in the Python
+    # glassgen backend; relax against the radial table the rand pre-IC writes.
+    GLASSMODE="--table densitytable.npz"
 }
 
 # Function for planet collision setup with generic parameters
@@ -1271,9 +1291,13 @@ mkdir initruns
     fi
     mkdir $runname
     echo "Code selection: $4"
-    if [ "$4" == 0 ] || [ "$4" == 1 ]; then
-    if [ "$4" == 1 ]; then sed -i '/^dCloudDensity/d' datafiles/$ICfile.param; fi
-        runline=( ${runlauncher:-$mpirun} $dir/${coderun} -s $1 -o $runname/$runname -I datafiles/$ICfile.00000 $EXTRACONDRUN datafiles/$ICfile.param)
+    if [ "$4" == 0 ]; then
+        runline=( ${runlauncher:-$mpirun} $dir/${coderun} -s $1 -o $runname/$runname -I datafiles/$ICfile.00000  $EXTRACONDRUN datafiles/$ICfile.param)
+    fi
+
+    if [ "$4" == 1 ]; then
+	    sed -i '/^dCloudDensity/d' datafiles/$ICfile.param;
+	 runline=( ${runlauncher:-$mpirun} $dir/${coderun} -s $1 -o $runname/$runname -I datafiles/$ICfile.00000 -b 24 +useckloop +balancer MultistepLB_SFC -D 1 $EXTRACONDRUN datafiles/$ICfile.param)
     fi
 
     if [ "$4" == 2 ]; then

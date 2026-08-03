@@ -196,9 +196,13 @@ def code_units_from(msol, kpc):
 # smoke-test synthetic logs, or very old runs).
 #
 # gasoline's header is '# [dTime] [z] [Etot] [Ekin] [Epot] [Eth] [Emag] [EClean]
-# [totentrop] [totenstro] [Lx] [Ly] [Lz] ...' (the positional map below predates
-# the [EClean] insertion, so it is misaligned from totentrop onward for current
-# builds -- another reason to parse by name).
+# [totentrop] [totenstro] [Lx] [Ly] [Lz] ...'. ChaNGa now emits the same names in
+# the same order for columns 1-54 (Main::calcEnergy), with its own extras --
+# [Brms] [TotalEVir] [Evir] [TotalECosmo] [Q0] -- appended from column 55.
+#
+# The positional map below predates the [EClean] insertion, so it is misaligned
+# from totentrop onward for BOTH codes' current builds -- another reason to parse
+# by name. It is kept as-is for the header-less synthetic logs that rely on it.
 LOG_COLUMNS = {
     "dTime": 0, "z": 1, "Etot": 2, "Ekin": 3, "Epot": 4, "Eth": 5, "Emag": 6,
     "totentrop": 7, "totenstro": 8, "Lx": 9, "Ly": 10, "Lz": 11,
@@ -216,12 +220,15 @@ LOG_COLUMNS = {
 # canonical names (its header tokens are just '[name]'), so only codes with a
 # different vocabulary need entries here. Add a code by adding its column names.
 LOG_NAME_ALIASES = {
-    # --- ChaNGa (Main::writeOutputLog header: "time redshift TotalEVir TotalE
-    #     Kinetic Virial Potential TotalECosmo Ethermal Lx Ly Lz Wallclock") ---
+    # --- LEGACY ChaNGa headers ('# [time] [redshift] [TotalE] [Ekin] [Epot]
+    #     [Ethermal] [Emag] ...', and older "Kinetic/Virial/Potential" forms).
+    #     Current ChaNGa writes gasoline's canonical names directly and needs no
+    #     aliases; these are retained so old runs still parse. ---
     "time": "dTime", "redshift": "z", "TotalE": "Etot", "Kinetic": "Ekin",
     "Potential": "Epot", "Ethermal": "Eth", "Wallclock": "WallTime",
-    # ChaNGa-only columns with no gasoline analogue (TotalEVir, Virial,
-    # TotalECosmo) pass through unmapped and are simply not requestable.
+    # Legacy ChaNGa also wrote non-canonical [Mwxy]/[divBerrmean]/[divBerrmax]
+    # and [Q0]/[E0]; those were never requestable and stay unmapped. ChaNGa-only
+    # columns (TotalEVir, Virial, TotalECosmo, Brms, Q0) pass through unmapped.
 }
 
 

@@ -1,6 +1,6 @@
 &DATAOPTS
  BUFFER_DATA=F,
- ICALCQUANTITIES=F,
+ ICALCQUANTITIES=T,
  IRESCALE=F,
  XORIGIN= 3*0.00000000      ,
  ITRACKTYPE=0          ,
@@ -37,7 +37,7 @@
  NACROSS=1          ,
  NDOWN=1          ,
  INTERACTIVE=T,
- IADAPT=T,
+ IADAPT=F,
  IADAPTCOORDS=F,
  NSTEPSPERPAGE=1          ,
  ICOLOUREACHSTEP=T,
@@ -88,14 +88,14 @@
  /
 &RENDEROPTS
  NPIX=0          ,
- ICOLOURS=36         ,
+ ICOLOURS=34         ,
  NCONTOURS=30         ,
  IPLOTCONT_NOMULTI=F,
  ICOLOUR_PARTICLES=F,
  COLOURBARDISP=  5.00000000    ,
  INORMALISE_INTERPOLATIONS=F,
  IFASTRENDER=F,
- IDENSITYWEIGHTEDINTERPOLATION=F,
+ IDENSITYWEIGHTEDINTERPOLATION=T,
  ICOLOURBARSTYLE=1          ,
  IPLOTCOLOURBARLABEL=T,
  ILABELCONT=F,
@@ -756,8 +756,10 @@
  SHAPE(32)%TEXT='                                                                                                                                                                                                                                                ',
  /
 &CALCOPTS
- CALCSTRING= 35*'                                                                                ',
- CALCLABEL= 35*'                                                                                ',
+ CALCSTRING='sqrt((x-x0)**2 + (y-y0)**2 + (z-z0)**2)                                         ','sqrt(vx**2 + vy**2 + vz**2)                                                     ','sqrt(BFieldx**2 + BFieldy**2 + BFieldz**2)                                      ','sqrt(CurlBx**2 + CurlBy**2 + CurlBz**2)                                         ','sqrt(acc2x**2 + acc2y**2 + acc2z**2)                                            ',
+ '0.5*(BFieldx**2 + BFieldy**2 + BFieldz**2)                                      ','h*abs(DivB)/sqrt((BFieldx^2 + BFieldy^2 + BFieldz^2))                           ', 28*'                                                                                ',
+ CALCLABEL='r                                                                               ','|v|                                                                             ','|BField|                                                                        ','|CurlB|                                                                         ','|acc2|                                                                          ',
+ 'P_{mag}                                                                         ','h|div B|/|B|                                                                    ', 28*'                                                                                ',
  CALCUNITSLABEL= 35*'                                        ',
  /
 &ANIMOPTS
@@ -780,5 +782,7 @@
  XMAXCOLEND=  0.00000000    ,
  XSECPOS_NOMULTI_END=  0.00000000    ,
  /
-orzag64_N64glass_3deta05GASOLINE/orzag64_N64glass_3deta05GASOLINE.00050
-orzag64_N64lattice_3deta05GASOLINE/orzag64_N64lattice_3deta05GASOLINE.00050
+orzag128_N64glasstestnewreonshock025CHANGA/orzag128_N64glasstestnewreonshock025CHANGA.000075
+orzag128_N64glasstestnewreonshock0bCHANGA/orzag128_N64glasstestnewreonshock0bCHANGA.000075
+orzag128_N64glasstestnewreonshock0CHANGA/orzag128_N64glasstestnewreonshock0CHANGA.000075
+orzag128_N64glasstestnewreonshock0sqrtrhoCHANGA/orzag128_N64glasstestnewreonshock0sqrtrhoCHANGA.000075

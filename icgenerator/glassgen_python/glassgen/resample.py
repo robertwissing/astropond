@@ -1,4 +1,4 @@
-glassgen/resample.py """Native particle split / merge for multi-resolution glass relaxation.
+"""Native particle split / merge for multi-resolution glass relaxation.
 
 Ports the geometry of SPH_methods.split_particless / merge_my_neighbor
 (setupfiles/SPH_methods.py) but operates directly on glassgen's (pos, mass,

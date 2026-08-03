@@ -1,4 +1,4 @@
-sph_interp/petkova_method.py """Petkova (2018) exact interpolation: integrate the kernel over each cell.
+"""Petkova (2018) exact interpolation: integrate the kernel over each cell.
 
 Mass-conserving alternative to the regular SPH deposit: instead of evaluating the
 kernel at the cell centre, integrate the (cubic-spline) kernel over the cell

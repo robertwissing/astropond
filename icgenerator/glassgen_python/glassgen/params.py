@@ -4,8 +4,10 @@ The C gdicgen reads the density profile it relaxes toward straight from the
 .param (dICdensprofile / dICdensdir / dICdensR / ...). This module ports the
 same reading so the Python backend (cli.py) and the benchmark get an identical
 target without a separate density table - profiles 1/2/3 (uniform / step /
-tanh). Profile >= 4 (disk / accdisk) is not ported and needs a density table
-(--table TABLE.npz; see glassgen.density); see PLAN.md "Future tasks".
+tanh). Profiles 4-7 (disk/accdisk), 8 (tabulated - the C backend reads
+densitytable_xdr implicitly) and 9 (gaussian slab) are not ported and need a
+density table (--table TABLE.npz; see glassgen.density); see PLAN.md
+"Future tasks".
 """
 import argparse
 import sys
@@ -80,9 +82,14 @@ def target_rho0(p):
         else:
             r = pos[:, d - 6]
         if prof >= 4:
+            what = {4: 'disk', 5: 'disk', 6: 'disk', 7: 'accdisk',
+                    8: 'table-driven: the C backend reads densitytable_xdr '
+                       'implicitly, the Python one needs the table named',
+                    9: 'gaussian slab'}.get(prof, 'unknown')
             raise NotImplementedError(
-                f'density profile {prof} (disk/accdisk) is not ported - pass '
-                'a density table (--table TABLE.npz; convert a legacy '
+                f'density profile {prof} ({what}) is not evaluated from the '
+                '.param - pass the density table the IC setup wrote '
+                '(--table densitytable.npz; convert a legacy '
                 'densitytable_xdr with python -m glassgen.density) or use '
                 'the C backend; see PLAN.md "Future tasks".')
         if prof == 1:

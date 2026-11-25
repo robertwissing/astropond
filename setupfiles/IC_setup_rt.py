@@ -86,9 +86,7 @@ class setup_rt(object):
         # MUST equal the run's body force: IC_createparamfile writes
         # bBodyForce=1 with dBodyForceConst=1.0, and pkdBodyForce applies
         # a_z = -dBodyForceConst*sign(z) (constant gravity toward the midplane;
-        # mti integrates its profile with the same g=1.0). This was 0.5 --
-        # only HALF the run's gravity was supported, so the slabs free-fell
-        # and over-compressed (bug found + fixed 2026-06-09).
+        # mti integrates its profile with the same g=1.0).
         grav=1.0
         C=4.*np.pi
         dvz=0.025
@@ -198,7 +196,8 @@ class setup_rt(object):
             #    self.u.append((przero-grav*self.getrhoi(i)*np.abs(self.z[i]))/(gam1*self.rho[i]))
             #else:
             #    self.u.append((przero-grav*self.getrhoi(i)*np.abs(self.z[i]))/(gam1*self.getrhoi(i)))
-        if distri==0 or distri==2:
+        if not self.preglass:
+            # the pre-glass seed is relaxed in the undoubled box
             self.dzbound = self.dzbound*2
     def rampfunc(self,z):
         rampf=0.5*(np.tanh((z+self.dICdensR)/self.dICdensRsmooth)-np.tanh((z-self.dICdensR)/self.dICdensRsmooth))

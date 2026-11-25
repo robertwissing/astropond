@@ -40,6 +40,7 @@ import readtipsy as tip
 from IC_analysis_framework import (
     Param, standalone_cli,
     RenderSpec, render_panels, aux_divB_error, magnetic_pressure,
+    emit_warning,
 )
 from IC_analysis_general import (
     find_files, read_vector_aux, read_tufac, read_log_series,
@@ -56,7 +57,7 @@ REG_NPTS = 101                 # points on the regression time grid
 #  parity; the analysis normalises the energy by E_mag(0).
 # --------------------------------------------------------------------------- #
 PARAM_SPEC = [
-    Param("a", "B0", 0.1, float, "seed vector-potential amplitude"),
+    Param("a", "B0", 0.1, float, "seed vector-potential amplitude", "B"),
 ]
 
 
@@ -260,7 +261,7 @@ def plot_divberr_vs_time(runs, labels, save=None, ref_table=None):
 def render_specs():
     # B^2/2 in the x-y plane (the screw mode; RAMSES uses the B^2/2 isosurface).
     return [
-        RenderSpec(0, 1, magnetic_pressure(), r"$\frac{1}{2}|B|^2$", True,
+        RenderSpec(1, 2, magnetic_pressure(), r"$\frac{1}{2}|B|^2$", True,
                    "average", None, "inferno", False),
     ]
 
@@ -306,6 +307,12 @@ def reference_table(inp):
 
 def _plot(inputs, labels, params, args):
     print(f"[ponomarenko] B0={params['B0']:g}  boxlen={BOXLEN:g}")
+    emit_warning(
+        "Ponomarenko kinematic build required",
+        "A quantitative Teyssier-et-al. growth comparison requires a "
+        "Gasoline executable that freezes the prescribed screw velocity and "
+        "applies explicit eta_mag=2.5e-3; the suite's ordinary gasolinemhd "
+        "evolves full MHD, so its fitted growth is qualitative.")
     runs = [series(inp) for inp in inputs]
     if all(s is None for s in runs):
         print("ponomarenko: no data to plot; exiting.", file=sys.stderr)

@@ -1,20 +1,11 @@
 """Mixed per-axis periodicity in the ghost-image Voronoi path.
 
-`_from_points_periodic` is entered whenever ANY axis is periodic, but until
-2026-07-27 it padded the tessellation box on ALL THREE axes while imaging
-generators only across the periodic ones. On a non-periodic axis nothing was
-imaged back, so every boundary cell simply ran out into the pad instead of
-being cut, and the central cells ended up tiling the PADDED box. The
-closed-box volume budget - the check that would have caught it instantly -
-was skipped for exactly this case (`if not all(per): break`).
-
-Measured before the fix, 1500 random generators in a unit cube: the central
-volume came to 1.500x the box with one non-periodic axis and 2.250x with two,
-i.e. exactly the padded volume. On a thin slab it reached ~10^4x.
-
-The fix clips the pad to the periodic axes, which restores a voro++ wall at
-lo/hi on the others - the same treatment the fully-open path gives them - and
-lets the budget check run for mixed periodicity too.
+`_from_points_periodic` is entered whenever ANY axis is periodic. It pads the
+tessellation box only on the periodic axes (the only ones generators are
+imaged across), leaving a voro++ wall at lo/hi on the others - the same
+treatment the fully-open path gives them - and runs the closed-box volume
+budget for mixed periodicity too. A pad on a non-periodic axis would leave its
+boundary cells uncut, so the central cells would tile the PADDED box.
 """
 import importlib.util
 
@@ -75,8 +66,8 @@ def test_no_cell_extends_beyond_a_non_periodic_wall(per):
 
 def test_a_thin_slab_is_the_worst_case():
     """The aspect ratio the KH / shearing-slab geometry actually uses: the
-    pad is a large fraction of the short axis, so the old behaviour was off
-    by orders of magnitude rather than tens of percent."""
+    pad is a large fraction of the short axis, so a padded non-periodic axis
+    would be off by orders of magnitude rather than tens of percent."""
     lo = np.array([-0.5, -0.5, -0.2])
     hi = np.array([0.5, 0.5, 0.2])
     pts, lo, hi = _points(n=2000, seed=5, lo=lo, hi=hi)

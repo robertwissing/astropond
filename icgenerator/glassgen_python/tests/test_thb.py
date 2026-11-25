@@ -1,5 +1,4 @@
-"""Truncated hierarchical B-splines (1D core): partition of unity + selection.
-FIELD_RECONSTRUCTION_PLAN, THB-spline readout, rung 3 (foundation)."""
+"""Truncated hierarchical B-splines (1D core): partition of unity + selection."""
 
 import numpy as np
 import pytest
@@ -241,8 +240,8 @@ def test_operators_match_ground_truth_aliasing(cls_name):
     # coefficient.  The galaxy base is (16, 15, 2) -> the z-axis (2 cells,
     # cubic) aliases.  eval_field_local / eval_matrix are the ground truth;
     # eval_operator (per-point) and eval_operator_fast (per-leaf, numba) must
-    # both reproduce it for the value AND every derivative.  Regression guard:
-    # the dict operators used to double-count aliased keys.
+    # both reproduce it for the value AND every derivative, without
+    # double-counting aliased keys.
     cls = getattr(thb, cls_name)
     base, deg = (16, 15, 2), (2, 3, 3)          # an A-component degree triple
     ref0 = np.zeros(base, dtype=bool)

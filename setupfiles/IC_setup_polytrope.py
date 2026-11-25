@@ -5,7 +5,7 @@ import IC_fixdens as fixdens
 import IC_smoothlength as smth
 import readtipsy as tip
 import IC_denstable as denstable
-from scipy.integrate import simps, odeint  # Add simps to imports
+from scipy.integrate import simps, odeint, cumulative_trapezoid  # Add simps to imports
 from scipy.interpolate import interp1d
 
 class setup_polytrope(object):
@@ -146,7 +146,10 @@ class setup_polytrope(object):
             
          self.npart=len(self.x)
          self.ngas=self.npart
-         if distri==1:
+         # Pre-glass only: integrate the total mass and export the relaxer's
+         # density table.  A placed IC (lattice/rand/glass) takes the exact
+         # analytic mass below instead.
+         if self.preglass:
              totmass = denstable.compute_total_mass(self,512)
              print("Numerically integrated mass(512**3) " , totmass)
              # Generate 1D radial density table
@@ -157,6 +160,16 @@ class setup_polytrope(object):
              # self-describing npz: r_sph mapping in the table header
              # (glassgen: --table densitytable.npz)
              denstable.write_density_table_npz("densitytable.npz",gridtab,rhotab,mapping='r_sph')
+             # Force-matched relax table (glassgen --force-table, relax.config GLASS_FORCEMATCH):
+             # g = grad P_t/rho_t, which for this hydrostatic target is gravity: inside R
+             # P = K rho^gamma and g = -G M(r)/r^2 (the table's own mass); the buffer keeps P(R)
+             # with g = 0.
+             r_t, rho_t = gridtab[0], np.asarray(rhotab, dtype=float)
+             M_t = cumulative_trapezoid(4*np.pi*r_t**2*rho_t, r_t, initial=0.0)
+             inside = r_t <= R
+             P_t = np.where(inside, self.K*rho_t**gamma, self.K*densities[-1]**gamma)
+             g_t = np.where(inside, -G*M_t/np.where(r_t > 0, r_t, 1.0)**2, 0.0)
+             np.savez("forcetable.npz", r=r_t, P=P_t, g=g_t, rho=rho_t, closure=gamma)
          else:
              totmass = self.M
              

@@ -988,8 +988,7 @@ class VoronoiGrid:
         Measured on the thin synthetic boxes (native AREPO, 1500..40000
         generators over 1x0.094x0.094 and 1x1x0.094): the budget is still open at
         max cell_rad = 0.66 half-periods (+1.5e-04) and closes to +1e-06 by 0.54,
-        so the closure sits at ~L/4 and not at the L/2 the old comments assumed.
-        Refining to the L/2 bound is what left slab2d stuck at +0.50%.
+        so the closure sits at ~L/4.
         """
         pl = [float(L[a]) for a in range(3) if per[a]]
         return 0.25 * min(pl) if pl else float("inf")
@@ -1197,12 +1196,10 @@ class VoronoiGrid:
                      is what sizes voro++'s internal block grid — setting it to a
                      large value (e.g. the box size) collapses the mesh into one
                      giant block and makes the build O(N^2) (and memory-hungry).
-                     PERFORMANCE ONLY: the result must not depend on it. (It
-                     appeared to until 2026-07-27, because passing `radii=[]`
-                     made pyvoro substitute a radius of `dispersion/10` and run
-                     a RADICAL tessellation — see `_tessellate`. Both mesher
-                     calls now pass explicit zero radii, which is what makes
-                     the tessellation an ordinary Voronoi one.)
+                     PERFORMANCE ONLY: the result does not depend on it, since
+                     both mesher calls pass explicit zero radii (`radii=[]`
+                     would make pyvoro run a RADICAL tessellation with radius
+                     `dispersion/10`).
         ghost_pad  : periodic only — the image shell width as a fraction of the
                      box per axis (generators within this distance of a boundary
                      are replicated across it). Acts as a FLOOR: the shell is
@@ -1426,16 +1423,11 @@ class VoronoiGrid:
         # an unclosed boundary cell can only ADD volume (it runs into the pad
         # instead of being cut by its missing image), so on a fully periodic box
         # Sum(central vol) > box vol detects an insufficient shell exactly.
-        # MIXED PERIODICITY: only a periodic axis gets a pad. Padding a
-        # NON-periodic axis (which is what this did until 2026-07-27) is a
-        # silent catastrophe: nothing is imaged across it, so every boundary
-        # cell simply runs out into the pad instead of being cut, and the
-        # central cells end up tiling the PADDED box. Measured on 1500 random
-        # generators in a unit box: +50.0% volume per non-periodic axis
-        # (per=(T,T,F) gave 1.500, per=(T,F,F) gave 2.250, both exactly the
-        # padded volume). Clipping the pad puts a voro++ wall back on lo/hi
-        # there, which is the correct open-boundary treatment and is what the
-        # fully-open path does anyway.
+        # MIXED PERIODICITY: only a periodic axis gets a pad. A padded
+        # NON-periodic axis has nothing imaged across it, so its boundary cells
+        # run out into the pad and the central cells tile the PADDED box;
+        # unpadded, voro++ puts a wall on lo/hi there, the correct
+        # open-boundary treatment (as in the fully-open path).
         pad_axis = np.asarray(per, dtype=bool)
         spacing = float((np.prod(L) / max(N, 1)) ** (1.0 / 3.0))
         margin = np.where(pad_axis, np.maximum(ghost_pad * L, 3.0 * spacing),
@@ -1445,17 +1437,10 @@ class VoronoiGrid:
         # the image set is COMPLETE. Every generator has then been replicated
         # into all 26 neighbouring boxes, so a wider shell can only add images of
         # images, which say nothing new about a mesh whose cells fit in a box.
-        # A half-period cap (what this was until 2026-07-29) is wrong twice over
-        # on a high-aspect box. It assumes the largest cell fits in a
-        # half-period, which a quasi-1D box breaks -- slab1d is 1 x 0.094 x
-        # 0.094, so the thin axes hold only ~5 generator spacings and a boundary
-        # cell's Voronoi reach runs past L/2; at 1500 generators the budget stuck
-        # at +2.3e-05 and closed to EXACTLY 0 only once the shell reached ~L.
-        # Worse, the cap was `max(min(margin, 3L), 0.5L)`, and there the
-        # 3x-spacing floor (0.054) already exceeded 0.5L (0.047) -- so
-        # margin_max came out EQUAL to the starting margin, the doubling loop
-        # could not grow by even one step on those axes, and the first iteration
-        # raised "even at the maximum shell" having never actually widened it.
+        # A half-period cap is too small on a quasi-1D box: slab1d's thin axes
+        # (1 x 0.094 x 0.094) hold only ~5 generator spacings, so a boundary
+        # cell's Voronoi reach runs past L/2 and the budget closes only once the
+        # shell reaches ~L.
         # The starting margin is still honoured if it is wider than a period (a
         # nearly-empty box, where 3*spacing alone exceeds L); dense meshes start
         # at 3*spacing << L and stop long before the ceiling either way.
@@ -1497,11 +1482,9 @@ class VoronoiGrid:
             vg.periodic = tuple(bool(x) for x in per)
             vg.cell_parent = np.ascontiguousarray(parent_all, dtype=np.int64)
             vg.ncentral = N
-            # The budget applies under MIXED periodicity too, now that the pad
-            # is clipped: the tessellation domain is exactly [lo, hi] on every
-            # non-periodic axis, so the central cells still tile exactly one
-            # period. It was skipped here while the pad was unclipped, which
-            # is why a +50%-per-axis error could go unnoticed.
+            # The budget applies under MIXED periodicity too: the tessellation
+            # domain is exactly [lo, hi] on every non-periodic axis, so the
+            # central cells still tile exactly one period.
             verr = float(vg.volumes().sum()) / float(np.prod(L)) - 1.0
             if verr <= _VOL_BUDGET_TOL:
                 # closed (or below noise). A deficit beyond noise cannot be a
@@ -1828,11 +1811,8 @@ class VoronoiGrid:
             # A cell too big for the unwrap is a MESH problem, and no amount of
             # re-meshing the same generators fixes it -- so refine: insert
             # generators into the offending cells until every cell fits, and keep
-            # the native per-axis-period tessellation. Switching to the ghost
-            # path (what this did unconditionally until 2026-07-29) abandons
-            # AREPO's correct thin-box periods for a backend whose cubic-clip
-            # history on thin boxes is exactly why the native path exists.
-            # Refinement CHANGES the mesh -- more cells come back than
+            # the native per-axis-period tessellation (the ghost path's cubic
+            # clip mishandles thin boxes). Refinement CHANGES the mesh -- more cells come back than
             # generators went in -- so it is capped and the ghost path stays as
             # the fallback for the case where the refinement would explode.
             if abs(verr) > _VOL_BUDGET_TOL:
@@ -1941,11 +1921,7 @@ class VoronoiGrid:
         A Voronoi tessellation partitions its container, so the cell volumes
         must sum to the domain volume. Everything downstream is built on that:
         petkova's mass budget, the periodic volume budget, the AMR capture
-        ledgers. Until 2026-07-27 nothing asserted it here, and two separate
-        bugs - the mixed-periodicity pad (task 3) and the pyvoro `radii=[]`
-        call (task 13) - each returned a grossly non-partitioning mesh that the
-        library then used without complaint. This is the one check that would
-        have caught both, at the source, in a single run.
+        ledgers - so it is asserted here, at the source.
         """
         vg = cls._tessellate_raw(pts, dom_lo, dom_hi, grid_lo, grid_hi,
                                  dispersion, backend, n_threads)

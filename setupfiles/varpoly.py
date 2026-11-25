@@ -13,7 +13,7 @@ import scipy.integrate as integrate
 import mpmath as mp
 import numpy as np
 # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
-# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+# NOT a global `np.trapz = ...` monkeypatch.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import scipy.optimize as optimize
 import numba

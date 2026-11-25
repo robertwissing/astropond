@@ -5,7 +5,7 @@ uniform grid with our interpolation (petkova, mass-conserving), and write ONE
 portable "GridIC" file that every grid code's in-code IC reader consumes
 (RAMSES `condinit`, Athena++ problem generator, ...). The file is always a fine
 uniform field; "uniform vs AMR" is a per-code run decision (the reader averages
-fine cells for coarser cells). See codes/GRID_CODES_PLAN.md.
+fine cells for coarser cells).
 
 Canonical GridIC stream-binary layout (little-endian, C order; Fortran reads it
 with access='stream', C++ with fread -- no HDF5 dependency):
@@ -60,10 +60,8 @@ def _with_v2(p):
 def _report_budget(p, M, vx, vy, vz, u, tu_fac, e_unresolved):
     """Print how exactly the deposit conserved mass, momentum and energy.
 
-    These are the numbers the plan set out to beat (orzag 64^3, old path:
-    momentum ~5e-9, E_therm +2.4e-7, E_kin -0.53%), so print them rather than
-    asserting: on a genuinely under-resolved grid a real deficit is
-    information, not a failure.
+    Printed rather than asserted: on a genuinely under-resolved grid a real
+    deficit is information, not a failure.
     """
     m = p.mass
     vel = np.stack([p.values[k] for k in ("vx", "vy", "vz")], axis=1)
@@ -97,7 +95,7 @@ def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
     source : a tipsy snapshot path, or a `Particles` instance.
     path   : output GridIC file.
     npx    : cells per axis (int -> cubic; for RAMSES use 2**levelmax). A (3,)
-             tuple is allowed but the codes' base grids are cubic (first cut).
+             tuple is allowed but the codes' base grids are cubic.
     method : 'petkova' (exact, mass-conserving; default) or 'sph' (fast).
     mhd    : also deposit B and write the 6 div-free face components.
     box    : periodic period (3,); default = the particles' box.
@@ -107,12 +105,10 @@ def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
              (momentum and energy) rather than from kernel-volume-weighted
              averages, and close the total-energy budget. See below.
 
-    THE CONSERVATIVE PATH (default; `conservative=False` restores the old
-    volume-weighted state). Mass was always conserved - petkova's density is
-    `sum_j m_j (integral_cell W_j) / V_cell` - but velocity and temperature
-    were kernel-volume-weighted averages, so MOMENTUM and ENERGY were not
-    conserved, only approximated. Using the `_content_<name>` channels that
-    the field-reconstruction work (M23) added:
+    THE CONSERVATIVE PATH (default; `conservative=False` gives the
+    volume-weighted state). Petkova's density conserves mass, but
+    kernel-volume-weighted velocity and temperature only approximate MOMENTUM
+    and ENERGY. Using the `_content_<name>` channels instead:
 
         M_cell   = sum_j m_j I_j                    (`_mass`)
         v_cell   = sum_j m_j v_j I_j / M_cell       (`_content_v*` / M)
@@ -124,8 +120,7 @@ def write_grid_ic(source, path, npx, method="petkova", mhd=False, box=None,
     holding particles with different velocities has kinetic energy
     `1/2 sum_j m_j |v_j|^2`, while the bulk motion it is collapsed to carries
     only `1/2 M |v_cell|^2`. The difference is the UNRESOLVED VELOCITY
-    VARIANCE, non-negative by Jensen, and it is exactly the -0.53% E_kin the
-    old path lost on orzag 64^3. A finite-volume cell has nowhere to put
+    VARIANCE, non-negative by Jensen. A finite-volume cell has nowhere to put
     sub-cell motion except its internal energy, so it is added there:
 
         u_cell = u_therm + [1/2 sum_j m_j |v_j|^2 - 1/2 M |v_cell|^2] / M_cell

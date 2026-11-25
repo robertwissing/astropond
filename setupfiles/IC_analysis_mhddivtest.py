@@ -28,6 +28,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 
 import numpy as np
@@ -48,13 +49,21 @@ BZ0 = 0.01 / np.sqrt(4.0 * np.pi)       # background / peak field amplitude
 R0 = 1.0 / np.sqrt(8.0)                # bump radius
 PRZERO = 6.0                           # initial (uniform) pressure
 
+_RUN_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_SMOOTH_FROM_RUNNAME = re.compile(
+    rf"rd{_RUN_NUMBER}s({_RUN_NUMBER})sq")
+
 # runtest.sh setup_mhddivtest() order. Only rhodiff/square matter physically;
 # smooth/cosmo are carried for CLI parity.
 PARAM_SPEC = [
-    Param("a", "rhodiff", 1.0, float, "x-density contrast rhodens/rhozero"),
-    Param("b", "smooth", 1, int, "smooth (1) vs sharp (0) density step"),
-    Param("c", "square", 1, int, "2-D square (1) vs 3-D sphere (0) bump"),
-    Param("d", "cosmo", 0, int, "cosmological run flag (unused in analysis)"),
+    Param("a", "rhodiff", 1.0, float,
+          "x-density contrast rhodens/rhozero", "rd"),
+    Param("b", "smooth", 1, int,
+          "smooth (1) vs sharp (0) density step", _SMOOTH_FROM_RUNNAME),
+    Param("c", "square", 1, int,
+          "2-D square (1) vs 3-D sphere (0) bump", "sq"),
+    Param("d", "cosmo", 0, int,
+          "cosmological run flag (unused in analysis)", "cos"),
 ]
 
 

@@ -1,5 +1,4 @@
-"""tipsy -> sph_interp AMR octree -> POLARIS synchrotron grid (M4 of
-POLARIS_EXPORT_PLAN.md §5.2).
+"""tipsy -> sph_interp AMR octree -> POLARIS synchrotron grid.
 
 The physics-aware driver: takes a galaxy cutout (from `_polaris_locate_galaxy.py`),
 rotates it into the disc frame, builds a CUBIC power-of-two AMR octree, deposits
@@ -178,7 +177,7 @@ def main():
                          "integrating along sight lines wants. 'hodge' = the "
                          "open-AMR Hodge solve, kept as the A/B control. "
                          "'none' = raw deposit: POLARIS's polarized-RT solver "
-                         "STALLS on a non-div-free field (see the plan 8b), so "
+                         "STALLS on a non-div-free field, so "
                          "it is a deposit sanity check only, never a run.")
     pa.add_argument("--thb-rtol", type=float, default=1e-6,
                     help="CG tolerance of the THB curl-fit")
@@ -538,8 +537,7 @@ def main():
         json.dump(side, fh, indent=2, default=float)
     print(f"  cmd:     {cmd}")
     print(f"  sidecar: {spath}")
-    # anchor on THIS file, not the cwd -- os.path.abspath('../utilities/...')
-    # silently resolved against wherever the user happened to be standing.
+    # anchor on THIS file, not the cwd, so the printed path holds from any cwd.
     _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     print(f"done in {time.time() - t0:.0f}s\n\nrun it with:\n"
           f"  {os.path.join(_repo, 'utilities/POLARIS/bin/polaris')} "

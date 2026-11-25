@@ -61,7 +61,7 @@ def _nn_dirs(pos, idx, h, box, periodic, nsmooth, dist_floor):
     for i in prange(n):
         floor = dist_floor * h[i]
         # primary + secondary: the two nearest neighbours clearing the floor
-        # (>= relaxed-glass spacing) -> the old SPH split's rank-k / rank-(k+1)
+        # (>= relaxed-glass spacing) -> SPH_methods' rank-k / rank-(k+1)
         # pair; track farthest overall as the primary fallback.
         bp = -1
         bpd = 1e30
@@ -138,7 +138,7 @@ def _nn_dirs(pos, idx, h, box, periodic, nsmooth, dist_floor):
                 bsd = d
                 bs = c
         if bp2 >= 0:
-            bs = bp2  # prefer the 2nd floor-cleared neighbour (old rank k+1)
+            bs = bp2  # prefer the 2nd floor-cleared neighbour (rank k+1)
         if bp >= 0:
             j = idx[i, bp]
             dx = pos[j, 0] - pos[i, 0]
@@ -613,10 +613,9 @@ def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
     """Split every particle, multiplying the count by `factor` (a power of 2).
 
     orient selects the dumbbell-axis algorithm (all perpendicular to the
-    nearest floor-cleared neighbour; 2026-07-06 benchmark in
-    _bench_split.py, history in the split-quality notes):
+    nearest floor-cleared neighbour; benchmark: _bench_split.py):
       'random'  - deterministic pseudo-random azimuth about the perpendicular
-                  plane (the original SPH_methods nn_ort port; former baseline).
+                  plane (the SPH_methods nn_ort port).
       'k1jitter'- (default) the original nn_ort azimuth (set by the secondary
                   neighbour), decorrelated only by a small +/- ~20 deg wiggle
                   instead of the full re-randomization.
@@ -633,8 +632,8 @@ def split(pos, mass, aux=None, box=None, factor=8, nsmooth=64, margin=8,
                   33k parents): N=96 is a safe cap, late sweeps are ~free.
 
     scale selects the per-particle offset length L (children at +/- dist*L):
-      'nn'  - distance to the floor-cleared nearest neighbour (original; fully
-              local but the min over candidates is a noisy statistic).
+      'nn'  - distance to the floor-cleared nearest neighbour (fully local
+              but the min over candidates is a noisy statistic).
       'vol' - (m/rho)^(1/3), the local mean spacing (same average on a uniform
               glass, far smoother per particle).
       'h'   - 2h*(4pi/(3 nsmooth))^(1/3), the spacing implied by the

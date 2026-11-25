@@ -1,4 +1,4 @@
-"""Slabbed accumulators (SPH_INTERP_PLAN task 7).
+"""Slabbed accumulators.
 
 The petkova accumulators are `(nthreads,) + cell_shape + (K,)` — N_grid x
 nthreads with NO N_part axis — so a 256³ grid on a 128-thread node wants 112 GB
@@ -13,8 +13,8 @@ to the unslabbed one, not merely close. It can be, because slabbing only skips
 cells — for any given cell the set of contributions and the order they are
 summed in are unchanged.
 
-The subtle half is the PERIODIC axis, which is what `prof_slab.py` left
-unsolved. There the raw z range is in unwrapped index space and a kernel
+The subtle half is the PERIODIC axis. There the raw z range is in unwrapped
+index space and a kernel
 straddling the boundary lands on BOTH ends of the grid, so clipping the loop
 bounds would silently drop the wrapped half. The deposit tests the slab in
 WRAPPED index space instead; `test_a_kernel_wrapping_the_z_boundary_*` is the

@@ -50,7 +50,7 @@ DEFAULT_TIME = 20.0           # nsteps*deltastep = 200*0.1 (loop back at origin)
 # density contrast) is physical here.
 PARAM_SPEC = [
     Param("a", "rhodiff", 1.0, float,
-          "loop/background density contrast rhodisk/rhozero"),
+          "loop/background density contrast rhodisk/rhozero", "rhodiff"),
 ]
 
 

@@ -2,7 +2,7 @@
 ## Setup for MHDCOLLAPSE
 import numpy as np
 # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
-# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+# NOT a global `np.trapz = ...` monkeypatch.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import IC_distribute as distribute
 import IC_fixdens as fixdens
@@ -135,7 +135,10 @@ class setup_mhdcollapse(object):
              
          self.npart=len(self.x)
          self.ngas=self.npart
-         if distri==1:
+         # Pre-glass only: integrate the total mass and export the relaxer's
+         # density table.  A placed IC (lattice/rand/glass) takes the exact
+         # analytic mass below instead.
+         if self.preglass:
              rq = np.linspace(0.0, 0.5*min(self.dxbound, self.dybound,
                                            self.dzbound), 200001)
              totmass = (self.rhoout*self.dxbound*self.dybound*self.dzbound
@@ -177,9 +180,7 @@ class setup_mhdcollapse(object):
          print(hsm,hsm2)
          
          #hsm=(5.0/kpctoau)
-         # vectorised over all particles (was a per-particle loop with a
-         # per-particle np.cross - the dominant cost at high nx). Rigid rotation
-         # about z inside R_in: v = w_vec x r = (-w*y, w*x, 0); zero outside.
+         # Vectorised over all particles. Rigid rotation about z inside R_in: v = w_vec x r = (-w*y, w*x, 0); zero outside.
          xa = np.asarray(self.x); ya = np.asarray(self.y); za = np.asarray(self.z)
          rho_a = np.asarray(self.rho)
          inside = (xa*xa + ya*ya + za*za) < self.Rin**2

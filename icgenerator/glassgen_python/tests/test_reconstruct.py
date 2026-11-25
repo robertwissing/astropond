@@ -142,8 +142,8 @@ def test_dedup_coincident_near_tolerance_clusters():
 
 @needs_sph_interp
 def test_capture_amr_state_dedup_merges_coincident_donors():
-    # duplicate a chunk of donors at IDENTICAL positions - without dedup this
-    # is the Q6 octree runaway; dedup collapses them and conserves content.
+    # duplicate a chunk of donors at IDENTICAL positions - without dedup the
+    # capture octree runs away; dedup collapses them and conserves content.
     pos, mass, box, _ = _gradient(nside=10)
     fields = {'u': 1.0 + 0.2 * pos[:, 0],
               'vel': np.stack([pos[:, 1], -pos[:, 0], pos[:, 2]], axis=1)}
@@ -207,7 +207,7 @@ def test_amr_matches_uniform_at_base_level():
     # no refinement (huge per-cell budget): the AMR table is its base grid,
     # so at cell centres it must agree with the uniform-grid table exactly.
     # Pin interp='flat': the centre read IS the cell's own value (the
-    # layout equivalence under test); the 'vertex' default (2026-07-13)
+    # layout equivalence under test); the 'vertex' default
     # reads the corner-node interpolation there instead.
     pos, mass, box = _lattice()
     npx = 8
@@ -239,7 +239,7 @@ def test_petkova_conserves_mass():
 
 @needs_sph_interp
 def test_petkova_conserves_field_contents():
-    # M23: non-density fields use the SAME exact Petkova cell fractions as
+    # non-density fields use the SAME exact Petkova cell fractions as
     # mass. Their raw m*A content must therefore sum to the particle content,
     # while the public primitive is content / deposited cell mass.
     pos, mass, box, _ = _gradient(nside=12)
@@ -402,9 +402,9 @@ def test_reconstruct_table_transfer_imprints_after_build(monkeypatch,
 @needs_sph_interp
 def test_linear_readout_is_smoother_than_flat():
     # same table values, two readouts: trilinear must remove the
-    # zeroth-order steps 'flat' has at cell faces. 'linear' is RETIRED
-    # from the public surface (2026-07-13, remaps to 'limited') but stays
-    # the internal substrate - set the attribute directly to test it.
+    # zeroth-order steps 'flat' has at cell faces. 'linear' is not on the
+    # public surface (it remaps to 'limited') but is the internal
+    # substrate - set the attribute directly to test it.
     pos, mass, box, _ = _gradient(nside=16)
     lin = capture_density(pos, mass, box=box, grid='amr', interp='limited')
     lin.interp = 'linear'
@@ -495,7 +495,7 @@ def _ball(n=6000, R=0.15, seed=0):
 def test_count_overlay_matches_builder_scheme():
     # apply_count_overlay = the leaf-set view of the builder's shell fill:
     # cells >= rho_edge keep their exact values, sub-edge cells come back
-    # positive (decay taper + M6 whole-frame tail, floored at rho_frame) and
+    # positive (decay fill, floored at rho_frame) and
     # never above rho_edge; the input is untouched
     pos, mass, box = _ball()
     table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
@@ -514,10 +514,10 @@ def test_count_overlay_matches_builder_scheme():
 
 
 def test_count_overlay_no_floor_profile():
-    # The C2-surviving fill: the overlay's sub-edge cells become ONE
-    # strictly-decreasing profile toward rho_frame (no plateau), resolved
-    # cells keep exact values, tail_reach reshapes the fill, and the
-    # retired taper-family kwargs really are gone (TypeError).
+    # The overlay's sub-edge cells become ONE strictly-decreasing profile
+    # toward rho_frame (no plateau), resolved cells keep exact values,
+    # tail_reach reshapes the fill, and taper-family kwargs are rejected
+    # (TypeError).
     import pytest
     pos, mass, box = _ball()
     table = reconstruct.capture_density(pos, mass, box=box, grid='amr',
@@ -535,7 +535,7 @@ def test_count_overlay_no_floor_profile():
         table, 2 * len(pos), c=64, tail_reach=12.0)
     assert info_s['tail_reach'] == 12.0
     assert not np.allclose(steep.vals[sub], noflr.vals[sub])
-    # the taper family is really retired (C2)
+    # taper-family kwargs are rejected
     for kw in (dict(flat_floor=True), dict(shell_start='edge'),
                dict(decay_spacing=5.0), dict(decay_cells=4.0),
                dict(decay_local=True)):
@@ -549,7 +549,7 @@ def test_padded_table_density_fused_matches_generic():
     # the fused one-kernel padded readout (PaddedTableDensity, the relax
     # hot path) must equal the generic PaddedDensity composition of the same
     # base/occupancy/shell pieces - inside the gas, in the taper, in the
-    # deep in-domain vacuum AND beyond the table domain (M6 tail region)
+    # deep in-domain vacuum AND beyond the table domain (tail region)
     from glassgen import envelope as E
     pos, mass, _ = _ball()
     amr, vals_raw = reconstruct.capture_amr_raw(pos, mass, box=None)
@@ -571,7 +571,7 @@ def test_padded_table_density_fused_matches_generic():
     b = KernelMatchedDensity(generic).rho0_h(q, h)
     np.testing.assert_allclose(a, b, rtol=1e-10, atol=0.0)
     # the 'vertex' interp runs fused too (corner tables threaded into the
-    # padded kernels, 2026-07-13): fused == generic on a vertex-interp build
+    # padded kernels): fused == generic on a vertex-interp build
     tv = AMRTable.from_grid(amr, vals_raw, interp='vertex')
     envv = E.build_table_envelope(tv, float(mass.sum()), 4000, box=None)
     pv = envv['density']
@@ -584,37 +584,34 @@ def test_padded_table_density_fused_matches_generic():
 
 
 @needs_sph_interp
-def test_open_raw_amr_mass_closure_preserves_bbox_geometry():
-    # An open particle-bbox capture clips extremal compact kernels.  The
-    # production reconstruct path keeps that validated geometry/envelope but
-    # closes the tiny global mass deficit with one recorded uniform factor.
+def test_open_raw_amr_capture_conserves_mass():
+    # An open capture meshes the union of the 2h kernel supports, so no kernel
+    # is clipped: the deposit already holds the source mass, and the closure
+    # factor is 1 to rounding and leaves geometry and values unchanged.
     pos, mass, _ = _ball(n=1200)
-    historical, historical_vals = reconstruct.capture_amr_raw(
+    raw, raw_vals = reconstruct.capture_amr_raw(
         pos, mass, box=None, nsmooth=32, close_open_mass=False)
     closed, closed_vals = reconstruct.capture_amr_raw(
         pos, mass, box=None, nsmooth=32, close_open_mass=True)
-    np.testing.assert_array_equal(closed.lo, historical.lo)
-    np.testing.assert_array_equal(closed.hi, historical.hi)
-    np.testing.assert_array_equal(closed.cell_lo, historical.cell_lo)
-    np.testing.assert_array_equal(closed.cell_size, historical.cell_size)
+    assert np.all(raw.lo < pos.min(0)) and np.all(raw.hi > pos.max(0))
+    np.testing.assert_array_equal(closed.lo, raw.lo)
+    np.testing.assert_array_equal(closed.hi, raw.hi)
+    np.testing.assert_array_equal(closed.cell_lo, raw.cell_lo)
+    np.testing.assert_array_equal(closed.cell_size, raw.cell_size)
     source_mass = float(mass.sum())
-    historical_mass = float(np.sum(
-        historical_vals * historical.volumes()))
-    closed_mass = float(np.sum(closed_vals * closed.volumes()))
-    assert historical_mass < source_mass
-    assert abs(closed_mass / source_mass - 1.0) < 3e-15
+    raw_mass = float(np.sum(raw_vals * raw.volumes()))
+    assert abs(raw_mass / source_mass - 1.0) < 1e-12
+    np.testing.assert_allclose(closed_vals, raw_vals, rtol=1e-12)
     audit = closed.capture_mass_audit
     assert audit['closure_applied'] is True
-    assert audit['uniform_closure_factor'] > 1.0
-    assert audit['relative_error_before_closure'] < 0.0
+    assert abs(audit['uniform_closure_factor'] - 1.0) < 1e-12
     assert abs(audit['relative_error_after_closure']) < 3e-15
 
 
 @needs_sph_interp
-@needs_sph_interp
 def test_local_launch_continues_bright_surface():
-    # The fill LAUNCHES from the nearest occupied cell's own value (the M12
-    # 'local' scheme, the only behaviour since C2): next to a surface much
+    # The fill LAUNCHES from the nearest occupied cell's own value: next to
+    # a surface much
     # brighter than the global rho_edge the vacuum scaffold reads far above
     # rho_edge (continuous support), and the fused readout still equals the
     # generic composition on the cap=None path.
@@ -651,35 +648,31 @@ def test_local_launch_continues_bright_surface():
 @needs_sph_interp
 def test_reconstruct_resample_cascade_conserves_mass_and_fields():
     # PURE reconstruct to a DIFFERENT count via the cascade + envelope
-    # (reconstruct_resample re-routed through relax_progressive, plan task 7).
+    # (reconstruct_resample runs through relax_progressive).
     pos, mass, box = _ball()
     fields = {'vel': np.zeros((len(pos), 3)), 'u': np.full(len(pos), 2.0)}
     # contour_refine=False, grade=False: this test exercises the CASCADE
     # path (mass / field conservation, cull accounting), not the capture.
-    # Either sharpening (M10 contour refine OR the M11 2:1 grading, both
-    # default ON) raises the tiny ball's rho_edge (the blurred pre-M10
-    # value came from coarse cells mixing edge gas with vacuum) and the
-    # N-aware envelope then CORRECTLY culls the kernel-scale skirt - a 3:1
-    # merge at nsmooth=64 leaves ~0.67x-0.72x of the naive count
-    # (permanent: max_iter 80->400 recovers nothing). The 0.8x floor below
-    # encodes the blurred-edge behaviour; the sharpened captures have their
-    # own tests (test_contour_refine_splits_band_straddlers,
-    # test_grade_2to1_balances_thin_slab_capture). shell_start='edge' too:
-    # the local scaffold on this tiny ball parks+culls ~900 particles at
-    # count=2000, putting the survivor count right ON the 0.8x floor
-    # (thread-order float noise flips it) - pin the whole pre-M12 envelope.
+    # Either sharpening (contour refine OR 2:1 grading, both default ON)
+    # raises the tiny ball's rho_edge (coarse cells otherwise mix edge gas
+    # with vacuum) and the N-aware envelope then CORRECTLY culls the
+    # kernel-scale skirt - a 3:1 merge at nsmooth=64 leaves ~0.67x-0.72x of
+    # the naive count. The count floor below encodes the blurred-edge
+    # behaviour; the sharpened captures have their own tests
+    # (test_contour_refine_splits_band_straddlers,
+    # test_grade_2to1_balances_thin_slab_capture).
     for count in (2000, 9000):                    # both < and > the 6000 input
         posf, massf, auxf, isf, a = reconstruct.reconstruct_resample(
             pos, mass, count, fields, box=box, nsmooth=64,
             relax_kw=dict(icr0_stop=2e-2, max_iter=80), seed=1,
             contour_refine=False, grade=False,
-            # scatter is no longer the default (flipped to 'table' 2026-07-24);
-            # this test validates the M22 scatter content/audit tiers, so pin it.
+            # the default is 'table'; this test validates the scatter
+            # content/audit tiers, so pin it.
             field_transfer='scatter')
         # exact mass conservation + equal-mass glass
         assert abs(massf.sum() - mass.sum()) < 1e-9
         assert np.allclose(massf, massf[0])
-        # fields SCATTERED onto the survivors (M22): content is conserved
+        # fields SCATTERED onto the survivors: content is conserved
         # exactly w.r.t. the interior donors, so a constant u=2 has a
         # machine-exact MEAN; pointwise it absorbs the local received/
         # uniform mass ratio (loose band - this ball is barely relaxed).
@@ -688,15 +681,14 @@ def test_reconstruct_resample_cascade_conserves_mass_and_fields():
         # content tier: nothing is lost in transfer (machine zeros)
         assert fa['resid_u'] < 1e-12 and fa['resid_vel'] < 1e-12
         # mass-weighted-average division: a constant field is reproduced
-        # EXACTLY, starved-receiver fill included (M22 A/B verdict)
+        # EXACTLY, starved-receiver fill included
         assert np.allclose(auxf['u'], 2.0, atol=1e-9)
         assert not isf.any()                      # survivors are gas, bg culled
         # survivors are the compact ball, count near the target
         d = np.linalg.norm(posf, axis=1)
         assert np.percentile(d, 99) < 0.30        # ball R = 0.15
-        # 0.75x floor: the two-rung (floor=rho_edge) envelope culls the
-        # tiny ball's skirt slightly harder than the old rho_floor one,
-        # nudging this boundary count from ~0.80x to ~0.79x (2026-07-14)
+        # 0.75x floor: the envelope culls the tiny ball's skirt (~0.79x
+        # survive at this boundary count)
         assert 0.75 * count < len(posf) < 1.3 * count
         for key in ('n_full', 'n_survivor', 'n_culled', 'n_background',
                     'mf', 'rho_edge'):
@@ -705,7 +697,7 @@ def test_reconstruct_resample_cascade_conserves_mass_and_fields():
 
 @needs_sph_interp
 def test_scatter_fields_conserves_and_truncates():
-    # M22: donor-normalized scatter - interior content conserved to machine
+    # donor-normalized scatter - interior content conserved to machine
     # precision for every field; excluded donors are the truncation budget.
     rng = np.random.default_rng(3)
     src = rng.random((4000, 3))
@@ -733,8 +725,7 @@ def test_scatter_fields_conserves_and_truncates():
     assert np.allclose(fa['trunc_vel'],
                        (m[~inside, None] * fields['vel'][~inside]).sum(0))
     assert abs(fa['trunc_mass'] - m[~inside].sum()) < 1e-15
-    # the KE/Lz geometry diagnostics are reported (M22 item 3: measure,
-    # then decide - no inequality asserted)
+    # the KE/Lz geometry diagnostics are reported (no inequality asserted)
     assert fa['ke_in_vel'] > 0.0 and fa['ke_out_vel'] > 0.0
 
 
@@ -759,9 +750,12 @@ def test_scatter_to_points_periodic_fold():
     # the wrapped receiver (dist 0.04 through the face) gets it, not the
     # in-box-distant one (0.48 > kernel reach, only reachable by fallback)
     assert recv[0] > 0.99 and recv[1] < 1e-12
-    # M3: a scalar base_npx on a non-cubic domain must yield ~CUBIC cells
+
+
+def test_capture_scalar_base_npx_gives_cubic_cells():
+    # a scalar base_npx on a non-cubic domain must yield ~CUBIC cells
     # (per-axis base counts scaled to the aspect), not cells whose aspect
-    # tracks the domain (the 8:1 galaxy capture)
+    # tracks the domain
     rng = np.random.default_rng(5)
     pos = rng.random((4000, 3)) * np.array([4.0, 2.0, 0.5])   # 8:1 slab
     mass = np.full(len(pos), 1.0 / len(pos))
@@ -808,14 +802,13 @@ def _two_level_table(child_vals, n0=4, refined=(1, 1, 1)):
 
 
 def test_linear_readout_level_jump_no_bleed():
-    # 2026-07-11 galaxy z-sheet fix: a stencil node inside a coarse cell
-    # must read the RESTRICTED average of a finer neighbour (mean of the
-    # sibling group), never point-sample one hot child - otherwise a hot
-    # fine leaf smears across the whole coarse cell width (readouts of
-    # 1e2-4.5e3 x rho_edge were measured in TRUE-ZERO cells)
+    # a stencil node inside a coarse cell must read the RESTRICTED average
+    # of a finer neighbour (mean of the sibling group), never point-sample
+    # one hot child - otherwise a hot fine leaf smears across the whole
+    # coarse cell width
     hot = [800.0, 0, 0, 0, 0, 0, 0, 0]        # restricted average = 100
     t = _two_level_table(hot)
-    t.interp = 'linear'      # the retired trilinear IS the machinery under
+    t.interp = 'linear'      # trilinear IS the machinery under
     # test here (limited/vertex build on its restricted nodes)
     # sample throughout the empty coarse cell face-adjacent to the refined
     # one: with level-consistent nodes every value is <= the restricted 100
@@ -845,23 +838,18 @@ def test_linear_readout_constant_across_levels():
 
 
 def test_occupancy_flat_ignores_level_jump_bleed():
-    # 2026-07-11 companion fix: even level-consistent trilinear legitimately
-    # ramps inside a truly-EMPTY coarse cell toward a dense neighbour's
-    # restricted average - so OCCUPANCY (and the padded-target dispatch)
-    # must use the flat cell average, or the ramp is classified as gas
-    # (15% of the galaxy survivors parked in true-zero cells and passed
-    # the cull as "occupied")
+    # even level-consistent trilinear legitimately ramps inside a
+    # truly-EMPTY coarse cell toward a dense neighbour's restricted
+    # average - so OCCUPANCY (and the padded-target dispatch) must use the
+    # flat cell average, or the ramp is classified as gas
     from glassgen.envelope import build_table_envelope, table_mass
     # one hot child + 7 faint siblings: rho_edge lands on the faint value
     # (8), DECADES below the hot child (800) and below the neighbour-cell
     # ramp - the galaxy configuration (rho_edge 2.5e-7 vs disk ~1e-3)
     t = _two_level_table([800.0, 8, 8, 8, 8, 8, 8, 8])
     M = table_mass(t)
-    # shell_start='edge': this test pins the CAPPED composition ("never
-    # above rho_edge in vacuum"); the 'local' default serves the local
-    # scaffold there instead (by design - still the shell, never the ramp)
     env = build_table_envelope(t, M, 8192, box=None, c=64, k=2.0)
-    # the (retired) trilinear base readout DOES ramp above rho_edge inside
+    # the trilinear base readout DOES ramp above rho_edge inside
     # the empty neighbour cell (the hazard is real in this fixture) - flip
     # the attribute ONLY for this standalone read: the envelope structures
     # hold references to t, so it must be restored before their asserts
@@ -884,7 +872,7 @@ def test_occupancy_flat_ignores_level_jump_bleed():
 
 
 def test_limited_readout_no_lobes_and_linear_exact():
-    # M13 cheap limiter: 'limited' (MUSCL minmod) must (a) reproduce a
+    # cheap limiter: 'limited' (MUSCL minmod) must (a) reproduce a
     # smooth linear field exactly where 'linear' does, (b) NEVER ramp
     # toward a bright neighbour inside a faint cell (the graded z-line
     # sawtooth lobes), staying at the faint cell's own scale.
@@ -922,7 +910,7 @@ def test_limited_readout_no_lobes_and_linear_exact():
 
 
 def test_vertex_readout_continuous_across_level_jump():
-    # M13 route (a): 'vertex' (hanging-node-slaved corner trilinear) must
+    # 'vertex' (hanging-node-slaved corner trilinear) must
     # be (a) exact on a linear field in a uniform region, (b) CONTINUOUS
     # across the level jump where 'linear'/'limited' step (the basis
     # switch), (c) fall back cleanly on the two-level fixture.
@@ -968,7 +956,7 @@ def test_vertex_readout_continuous_across_level_jump():
 
 @needs_sph_interp
 def test_envelope_mass_contract_closure():
-    # 2026-07-13 (user): the ensemble must carry the target's WHOLE mass
+    # the ensemble must carry the target's WHOLE mass
     # integral - gas + backed shell + the analytic outside-domain tail -
     # so nothing is borrowed from the gas during the relax:
     # M_gas + n_bg*m == M_target to within one particle mass.
@@ -1094,7 +1082,7 @@ def test_padded_capture_metadata_roundtrip_and_frame_invariance(tmp_path):
 
 @needs_sph_interp
 def test_contour_refine_splits_band_straddlers():
-    # M10: with contour_n set, occupied cells whose mean density falls in the
+    # with contour_n set, occupied cells whose mean density falls in the
     # rho_edge band must be refined below the local output sampling scale
     # beta*(m_out/rho)**(1/3) - the coarse straddlers that quantize the flat
     # occupancy verdict (the rectangular cull bites) disappear.
@@ -1133,9 +1121,9 @@ def test_contour_refine_splits_band_straddlers():
     n0, band0, w0, f0 = band_leaf_widths(None)
     n1, band1, w1, f1 = band_leaf_widths(count)
     assert n1 > n0                       # the pass added leaves
-    # pre-M10: at least one coarse straddler wider than its sampling floor
+    # unrefined: at least one coarse straddler wider than its sampling floor
     assert (band0 & (w0 > f0)).any()
-    # post-M10: every occupied band leaf is at or below the floor
+    # contour-refined: every occupied band leaf is at or below the floor
     assert not (band1 & (w1 > f1 * (1 + 1e-9))).any()
 
 
@@ -1201,8 +1189,8 @@ def test_grade_2to1_balances_thin_slab_capture():
 
 
 def test_count_overlay_m20_lockstep_with_builder():
-    # M20: the overlay MUST resolve the same (k, tail_reach, nl0) as the
-    # builder - the CLEANUP_PLAN C1a lockstep rule - or glasstable renders
+    # the overlay MUST resolve the same (k, tail_reach, nl0) as the
+    # builder, or glasstable renders
     # a different target than the one the relax sees.
     import warnings as _w
 

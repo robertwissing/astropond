@@ -357,9 +357,7 @@ def finish_figure(fig, save=None, dpi=150):
     if save:
         fig.savefig(save, bbox_inches='tight', dpi=dpi)
         print(f"saved {save}")
-        print("Trololol")
-        tg.send_message("Trololol")
-        tg.send_photo(save, "{save}")
+        tg.send_photo(save, os.path.basename(save))
     else:
         plt.show()
 
@@ -408,13 +406,37 @@ def finish_figure_with_legend(fig, ax, save=None, dpi=150, footnote=None):
         extra.append(ft)
 
     if not save:
+        # The legend/footnote sit BELOW the axes, i.e. under figure y=0. Saving
+        # gets away with that because bbox_inches="tight" grows the canvas; an
+        # interactive window cannot grow, so anything below y=0 is simply
+        # invisible. Measure how far they overhang and free that strip instead.
+        if extra:
+            fig.canvas.draw()
+            inv = fig.transFigure.inverted()
+            overhang = -min(a.get_window_extent().transformed(inv).y0
+                            for a in extra)
+            if overhang > 0:
+                room = min(overhang + 0.04, 0.6)
+                fig.subplots_adjust(bottom=fig.subplotpars.bottom + room)
+                if handles:
+                    leg.set_bbox_to_anchor((0.5, room), transform=fig.transFigure)
+                if footnote:
+                    fig.canvas.draw()
+                    y = room
+                    if handles:
+                        y = leg.get_window_extent().transformed(inv).y0
+                    ft.set_position((0.5, y - 0.02))
         plt.show()
         return
     # bbox_extra_artists + tight bbox so the below-figure legend/footnote aren't clipped.
+    # Supplying bbox_extra_artists makes the tight bbox consider ONLY the axes and
+    # the listed artists, so a figure-level suptitle would otherwise be cropped away.
+    suptitle = getattr(fig, "_suptitle", None)
+    if suptitle is not None and suptitle.get_text():
+        extra.append(suptitle)
     fig.savefig(save, bbox_inches="tight", bbox_extra_artists=tuple(extra), dpi=dpi)
     print(f"saved {save}")
-    print("Trololol")
-    tg.send_photo(save, "{save}")
+    tg.send_photo(save, os.path.basename(save))
     plt.close(fig)
 
 def loaddata(entry: str):
@@ -619,9 +641,7 @@ def render_particles(axis1, axis2, render, box_size=None, res=512, outname=None,
 
     if outname:
         plt.savefig(outname, dpi=150, bbox_inches="tight")
-        print("Trololol")
-        tg.send_message("Trololol")
-        tg.send_photo(outname, "{save}")
+        tg.send_photo(outname, os.path.basename(outname))
         plt.close()
     else:
         plt.show()
@@ -705,4 +725,3 @@ def render_movie_over_files(files, axis1_idx, axis2_idx, render_idx,
             plt.close()
 
     print(f"Saved movie to {out}")
-

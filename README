@@ -1,15 +1,71 @@
-A large testsuite of different simulations. Can generate both closed-packed lattice, poisson distributed or glass generated ICs. The glass generation occurs through an IC-generator that can produce glass for a wide-range of density profiles.
+A large testsuite of different simulations. Can generate close-packed (FCC) lattice, simple cubic lattice, poisson distributed or glass generated ICs. The glass generation occurs through an IC-generator that can produce glass for a wide-range of density profiles.
 
-Before starting, you need to change GASOLINE_DIR, CHANGA_DIR, SPHEXA_DIR variables in runtest.sh to point towards your specific gasoline/changa/sphexa build and if you are running serial mpi etc. :
-default is:
+Gasoline code 0 and ChaNGa code 1 are built and selected automatically from each
+test's physics and EOS requirements. Set `GASOLINE_SRC` or `CHANGA_SRC` to use
+another source tree, and the matching `<CODE>_BUILD_CONFIG` when that fork has
+different capabilities. Other code locations can still be overridden with
+their directory variables, such as `SPHEXA_DIR`.
+
+The repository default for ChaNGa is `codes/changa/changa-public` and advertises
+hydro/gravity only. For the current private MHD-TP development tree, opt into the
+matching profile (its source path is recorded there):
+
+  export CHANGA_BUILD_CONFIG="$PWD/codes/changa/build_config_mhdtp.sh"
+  ./runtest.sh orzag 64 32 3 1
+
+You may additionally set `CHANGA_SRC`, `CHANGA_CHARM_SRC`, or
+`CHANGA_UTILITY_SRC` to relocate that source and its dependencies. Every source,
+dependency, or configure-flag change produces a new build key; `auto` builds the
+new immutable artifact, while `CHANGA_BUILD_MODE=reuse-only` refuses a cache
+miss. Run `./runtest.sh support` to see the active adapter's capabilities.
+
+Gasoline run names use a short letter build alias (`GASOLINE-A`,
+`GASOLINE-B`, ...) instead of repeating `cfg` plus twelve hash characters.
+The append-only mapping at `codes/gasoline/builds/build-aliases.tsv` records
+each alias, old `cfg<short-key>` tag, cache directory, and full content key;
+`codes/gasoline/build_alias.sh list` prints it. Every run also retains its full
+key and manifest, so the shorter display name does not weaken provenance.
+
+Extra build flags
+-----------------
+
+Persistent campaign additions live in `codes/extra_build_flags.sh`; neither
+adapter requires the user to export a code-specific flags string. The uniform
+array names are `<CODE>_EXTRA_BUILD_FLAGS`, while each array contains the native
+form understood by that code.
+
+For example, a Gasoline reconstruction campaign uses preprocessor definitions:
+
+  GASOLINE_EXTRA_BUILD_FLAGS=(
+      CORRPARTITION
+      RECONSTRUCTION
+      RECONB
+  )
+
+The adapter turns these into `-DCORRPARTITION -DRECONSTRUCTION -DRECONB`.
+Gasoline's `MHD` and `BAROTROPIC` definitions remain profile-owned.
+
+A ChaNGa campaign uses configure feature switches:
+
+  CHANGA_EXTRA_BUILD_FLAGS=(
+      --enable-corrpartition
+  )
+
+ChaNGa's configure script translates those switches to compiler options. The
+private MHD-TP profile already enables reconstruction, while `mhd` and
+`barotropic` remain profile-owned. After editing the file, run `runtest.sh` or
+either `build_* all` command normally. The effective entries are included in
+the content key and manifest. `GASOLINE_DEFINES` and
+`CHANGA_CONFIGURE_FLAGS` remain available only as temporary compatibility
+overrides. Set `CODE_EXTRA_BUILD_FLAGS_FILE=/path/to/another.sh` to select a
+separate campaign file without editing the repository default.
 
 If you wanna use the glass relaxation (hacked version of gasoline) you need to go into icgenerator/mdl/mpi and make and icgenerator/gasoline/ and make mpi (for default)
 
-Usage: ./runtest.sh [-i] [-r] [-a value1] ... [-h value8] <nameofsimulation> <Nsmooth> <Nres> <0: lattice | 1: rand | 2: glass>
+Usage: ./runtest.sh [-r] [-a value1] ... [-k value11] <nameofsimulation> <Nsmooth> <Nres> <0: FCC lattice | 1: rand | 2: glass | 3: cubic lattice>
 
 Options:
   -a, -b, -c, ...    These options depend on the simulation. To see the specific options, enter the nameofsimulation without arguments.
-  -i                 Interactive.
   -r                 After the simulation finishes, run the matching analysis
                      (setupfiles/IC_analysis_<simulation>.py) with --save-reference
                      to bless a regression baseline for the run (see "Analysis"
@@ -19,14 +75,20 @@ Arguments:
   nameofsimulation   Name of the simulation to be run (e.g., shocktube).
   Nsmooth            Number of neigbours within smoothing kernel
   Nres               Resolution for the simulation.
-  0 | 1 | 2          Initial conditions type:
-                     0: lattice
+  0 | 1 | 2 | 3      Initial conditions type:
+                     0: close-packed (FCC) lattice
                      1: random
-                     2: glass
+                     2: glass (relaxed from a random pre-IC)
+                     3: simple cubic lattice
+                     0 and 3 select the lattice for every test.  The glass's
+                     random pre-IC is a separate artefact from a `rand` run's
+                     IC (datafiles/<test><Nres>_preglass*): its .param is a
+                     glassgen input (periodic box + dICdens* target profile),
+                     while a `rand` IC gets the test's own runnable .param.
 If glass data file exist for a specific Nsmooth it will skipp the glass generation and run the simulation. If you choose an nSmooth that does not have a glass datafile it will do the whole glass generation again.
 
 List of available simulations:
-(enter a name without arguments to see its specific -a..-h options.
+(enter a name without arguments to see its specific -a..-k options.
  [A] = has a post-processing analysis script, setupfiles/IC_analysis_<name>.py)
 
   Hydrodynamics:
@@ -44,6 +106,8 @@ List of available simulations:
     rt            [A]  Rayleigh-Taylor instability.
     shocktube     [A]  Riemann shock-tube suite (hydro + MHD presets).
     coldkeplerian [A]  Cold Keplerian disk/ring (AV / angular-momentum test).
+    powerlawring  [A]  Relaxed power-law disk/annulus equilibrium, cylindrical
+                       or spherical (general beta; orbits / MHD winding).
     accdisk            Accretion disk.
     planet             Planet / planet-in-disk simulation.
     planetcollision    Planet collision.
@@ -64,10 +128,280 @@ List of available simulations:
     mhdcollapse   [A]  Magnetized rotating-cloud collapse (Wissing & Shen).
     mhddivtest    [A]  Hyperbolic divergence-cleaning test (Tricco & Price).
     mhdisowave    [A]  Isolated longitudinal MHD/sound pulse (Iwasaki).
-    currentsheet  [A]  2-D MHD current sheet / reconnection.
-    mti           [A]  Magnetothermal instability (Owens et al.).
-    mhdbalsaravortex   Balsara MHD vortex.
-    mri                Magnetorotational instability.
+    currentsheet [A]  2-D MHD current sheet / reconnection.
+    mti          [A]  Magnetothermal instability (Owens et al.).
+    mhdbalsaravortex  Balsara MHD vortex.
+    mri               Magnetorotational instability.
+
+  Fuzzy dark matter (ChaNGa --enable-fdm, code 1; dark particles, m = 1e-22 eV):
+    soliton       [A]  -a 0 (default): static Gaussian core, quantum potential Q
+                       and a_QP vs analytic. -a 1: the same Gaussian as a free
+                       packet (gravity off, periodic, to t = tau = 2 sigma^2 m/hbar):
+                       homologous spreading, central density, E_kin vs analytic.
+                       -a 2: self-gravitating
+                       Schroedinger-Poisson ground state (r_c = 1 kpc), must stay in
+                       equilibrium for 1.6 Gyr. -a 3: head-on collision of two
+                       ground states, -b separation / r_c (10), -c relative speed /
+                       v_c(r_c) (6); presets fast -b 10 -c 6 (passes through, 0.63
+                       Gyr) and slow -b 8 -c 1 (bound, 1.6 Gyr). Scored against the
+                       Schroedinger-Poisson reference in
+                       reference_solution_highres/soliton/ (setupfiles/
+                       soliton_reference.py, ~4 h per phase on 60 cores); a bound
+                       collision depends on the solitons' relative phase, which a
+                       particle code does not carry, so it is scored against the
+                       band of phases 0, pi/2, pi. -a 4: halo from -b N (4) ground
+                       states at rest, centres drawn (seeded) in a sphere of -c R
+                       r_c (6); they merge into a cored halo (1.6 Gyr). Scored
+                       against the band of three Schroedinger-Poisson phase
+                       realisations (soliton_reference.py --halo, ~3 h each on 60
+                       cores). Cost at Nres 16 on 16 cores: -a 1 < 1 min, -a 4
+                       ~10 min; -a 1 at Nres 32 ~5 min.
+    gaussOverdens [A]  Static 3-D Gaussian overdensity on a background.
+    1DdensityFront [A] Static 1-D tanh density front.
+    fdmwave       [A]  Linear waves, -b mode, -c amplitude. -a 0: free quantum
+                       dispersion omega = (hbar/2m) k^2 in a periodic slab, gravity
+                       off. Self-gravitating, in a periodic cube cut from one shared
+                       uniform glass (Ewald), the mode imprinted as a Zel'dovich
+                       displacement: -a 1 Jeans test, omega^2 = (hbar/2m)^2 k^4 -
+                       4 pi G rho0 with k_J = 3 pi / L (n = 1 grows, n >= 2
+                       oscillate); -a 2 comoving Jeans crossing (EdS, a = 0.1 -> 1,
+                       n = 1 crosses k_J at a = 0.2), against the linear ODE; -a 3
+                       null test (uniform glass, box = 0.25 Jeans lengths): noise
+                       velocities, density noise, energy. Cost at Nres 32: -a 1, 2
+                       3-10 min on 16 cores, -a 3 ~20 min on 32.
+                       Exact free solutions in the slab of -a 0 (Hopkins 2019):
+                       -a 4 two interfering plane waves, rho0 (1 + A cos(Kx -
+                       Omega t)), -c contrast A (default 1: nodes rho = 0); -a 5
+                       two-stream intersection, a converging Gaussian that
+                       bounces, t = -tau .. +tau (-b, -c ignored). -d: slab
+                       thickness factor of -a 0, 4, 5 (default 1 = 24 rows; use 2
+                       with 400 neighbours).
+    The estimator variant is a run-time choice (ChaNGa default V5), passed
+    through [extra] and labelled by EXTRANAME, e.g.
+      EXTRANAME=V7 ./runtest.sh soliton 64 32 2 1 0 "-iFDMForce 3 -iFDMHMode 2"
+
+Coldkeplerian arguments are:
+
+  -a  thermal coefficient hr=P/rho at R=1 (default 9.5e-7)
+  -b  inner ring radius (default 1)
+  -c  outer ring radius (default 2)
+  -d  thermal exponent q in P/rho proportional to R^-q (default 0.5;
+      Sigma and v_phi remain R^-1/2)
+
+For the default gamma=5/3, the nominal orbital Mach number at R=1 is
+`1/sqrt(gamma*hr)=794.7`.  The Gaussian target converts the thermal
+coefficient to the geometric thickness `H/R=sqrt(hr)=9.75e-4`; `hr` itself is
+not an aspect ratio.  This remains a three-dimensional live-sink test, so the
+very thin default needs enough vertical resolution.  The cylindrical
+powerlawring arm (`-b 2`) is the better-resolved analogue of the literature's
+strictly two-dimensional Kepler disc.
+
+Powerlawring arguments are:
+
+  -a  circular-speed slope beta (-0.5 Kepler, 0 flat, 1 solid body)
+  -b  force geometry (2 cylindrical, 3 spherical)
+  -c  field mode (0 hydro, 1 toroidal C/R, 2 radial winding,
+      3 normal field, 4 constant toroidal B_phi=C,
+      5 constant toroidal with NO central regularization)
+  -d  plasma beta 2P/B^2 at R=1 (sets the magnetic amplitude; default 1e6)
+  -e  potential softening
+  -f  orbital-plane tilt in degrees (spherical geometry only)
+  -g  radial domain (0 annulus with science radii 0.5..2, 1 full disk)
+  -h  barotrope scale height H, which sets the temperature
+  -i  paired radial density/confinement mode
+      (0 free edges, 1 matched wall, 2 Groth equations 49--50; default 0)
+
+The vertical structure follows -b.  Spherical geometry has a vertical
+restoring force and uses the exact compact hydrostatic atmosphere.  Cylindrical
+geometry has no vertical force, so it uses a constant-density slab closed by
+periodicity in z (`bPeriodic=1`, `dxPeriod=dyPeriod=0`).  With free edges
+(`-i 0`) its source is a plain uniform periodic glass that the IC carves; with
+the matched wall (`-i 1`) the relaxer is handed the tapered `rho(R)` itself and
+its output IS the final particle set.
+
+The z period is MINIMAL and scales with the resolution, the same rule every
+other thin-box test in this suite uses: the half period is `2*sqrt(6)` particle
+spacings (orzag, gresho, currentsheet, khslab, taylorgreen, noh, square and
+mhddivtest all set their half-thickness to `2*sqrt(6)*dx`), i.e.
+`dzPeriod = 4*sqrt(6)*(4/nx)`, which is `0.612` at nx=64 and `0.153` at nx=128.
+A fixed thickness would spend particles on depth the test does not use, and
+because the slab thins with resolution the cylindrical arm costs `nx^2`
+particles rather than `nx^3` -- 3.3x fewer at nx=128 and 6.6x fewer at nx=256.
+The published surface density, `P/Sigma`, the sound speed and the Mach number
+are all unchanged by the thinning; only the volume density and the particle
+count move.
+
+The rule also fixes the kernel/period contract.  A pair must not fall inside
+one kernel both directly and through the wrap, which needs the support diameter
+`2h` to stay below the half period.  At the science density `2h = 2.72 dx`
+against a half period of `4.90 dx`, so the ratio is `0.55` independent of
+resolution: the contract holds at every nx by construction, and `create()`
+still guards it.  It cannot hold in the disposable low-density edge bands,
+where `h` grows as `rho^(-1/3)`: a taper running to vacuum (`-i 1`) or equation
+(49)'s shallow outer wing (`-i 2`) always reaches `2h > ` half period
+somewhere, at every resolution.  `create()` reports the emitted mass that lands
+there (0.8% for `-i 1`, 1.2% for `-i 2`) rather than pretending otherwise.
+
+With the default `-i 0`, cylindrical geometry has a sharp radial edge: rho=1 over the science domain itself -- R=0.5..2 for an annulus,
+R=0..2 for a full disk -- and zero outside.  A sharp ring has no taper, so it
+keeps none of the R=0.25/2.5 support band that the tapered targets carry their
+density to zero across, and its periodic source glass is the ring's own
+bounding box (4.0 x 4.0 against 5.0 x 5.0 for the wall, both by the z
+period), so no particle is relaxed into a shell the carve throws away.  This is suitable for
+cold force/induction
+tests, but a hot edge next to vacuum launches a radial rarefaction and, for
+beta=1, a coherent epicyclic breathing mode.
+
+`-i 1` replaces the free radial surfaces with a matched wall.  Let `s(R)` be
+one in the science domain, fall smoothly from one to zero over R=2..2.5, and,
+for an annulus, rise from zero to one over R=0.25..0.5.  The IC uses
+
+  rho(R) = 0.01 [exp(ln(101) s) - 1]
+  Phi_wall(R) = H^2 ln(101) [1 - s(R)].
+
+Thus `dPhi_wall/dR = -dh/dR`: the wall force exactly cancels the taper's
+pressure force and leaves the requested power-law circular speed unchanged.
+For beta=1 this preserves exact solid-body rotation `v_phi=R` at any H.  The
+annulus gets an inner repulsive and outer attractive wall; the full disk gets
+the outer wall only.  The wall is opt-in and its state is included in final-IC,
+run, parameter, and analysis identities.
+
+Wall mode does NOT share the free-edge source glass: that taper is a density
+profile, so it is relaxed like any other target rather than reproduced by a
+post-glass radius remap (which matched the radial mass profile but was not an
+isotropic glass of it, and so started the run settling).  The boundaries are
+mixed and both come from the seed .param: z stays genuinely periodic across the
+whole slab -- `--open` would break that wrap -- while the free radial surfaces
+sit in the box interior and ride glassgen's envelope scaffold and vacuum cull.
+The cull contour is where one kernel of mass remains: at nx=64, nSmooth=84 that
+is `rho_edge=0.027` at R=2.33 for the full disk (0.025 for the annulus), so the
+science domain and most
+of the disposable taper survive and 0.2% of the mass does not.  On the annulus,
+the corresponding inner contour is expected near R=0.33 for the
+R=0.25..0.5 taper.  The compact target is exactly independent of H, beta and
+softening, so one glass per radial domain serves every temperature and force
+law.
+
+`-i 2` selects the Groth et al. (2023) Kepler-disc prescription as one atomic
+mode: equation (49)'s surface density and the printed equation (50) edge
+force.  It is deliberately not a `-g` value: `-g` continues to select the
+spatial domain, while `-i` selects the paired density/confinement law.  The
+literature mode is the cylindrical, hydrodynamic, unsoftened Kepler annulus
+(`-a -0.5 -b 2 -c 0 -e 0 -f 0 -g 0`).  Omitted `-b` and `-e` are set to 2
+and 0 automatically; explicit incompatible choices are rejected.
+
+Within the retained edge bands `R=0.25..2.5`, the cylindrical slab is assigned
+
+  Sigma(R) = 0.01 + (R/0.5)^3                         (R < 0.5)
+             0.01 + 1                                (0.5 <= R <= 2)
+             0.01 + [1 + (R-2)/0.1]^-3              (R > 2).
+
+The 2-D quantities are extruded uniformly through the periodic slab as
+`rho=Sigma/dzPeriod` and `P_3D=1e-6/dzPeriod`, preserving both the published
+surface density and `P/Sigma` -- and hence the sound speed and Mach number --
+at every resolution, even though `dzPeriod` itself scales with nx.  A disposable glass-only skirt lies outside the emitted
+`R=0.25..2.5` interval.  The runtime force replaces, rather than supplements,
+the generic power-law acceleration and follows the three printed equation
+(50) branches at `R=0.35` and `R=2.1`.  The generic `-h` barotrope control is
+ignored in this mode because the literature pressure is fixed.
+
+This mode passes NO `--rho-edge-max` to the relaxer, unlike the two taper
+targets, and the difference is the profile.  `rho_edge` is glassgen's
+RESOLVABILITY contour: the density below which the target holds less than one
+kernel of mass, so it is filled with background and culled afterwards.  The
+taper targets fall to ZERO inside the retained band, so that contour
+necessarily lies inside it and the cap bounds how far in the cull eats.
+Equation (49) instead keeps the published `0.01` floor, so the retained band
+never approaches vacuum and the contour lands at or beyond the emitted edge on
+its own.  Measured contour radius against the `R=2.5` edge (`nSmooth=84`):
+`2.428, 2.493, 2.547, 2.568` at `nx = 48, 64, 96, 128`, i.e. the cull removes
+`0.14%, 0.012%, 0, 0` of the emitted annulus -- at `nx=64` a band `0.03` of one
+LOCAL particle spacing wide.  A cap on the contour position would be a
+knife-edge test with no physical content at any resolution this test is run at.
+`nx=64` is a perfectly good Groth grid; only an absurdly coarse one (`nx<=24`,
+where the contour reaches `R=2.18` and takes ~1% of the mass) would matter.
+
+`-d` is the MAGNETIZATION, given as the plasma beta `2P/B^2` at R=1 in the
+science domain; the amplitude `C` is derived from it.  It replaces the raw
+amplitude because the pressure scales as `H^2`, so holding `C` fixed across a
+temperature scan silently scans the magnetization too (a factor 2500 over
+`-h 0.01..0.5`).  The suite's induction tests are kinematic, and `beta >> 1`
+is exactly that statement.  Beta is only uniform where the profile is: modes 1
+and 2 fall as `1/R`, so their local beta rises as `R^2`, and a full disk's
+toroidal core dips about two decades below the reference value at `R=eps` --
+that core minimum, printed at IC creation, is where the kinematic assumption
+actually binds (at the default 1e6 it is ~1e4).
+
+Field mode `-c 4` IS that spatial constant, `B_phi = C`, and exists as the
+deliberate counterpart to `-c 1`.  Both are exactly invariant under ideal
+induction for ANY rotation law, because a purely toroidal field in a purely
+azimuthal axisymmetric flow has `v x B = 0`, so `dB/dt = 0` identically; solid
+body (`-a 1`) is the cleanest case because there is no shear at all, so any
+measured drift is pure numerical error.  The difference is the momentum
+equation: `C/R` is current-free and exerts no Lorentz force, whereas the
+constant field has `R B_phi` non-constant, so it carries a current `~C/R` and
+an inward hoop stress.  The IC balances that exactly -- the term is `C^2/rho`,
+which raises the equilibrium `v_phi^2` by `2P/plasma_beta` at the science
+density, i.e. by 2e-6 relative at the default `-d 1e6` and by ~2% only as beta
+approaches unity.  Mode 4 therefore tests field-momentum coupling, not just
+induction.  On a full disk it continues to the axis as the center-regular
+`B_phi = C R/sqrt(R^2+eps^2)`, exactly as mode 1 continues `C/R` as
+`C R/(R^2+eps^2)`, with the same `-e`.  That softening is not cosmetic: a
+strictly constant `B_phi` leaves the hoop term `C^2/rho` finite as `R->0`
+while gravity vanishes, so equilibrium would demand `v_phi -> C` and hence
+`Omega -> infinity` on the axis.  The softened form's hoop term falls as `R^2`,
+giving the finite limit `Omega -> sqrt(1 + 2C^2/eps^2)` (verified: 1.00001 at
+`-d 1e6`, 4.037 at `-d 1`).  It costs only the core: `B_phi/C` is 0.9988 at
+R=1 and 0.9997 at R=2 for `-e 0.05`.  NOTE that at low plasma beta the disk's
+core is then strongly magnetically supported and rotates several times
+super-Keplerian; raise `-e` if that core is the object of study.
+
+`-c 5` is the same constant field with that central softening REMOVED, on
+either domain.  On an annulus it is identical to `-c 4` (the softening only
+ever acted at the axis, which an annulus excludes), so the two differ only on
+a full disk, where `-c 5` is the singular case: `v_phi -> C` and hence
+`Omega -> infinity` as `R -> 0`.  It exists to run that experiment
+deliberately.  Two things to know before using it: at the default `-d 1e6` the
+pathology is invisible (the innermost particle at nx=64 sits at `R ~ 0.031`,
+where `Omega = 1.00001`), so use `-d 100` or `-d 1` to see anything; and the
+sharpest quantitative contrast against `-c 4` is in the divergence
+diagnostics, since `phi_hat` reverses across the axis inside one kernel --
+the run log records `divBAvg/divBMax/divBerrAvg/divBerrMax` every step.
+
+Toroidal field mode `-c 1` is deliberately `B_phi=C/R` in an annulus, not a
+spatial constant.  It is current-free and has zero net radial Lorentz force.
+Solid-body rotation means constant angular velocity and therefore no winding;
+it does not require constant `B_phi`.  A constant toroidal field has inward
+hoop stress and would need a different force balance.  In a full disk, mode 1
+uses the center-regular `C R/(R^2+epsilon^2)` profile.
+
+-h is the barotrope scale height, i.e. the TEMPERATURE, and the only control
+on the orbital Mach number (Mach(R=1) ~ 1/(1.261 H); H=0.15 -> 5.3,
+H=0.05 -> 15.9, H=0.02 -> 39.7).  For -b 2 it is decoupled from the slab
+thickness -- the cylindrical density target is exactly H-independent -- so the
+cold, nearly pressureless regime of the classic Keplerian-ring test
+(Hopkins 2015; see codes/opengadget3/.../tests/KeplerDisk) is reachable at any
+resolution.  For -b 3 it also sets the vertical thickness and so must stay
+resolved.  A hot disk expands into any vacuum at c_s, which is what makes the
+-g 0 inner hole violent and what the literature avoids by being cold.
+
+-e (potential softening) DEFAULTS TO 0.05, matching coldkeplerian's central
+sink softening so both Keplerian tests share one central regularization.  It
+enters only through v_c = R (R^2+eps^2)^((beta-1)/2), self-consistently in both
+the IC and the analyzer, so it defines the rotation law rather than adding an
+error: it changes v_c by -0.19% at R=1, -0.74% at the ring's inner edge R=0.5,
+and exactly 0% for beta=1, while bounding max|a| at 154 instead of letting it
+diverge at the axis.  NOTE for -g 1 (full disk), where the softened core is the
+object of study rather than empty vacuum: 0.05 is BELOW the smoothing length at
+nx=64 (h=0.085), so that arm wants an explicit larger -e (0.1-0.2 at nx=64) or
+nx >= 128.
+
+A tilt (-f) is meaningful only for -b 3.  Examples with free edges and with the matched hot-disk wall are:
+
+  ./runtest.sh -a 1 -b 3 -c 1 powerlawring 83 64 2 0
+  ./runtest.sh -a 1 -b 2 -c 1 powerlawring 83 64 2 0
+  ./runtest.sh -a 1 -b 2 -g 1 -e 0.1 -h 0.1 -i 1 powerlawring 84 64 2 0
+  ./runtest.sh -a 1 -b 2 -g 0 -e 0.05 -h 0.1 -i 1 powerlawring 84 64 2 0
 
 Analysis
 --------
@@ -78,11 +412,11 @@ against that test's analytic / reference solution. The scripts share one CLI, so
 every test is analysed the same way.
 
 You declare the run the SAME way you launched it: the analysis takes the same
--a..-h parameters, with the same defaults, as that test's setup in runtest.sh
+-a..-k parameters, with the same defaults, as that test's setup in runtest.sh
 (no sidecar file -- the physics is derived from the parameters you pass).
 
 Basic usage (point it at the run directory produced by runtest.sh):
-  python setupfiles/IC_analysis_<name>.py <run-dir> [-a .. -h ..] [--save out]
+  python setupfiles/IC_analysis_<name>.py <run-dir> [-a .. -k ..] [--save out]
 
   --save out            write figures to out_*.png instead of showing them
   --times t [t ..]      comparison time(s) (one profile panel each; default is
@@ -163,8 +497,8 @@ regressions without flagging run-to-run noise; tighten it for higher-resolution
 or deterministic tests.
 
 A complete worked example for the ChaNGa fork (self-contained GitHub Actions
-workflow, the curated matrix, and a local build+bless helper) lives under ci/ --
-see ci/CHANGA_CICD_PLAN.md. Note: the GitHub workflow itself must live in the
+workflow, the curated matrix, and a local build+bless helper) lives under ci/.
+Note: the GitHub workflow itself must live in the
 code's OWN repo (.github/workflows/), since Actions only runs workflows from the
 repo under test; this testsuite supplies the tests, analysis, and committed
 references that the workflow pulls in.

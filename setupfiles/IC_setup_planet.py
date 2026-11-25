@@ -168,7 +168,10 @@ class setup_planet(object):
             
          self.npart=len(self.x)
          self.ngas=self.npart
-         if distri==1:
+         # Pre-glass only: integrate the total mass and export the relaxer's
+         # density table.  A placed IC (lattice/rand/glass) takes the exact
+         # analytic mass below instead.
+         if self.preglass:
              totmass = denstable.compute_total_mass(self,512)
              print("Numerically integrated mass(512**3) " , totmass)
              # Generate 1D radial density table

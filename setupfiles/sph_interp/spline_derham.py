@@ -1,9 +1,8 @@
 """Tensor-product B-spline De Rham complex on a uniform grid (periodic).
 
 The structure-preserving ("compatible") readout for the magnetic
-vector-potential mode (FIELD_RECONSTRUCTION_PLAN.md, "THB-spline De Rham
-complex readout").  This module is the FOUNDATION rung (T-b on a uniform
-periodic grid); the open-boundary and hierarchical-THB rungs build on it.
+vector-potential mode on a uniform periodic grid; the open-boundary and
+hierarchical-THB readouts build on it.
 
 The idea in one line: differentiating a degree-p B-spline yields degree-(p-1)
 B-splines, so a chain of spline spaces closes EXACTLY under grad/curl/div::

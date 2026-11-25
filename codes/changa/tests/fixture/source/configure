@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ -n "${CHARM_DIR:-}" ]
+[ -x "${CHARMC:-}" ]
+[ -d "${STRUCT_DIR:-}" ]
+[ "$*" = "${CHANGA_EFFECTIVE_CONFIGURE_FLAGS:-}" ]

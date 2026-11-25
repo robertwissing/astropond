@@ -41,8 +41,11 @@ from IC_analysis_framework import (
 
 # -a..-d match runtest.sh setup_taylorgreen() flag-for-flag with the same defaults.
 PARAM_SPEC = [
-    Param("a", "etavisc", 0.1,  float, "physical shear viscosity eta (-PhysViscEta); nu = eta/rho"),
-    Param("b", "xivisc",  0.0,  float, "physical bulk viscosity xi (no effect on the div-free TG flow)"),
+    Param("a", "etavisc", 0.1, float,
+          "physical shear viscosity eta (-PhysViscEta); nu = eta/rho", "eta"),
+    Param("b", "xivisc", 0.0, float,
+          "physical bulk viscosity xi (no effect on the div-free TG flow)",
+          "xi"),
 ]
 
 # Both metrics are normalized by their own t=0 value -> the analytic decay starts

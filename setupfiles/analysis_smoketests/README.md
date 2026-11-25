@@ -42,15 +42,24 @@ failure -- so a CI job is just that one line). Pass a test id to run a subset:
   by `IC_analysis_general` (loaddata / read_vector_aux / read_log_series /
   read_log_param). Gas columns: `0 mass | 1-3 xyz | 4-6 v | 7 rho | 8 temp |
   9 h | 10 metals | 11 phi`.
+  A snapshot may also carry STAR particles (`star_table` / the `stars` key of a
+  snap dict; 11 columns `0 mass | 1-3 xyz | 4-6 v | 7 metals | 8 tform | 9 eps |
+  10 phi`), the log extra verbatim header lines (`log_extra_lines`, for sections
+  this template does not model: `# Preprocessor macros:`, `# STAR FORMATION:`),
+  and the run a `<runname>.starlog` (`starlog=`, an `IC_starlog.record_dtype()`
+  array — `write_starlog` forces it back to big-endian, since numpy quietly
+  normalises a structured dtype to native order across `concatenate`).
 - `test_analyses.py` — `AnalysisSmokeBase` does the 4-step bless/gate dance; one
   subclass per covered test sets `test = "<name>"` and `build_run(parent,
   diverge=False)` (the `diverge` data perturbation is what must trip the gate).
 
-## Currently covered (ALL 25 analyses)
+## Currently covered (ALL 26 analyses)
 
 - **run_cli metric-vs-time** (framework `--reference`/reg-tol gate): **kh**, **rt**,
   **mti**, **square**, **taylorgreen**, **blob** (cloud-survival mass fractions,
-  normalised to t=0).
+  normalised to t=0), **starform** (gas depletion vs the closed recursion; the
+  only test with star particles and a `.starlog`, plus unit tests of the
+  recursion and of the starlog round trip).
 - **standalone energy/divergence series** from the dense `.log`: **mhdloop**
   (Emag), **orzag** (Emag), **mhdrotor** (Emag+Ekin), **mhddivtest** (divBerr),
   **currentsheet** (Emag/Ekin/Eth + divBerr), **gresho** (Ekin),

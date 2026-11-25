@@ -1,5 +1,4 @@
-"""Thermal- and cosmic-ray-electron fields for the POLARIS export (M3 of
-POLARIS_EXPORT_PLAN.md §4).
+"""Thermal- and cosmic-ray-electron fields for the POLARIS export.
 
 Ideal-MHD gasoline has no electrons and no cosmic rays, but `CMD_SYNCHROTRON`
 cannot run without them, and POLARIS has NO command-file defaults for these
@@ -265,7 +264,7 @@ def n_cr_from_energy_density(u_cr_si, p=CR_P, gamma_min=GAMMA_MIN,
 
     The general converter for any model specified as an energy density (e.g. a
     plain zeta * B^2/2mu0 equipartition), since POLARIS wants a total number
-    density (§1.6 of the plan):
+    density:
 
         n_cr = (u_cr / m_e c^2) * (p-2)/(p-1)
                * (g_min^(1-p) - g_max^(1-p)) / (g_min^(2-p) - g_max^(2-p))

@@ -1,7 +1,6 @@
 """Vector-potential (A) capture on a uniform grid, with B = curl(interp(A)).
 
-The magnetic-projection `vector-potential` mode (FIELD_RECONSTRUCTION_PLAN.md,
-"Magnetic-projection CLI surface", 2026-07-22).  The guarantee: reading B as the
+The magnetic-projection `vector-potential` mode.  The guarantee: reading B as the
 analytic curl of a differentiable A interpolant makes ``div B == 0`` POINTWISE at
 arbitrary query positions -- a property no face/RT0 representation retains off
 its lattice.

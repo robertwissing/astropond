@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+GASOLINE_EXTRA_BUILD_FLAGS=(EXTRA_VALUE=7)

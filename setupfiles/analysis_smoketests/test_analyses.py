@@ -24,6 +24,23 @@ Run:  python -m unittest tests.test_analyses        (from the testsuite root)
 import glob
 import os
 import subprocess
+
+# --------------------------------------------------------------------------- #
+#  Never deliver this suite's figures to Telegram.
+#
+#  IC_analysis_general.finish_figure_with_legend sends every figure it saves
+#  (tg.send_photo), and this module drives the real analysis CLI with --save
+#  three times for each of ~27 analyses, so an unguarded run floods the chat
+#  with a hundred-odd images captioned with bare filenames.
+#
+#  The pop lives HERE, at module scope, rather than in the package __init__:
+#  `python -m unittest discover -s setupfiles/analysis_smoketests` (run.sh, the
+#  CI entry point) imports test modules as TOP-LEVEL modules and never runs
+#  __init__.py, so a guard there fires under pytest only.  This runs under every
+#  runner, before run_analysis copies os.environ into the subprocess env, and
+#  telegram_notify.make_notifier then returns a no-op stub.
+# --------------------------------------------------------------------------- #
+os.environ.pop("TELEGRAM_BOT_TOKEN", None)
 import sys
 import tempfile
 import unittest
@@ -189,6 +206,33 @@ class AnalysisSmokeBase(unittest.TestCase):
 class TestKH(AnalysisSmokeBase):
     test = "kh"
 
+    def test_magnetic_growth_prediction(self):
+        from IC_analysis_kh import HYDRO_GROWTH_RATE, growth_prediction
+
+        hydro, bcrit, _label = growth_prediction(
+            {"rhodiff": 2.0, "B0": 0.0, "Bdir": 1})
+        weak, _bc, _label = growth_prediction(
+            {"rhodiff": 2.0, "B0": 0.25, "Bdir": 1})
+        stable, _bc, _label = growth_prediction(
+            {"rhodiff": 2.0, "B0": 1.0, "Bdir": 1})
+        transverse, _bc, _label = growth_prediction(
+            {"rhodiff": 2.0, "B0": 0.25, "Bdir": 3})
+        self.assertAlmostEqual(hydro, HYDRO_GROWTH_RATE)
+        self.assertAlmostEqual(bcrit, 1.0 / np.sqrt(3.0))
+        self.assertGreater(weak, 0.0)
+        self.assertLess(weak, hydro)
+        self.assertEqual(stable, 0.0)
+        self.assertAlmostEqual(transverse, hydro)
+
+    def test_render_specs_use_one_average_extent(self):
+        from IC_analysis_kh import KH_RENDER_EXTENT, render_specs
+
+        specs = render_specs({"B0": 0.25})
+        self.assertTrue(specs)
+        self.assertTrue(all(spec.project == "average" for spec in specs))
+        self.assertTrue(all(tuple(spec.extent) == KH_RENDER_EXTENT
+                            for spec in specs))
+
     def build_run(self, parent, diverge=False):
         rng = np.random.default_rng(0)
         n = 1024
@@ -290,6 +334,45 @@ class TestSedov(AnalysisSmokeBase):
 class TestAlfven(AnalysisSmokeBase):
     test = "alfven"
 
+    def test_particle_profile_has_no_binned_run_lines(self):
+        import matplotlib.pyplot as plt
+        import IC_analysis_alfven as analysis
+
+        run = self.build_run(self._tmp)
+        captured = []
+        original_finish = analysis.finish_figure_with_legend
+        analysis.finish_figure_with_legend = (
+            lambda fig, _axes, save=None: captured.append(fig))
+        try:
+            analysis.plot_profiles([run], ["run"], rotate=1, t=5.0)
+        finally:
+            analysis.finish_figure_with_legend = original_finish
+        self.assertEqual(len(captured), 1)
+        # With no blessed reference, the only line on each particle panel is
+        # the physically required analytic wave; the run itself is scatter-only.
+        self.assertEqual([len(ax.lines) for ax in captured[0].axes], [1, 1])
+        plt.close(captured[0])
+
+    def test_mode_diagnostics(self):
+        from IC_analysis_alfven import AMPL, WK, VWAVE, mode_diagnostics
+
+        rng = np.random.default_rng(17)
+        xdot0 = -1.5
+        x_par = rng.uniform(-1.5, 1.5, 600)
+        volume = rng.uniform(0.2, 2.0, x_par.size)
+        time = 0.37
+        amplitude_ratio = 0.73
+        phase_error = -0.41
+        expected = -1j * AMPL * np.exp(-1j * WK * VWAVE * time)
+        measured = amplitude_ratio * expected * np.exp(1j * phase_error)
+        theta = WK * (x_par - xdot0)
+        values = 0.017 + np.real(measured * np.exp(1j * theta))
+
+        got_amplitude, got_phase = mode_diagnostics(
+            x_par, values, volume, time, xdot0)
+        self.assertAlmostEqual(got_amplitude, amplitude_ratio, places=12)
+        self.assertAlmostEqual(got_phase, phase_error, places=12)
+
     def build_run(self, parent, diverge=False, runname=None):
         from IC_analysis_alfven import geometry
         runit, e_perp, _xdot0 = geometry(1)        # rotated geometry (default -a 1)
@@ -320,6 +403,8 @@ class TestAlfven(AnalysisSmokeBase):
 
     def test_convergence(self):
         self.check_convergence("alfven%d_N64latticerot1GASOLINE")
+        self.assertTrue(glob.glob(os.path.join(
+            self._tmp, "cv_amplitude_phase_convergence.png")))
 
 class TestOrzag(AnalysisSmokeBase):
     test = "orzag"
@@ -337,9 +422,29 @@ class TestOrzag(AnalysisSmokeBase):
     def expected_plots(self, save_prefix):
         return save_prefix + "_emag.png"
 
+    def test_horizontal_cut_particles_and_lines_are_separate(self):
+        run = self.build_run(self._tmp)
+        save = os.path.join(self._tmp, "cut")
+        r = run_analysis(
+            self.test, run, "--render", "--render-times", "0.5",
+            "--render-backend", "hist", "--render-res", "24", "--save", save)
+        self.assertEqual(r.returncode, 0,
+                         msg="split cut render failed:\n%s\n%s"
+                             % (r.stdout, r.stderr))
+        self.assertTrue(os.path.exists(save + "_cut.png"))
+        self.assertTrue(os.path.exists(save + "_cut_binned.png"))
+
 
 class TestMHDRotor(AnalysisSmokeBase):
     test = "mhdrotor"
+
+    def test_render_set_omits_redundant_component_maps(self):
+        from IC_analysis_mhdrotor import render_specs
+        from IC_analysis_render import spec_slug
+
+        self.assertEqual([spec_slug(spec) for spec in
+                          render_specs({"rhodisk": 10.0})],
+                         ["rho", "Pmag", "divBerr"])
 
     def build_run(self, parent, diverge=False):
         snaps = mhd_snaps((0.0, 0.15, 0.3))
@@ -493,6 +598,16 @@ class TestShocktube(AnalysisSmokeBase):
 
     def expected_plots(self, save_prefix):
         return save_prefix + "_profile.png"
+
+    def test_particle_and_line_profiles_are_separate(self):
+        run = self.build_run(self._tmp)
+        save = os.path.join(self._tmp, "split")
+        r = run_analysis(self.test, run, "--save", save)
+        self.assertEqual(r.returncode, 0,
+                         msg="split profile run failed:\n%s\n%s"
+                             % (r.stdout, r.stderr))
+        self.assertTrue(os.path.exists(save + "_profile.png"))
+        self.assertTrue(os.path.exists(save + "_profile_lines.png"))
 
 
 class TestEvrard(AnalysisSmokeBase):
@@ -679,6 +794,203 @@ class TestRT(AnalysisSmokeBase):
             snaps.append({"time": t, "gas": g})
         return sd.make_run(parent, "rt64_N64latticeGASOLINE", snaps,
                            start=0, step=10)
+
+
+class TestStarform(AnalysisSmokeBase):
+    """starform -- the only analysis that reads STAR particles and a `.starlog`.
+
+    The synthetic run follows the analytic depletion recursion exactly (gas
+    count = round(f_k N_0), gas density = rho_0 f_k, one star per spent gas
+    particle), so `zfgas` sits at ~0 and the blessed series is the recursion
+    itself.  `diverge` converts EXTRA particles in the later snapshots only:
+    `fgas` is a self-normalising ratio N_gas/(N_gas+N_star), so a uniform
+    rescale would leave it untouched -- the shape has to change.
+    """
+
+    test = "starform"
+    # -a..-k, exactly as runtest.sh setup_starform would have launched it.
+    RUNNAME = "starform16_N64glasscase1GASOLINE"
+    CSTAR, DT, RHO0, BZ = 0.05, 0.0567029, 1.0, 1.0e-3
+
+    def test_depletion_recursion_matches_a_step_by_step_product(self):
+        """The closed recursion is the product of its own per-step (1-p_k)."""
+        from IC_analysis_starform import depletion_series
+        from IC_setup_starform import formation_probability
+
+        f, sig = depletion_series(4096, 12, self.CSTAR, self.DT, self.RHO0)
+        self.assertEqual(f[0], 1.0)
+        self.assertEqual(sig[0], 0.0)
+        expect = 1.0
+        for k in range(12):
+            p = float(formation_probability(self.CSTAR, self.DT,
+                                            self.RHO0 * expect))
+            expect *= (1.0 - p)
+            self.assertAlmostEqual(f[k + 1], expect, places=12)
+        # Depletion slows as rho falls, so the curve stays above a fixed-p one.
+        p0 = float(formation_probability(self.CSTAR, self.DT, self.RHO0))
+        self.assertGreater(f[-1], (1.0 - p0) ** 12)
+        self.assertTrue(np.all(np.diff(sig) >= 0.0))      # spread accumulates
+
+    def test_winding_field_is_exact(self):
+        """field = 2 must be divergence-free, periodic, |B| = B0 and force-free.
+
+        Every one of those is what makes the handoff prediction closed-form, so
+        each is asserted rather than assumed.
+        """
+        from IC_setup_starform import winding_b, BOXLEN
+
+        turns = 5
+        k = 2.0 * np.pi * turns / BOXLEN
+        x = np.linspace(-0.5, 0.5, 4001)
+        Bx, By, Bz = winding_b(x, 2.0, turns)
+        self.assertEqual(float(np.abs(Bx).max()), 0.0)          # div B = 0
+        self.assertLess(float(np.abs(np.sqrt(Bx**2 + By**2 + Bz**2) - 2.0).max()),
+                        1e-14)                                  # |B| = B0
+        e = (np.array(winding_b(np.array([-0.5]), 2.0, turns))
+             - np.array(winding_b(np.array([0.5]), 2.0, turns)))
+        self.assertLess(float(np.abs(e).max()), 1e-13)          # periodic
+        # curl B = -k B, so the Lorentz force vanishes identically
+        B = np.array([Bx, By, Bz])
+        # curl of B0 (0, cos kx, sin kx) is -k B0 (0, cos kx, sin kx): carry B0.
+        curl = np.array([np.zeros_like(x), -k * 2.0 * np.cos(k * x),
+                         -k * 2.0 * np.sin(k * x)])
+        self.assertLess(float(np.abs(curl + k * B).max()), 1e-12)
+        self.assertLess(float(np.abs(np.cross(curl.T, B.T)).max()), 1e-12)
+
+    def test_winding_pitch_locks_every_donor_to_one_phase(self):
+        """turns = n puts all donor planes at the same phase, whatever n."""
+        from IC_setup_starform import winding_b, winding_turns
+
+        for n in (3, 4, 5, 6):
+            turns = winding_turns(n ** 3, 0, 2)
+            self.assertEqual(turns, n)
+            nodes = (np.arange(n) + 0.5) / n - 0.5
+            B = np.array(winding_b(nodes, 1.0, turns))
+            self.assertLess(float(np.abs(B - B[:, :1]).max()), 1e-12)
+
+    def test_kernel_ft_is_one_at_zero_and_falls(self):
+        """What(k) -> 1 as k -> 0, and decreases as the winding tightens."""
+        from IC_setup_starform import kernel_ft, smoothing_length
+
+        h = smoothing_length(32 ** 3, 64)
+        self.assertAlmostEqual(kernel_ft(0.0, h, 64), 1.0, places=9)
+        vals = [kernel_ft(2.0 * np.pi * t / 1.0, h, 64) for t in (1, 3, 5, 8)]
+        self.assertTrue(all(a > b for a, b in zip(vals, vals[1:])))
+        self.assertTrue(all(0.0 < v <= 1.0 for v in vals))
+
+    def test_handoff_ratios_are_exact_only_at_n_half(self):
+        """flux (1+x)^(1/2-n), energy (1+x)^(1-2n): both 1 iff n = 1/2."""
+        from IC_setup_starform import handoff_ratios
+
+        x = 0.016
+        fr, er = handoff_ratios(0.5, x)
+        self.assertAlmostEqual(float(fr), 1.0, places=15)
+        self.assertAlmostEqual(float(er), 1.0, places=15)
+        f0, e0 = handoff_ratios(0.0, x)
+        f1, e1 = handoff_ratios(1.0, x)
+        self.assertGreater(float(f0), 1.0)                 # n = 0 over-delivers
+        self.assertLess(float(f1), 1.0)                    # n = 1 under-delivers
+        self.assertAlmostEqual(float(f0 * f1), 1.0, places=15)   # reciprocal
+        self.assertAlmostEqual(float(e0 * e1), 1.0, places=15)
+
+    def test_blend_conserves_flux_and_charges_mixing_to_heat(self):
+        """sfBFieldBlend: sum V B exact, dE_mag + Q_mix = 0 exact.
+
+        The property the whole case-10 measurement rests on, asserted against a
+        direct transcription of smoothfcn.c:7492-7512 rather than an expansion.
+        """
+        rng = np.random.default_rng(11)
+        nq = 10
+        Vd = 0.31
+        Bd = np.array([0.4, -0.9, 0.6])
+        Vq = 0.2 + 0.4 * rng.random(nq)
+        Bq = rng.normal(size=(nq, 3))
+        w = rng.random(nq)
+        w /= w.sum()
+        dV = w * Vd
+
+        Vnew = Vq + dV
+        Bnew = (Vq[:, None] * Bq + dV[:, None] * Bd) / Vnew[:, None]
+        Q = 0.5 * Vq * (dV / Vnew) * np.sum((Bq - Bd) ** 2, axis=1)
+
+        flux0 = (Vq[:, None] * Bq).sum(0) + Vd * Bd
+        self.assertLess(float(np.abs((Vnew[:, None] * Bnew).sum(0) - flux0).max()),
+                        1e-14)
+        e0 = 0.5 * np.sum(Bq ** 2, axis=1) @ Vq + 0.5 * (Bd @ Bd) * Vd
+        e1 = 0.5 * np.sum(Bnew ** 2, axis=1) @ Vnew
+        self.assertLess(abs(float(e1 + Q.sum() - e0)), 1e-14)
+        self.assertGreater(float(Q.sum()), 0.0)
+        # a UNIFORM field is the degenerate case: no mixing, no heat at all
+        Qu = 0.5 * Vq * (dV / Vnew) * np.sum((Bd - Bd) ** 2)
+        self.assertEqual(float(np.sum(Qu)), 0.0)
+
+    def test_starlog_round_trip(self):
+        """The reader recovers what synthdata wrote, big-endian and sorted."""
+        import IC_starlog as slog
+
+        ev = np.zeros(3, dtype=slog.record_dtype())
+        ev["iOrdGas"] = [5, 1, 9]
+        ev["timeForm"] = [0.2, 0.1, 0.2]
+        ev["rhoForm"] = [1.0, 0.9, 0.8]
+        path = os.path.join(self._tmp, "x.starlog")
+        sd.write_starlog(path, ev)
+        got = slog.read_starlog(path)
+        self.assertEqual(list(got["iOrdGas"]), [1, 5, 9])       # sorted by time
+        self.assertAlmostEqual(float(got["rhoForm"][0]), 0.9)
+        self.assertEqual(len(slog.events_in_step(got, 0.15, 0.25)), 2)
+
+    def build_run(self, parent, diverge=False):
+        import IC_starlog as slog
+        from IC_analysis_starform import depletion_series
+
+        pos, _r = lattice3d(8)
+        n0 = len(pos)
+        nsnap = 6
+        f, _sig = depletion_series(n0, nsnap - 1, self.CSTAR, self.DT, self.RHO0)
+        mpart = self.RHO0 / n0
+        rec = slog.record_dtype()
+        snaps, events, prev = [], [], n0
+        for k in range(nsnap):
+            ngas = int(round(f[k] * n0))
+            if diverge and k:
+                ngas = max(1, ngas - 2 * k)          # shape change, not a scale
+            nstar = n0 - ngas
+            g = sd.gas_table(ngas)
+            g[:, 0] = mpart
+            g[:, 1:4] = pos[:ngas]
+            g[:, 7] = self.RHO0 * ngas / n0          # the gas-only smooth
+            g[:, 8] = 0.0237                         # u/dTuFac, dTuFac = 1
+            st = sd.star_table(nstar, mass=mpart)
+            if nstar:
+                st[:, 1:4] = pos[ngas:]
+            B = np.zeros((ngas + nstar, 3))
+            B[:ngas, 2] = self.BZ                    # stars carry no field
+            snaps.append({"time": k * self.DT, "gas": g, "stars": st,
+                          "aux": {"BField": B}})
+            for j in range(prev - ngas):
+                e = np.zeros(1, dtype=rec)
+                e["iOrdStar"], e["iOrdGas"] = -1, ngas + j
+                e["timeForm"] = k * self.DT
+                e["rFormx"], e["rFormy"], e["rFormz"] = pos[ngas + j]
+                e["massForm"] = mpart
+                e["rhoForm"] = self.RHO0 * prev / n0
+                e["TForm"] = 10.0
+                events.append(e)
+            prev = ngas
+        ev = (np.concatenate(events).astype(rec) if events
+              else np.zeros(0, dtype=rec))
+        extra = [
+            "# Preprocessor macros: GASOLINE MHD STARFORM SFBFIELD DIVVOFF "
+            "NOCOOLING DTADJUST",
+            "# TIMESTEPPING:  dDelta: %g dEta: 0.175" % self.DT,
+            "# STAR FORMATION:  bStarForm: 1 dCStar: %g dStarEff: 1 "
+            "dPhysDenMin: 0.024656 dTempMax: 10000 dDeltaStarForm (set): "
+            "40098.6, effectively: %g = 26732 yrs iStarFormRung: 0"
+            % (self.CSTAR, self.DT),
+        ]
+        return sd.make_run(parent, self.RUNNAME, snaps, start=0, step=10,
+                           log_params={"dTuFac": 1.0}, log_extra_lines=extra,
+                           starlog=ev)
 
 
 # --------------------------------------------------------------------------- #
@@ -925,3 +1237,32 @@ class TestCosmowave(AnalysisSmokeBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTelegramIsDisabledForTheSuite(unittest.TestCase):
+    """The suite must never deliver figures to Telegram.
+
+    `IC_analysis_general.finish_figure_with_legend` sends every figure it saves,
+    and this suite drives the analysis CLI with `--save` three times for each of
+    ~27 analyses, so an unguarded run floods the chat with a hundred-odd images.
+    `analysis_smoketests/__init__.py` drops the token on import; these assert it
+    reached both this process and the analysis subprocesses.
+    """
+
+    def test_the_token_is_absent_from_this_process(self):
+        self.assertIsNone(os.environ.get("TELEGRAM_BOT_TOKEN"))
+
+    def test_the_notifier_the_analyses_build_is_a_no_op(self):
+        from telegram_notify import make_notifier
+        self.assertEqual(type(make_notifier()).__name__, "_NullNotifier")
+
+    def test_the_token_does_not_leak_into_the_analysis_subprocess(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = SETUP + os.pathsep + env.get("PYTHONPATH", "")
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import os, sys; from telegram_notify import make_notifier; "
+             "sys.stdout.write(type(make_notifier()).__name__)"],
+            cwd=REPO, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "_NullNotifier")

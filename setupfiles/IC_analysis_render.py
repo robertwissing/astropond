@@ -97,8 +97,7 @@ ContourSpec.__new__.__defaults__ = ("contour", 8, "w", False, 0.8, 0.9)
 #  Canonical render style: one {quantity -> (cmap, log, symmetric, slug)} map so
 #  the SAME physical quantity is drawn with the same colormap/scale (and gets a
 #  stable, collision-free filename token) across every test -- figures become
-#  directly comparable, and the per-script label->slug string-matching (which had
-#  documented "|B|" collisions) is retired. A test builds a spec with
+#  directly comparable. A test builds a spec with
 #  `styled(key, axis1, axis2, quantity, ...)`; per-call cmap/log/symmetric/slug
 #  overrides are still allowed for a deliberately different rendering.
 RenderStyle = namedtuple("RenderStyle", ["cmap", "log", "symmetric", "slug"])
@@ -171,7 +170,7 @@ StreamSpec.__new__.__defaults__ = ("flow", "viridis", 1.4, None)
 # arbitrary aux output -- not just the magnetic field. The aux is truncated to
 # the gas particles (ngas) so it aligns row-for-row with tgdata. A missing aux
 # yields zeros (a run with no magnetic field renders a uniform zero panel rather
-# than NaN dots / a blank); pass missing=np.nan for the old blank behavior.
+# than NaN dots / a blank); pass missing=np.nan for a blank panel.
 
 def aux_scalar(label, missing=0.0):
     """quantity callable for a per-particle SCALAR aux field, e.g. 'DivB', 'HeI'."""
@@ -526,6 +525,9 @@ def _grid_image(fn, tgdata, ngas, spec, q, x0, x1, y0, y1, res,
               "using SPH for this slice.", file=sys.stderr)
         method = "sph"
 
+    # Interpolate the supplied particle field, including density. Its values
+    # may come from a corrected volume partition (e.g. CORRPARTITION), so a
+    # density slice must not replace them with a new mass-kernel sum.
     p = Particles(pos=pos, mass=mass, rho=rho, h=h, values={"q": qg},
                   box=box, periodic=periodic)
     target = Projection2D(axis1=spec.axis1 - 1, axis2=spec.axis2 - 1,
@@ -1263,8 +1265,7 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
                    else f"{save}_residual.png")
             fig.savefig(out, bbox_inches="tight")
             print(f"saved render -> {out}")
-            tg.send_message("Trololol")
-            tg.send_photo(out, "{out}")
+            tg.send_photo(out, os.path.basename(out))
         else:
             plt.show()
         return
@@ -1328,8 +1329,7 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
                 out = f"{save}_render_t{tv:g}.png"
                 fig.savefig(out, bbox_inches="tight")
                 print(f"saved render -> {out}")
-                tg.send_message("Trololol")
-                tg.send_photo(out, "{out}")
+                tg.send_photo(out, os.path.basename(out))
             else:
                 plt.show()
         return
@@ -1382,8 +1382,7 @@ def render_panels(entries, spec, times=None, n=4, res=512, save=None,
     if save:
         out = f"{save}_render.png"
         fig.savefig(out, bbox_inches="tight")
-        tg.send_message("Trololol")
-        tg.send_photo(out, "{out}")
+        tg.send_photo(out, os.path.basename(out))
         print(f"saved render -> {out}")
     else:
         plt.show()
@@ -1736,4 +1735,3 @@ def render_movie(input_arg, label, spec, save=None, res=512, backend="grid",
 # --------------------------------------------------------------------------- #
 #  Top-level CLI
 # --------------------------------------------------------------------------- #
-

@@ -90,7 +90,14 @@ class setup_blob(object):
          self.dICdensinner = rhodiff
          self.setphysunits()
          przero=self.przero
-         Bzero = 0.0
+         # Magnetic field from the ambient plasma beta (beta<=0 -> hydro):
+         # B0 = sqrt(2 p / beta), uniform and transverse (y) to the z-directed
+         # wind -- the classic cloud-crushing field geometry.
+         if beta > 0.0:
+             Bzero = np.sqrt(2.0*przero/beta)
+         else:
+             Bzero = 0.0
+         print('beta = ', beta, ' B0 = ', Bzero)
          machno = mach
          csound = np.sqrt(self.gamma*przero/self.rhoout)
          vzero = machno*csound
@@ -190,7 +197,9 @@ class setup_blob(object):
              self.By.append(Bzero)
              self.Bz.append(0.)
              self.metals.append(1E-6)
-             if distri != 1:
+             if not self.preglass:
+                # the pre-glass seed keeps the frame glassgen relaxes in; the
+                # recentring is applied when the final IC is built from it
                 self.z[i]=self.z[i]-(zmax+zmin)/2
          print("wrapping")
          self.wrapbound()

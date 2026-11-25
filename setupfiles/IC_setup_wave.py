@@ -20,6 +20,25 @@ Created on Thu Mar  8 21:30:46 2018
 ##   3 = Alfven            (MHD,         speed c_A  = 1)
 ## MHD background (Stone et al. 2008): rho=1, P=1/gamma, B=(1, sqrt(2), 1/2),
 ## gamma=5/3 -> a=1, c_A=1, c_s=1/2, c_f=2.
+##
+## AMPLITUDE vs DISTRIBUTION.  The default ampl=3e-2 is a GLASS number: a
+## relaxed uniform glass has a particle-disorder floor that shows up in the
+## eigenmode projection at ~4.5e-3 after one period, whatever the amplitude, so
+## the old 1e-4 default put the wave ~50x BELOW its own noise (measured nx=32,
+## nSmooth=64: signal/noise 0.02 for all four modes).  S/N crosses 1 at
+## ampl ~ 5e-3; above that:
+##   ampl   1e-2    3e-2     1e-1
+##   S/N     ~2      ~5-7    ~15-21      (all four modes, after one period)
+##   A2/A1  0.02-0.035  0.05-0.07  0.13-0.21   (2nd harmonic = steepening)
+## The compressive modes leave the linear regime as the sinusoid steepens: the
+## measured A2/A1 tracks t/(2 t_shock) with t_shock = 2/((gamma+1) k dv) to
+## ~20%, so one period is shock-free only for ampl < ~0.2.  3e-2 is the sweet
+## spot -- S/N 5-7 with under 7% harmonic content, and it minimises L1/ampl for
+## the sound mode.  The Alfven mode is an exact nonlinear solution (A2/A1 ~ 1e-4
+## even at 0.1), so for it just push the amplitude up.
+## On a lattice (distrib 0) the floor is 4e-5 instead, so a lattice convergence
+## study can drop back to 1e-4 for a cleaner order measurement -- but see
+## LATTICE_INSTABILITY.md: never run it at nSmooth 57-80.
 import numpy as np
 import IC_distribute as distribute
 import IC_fixdens as fixdens
@@ -115,10 +134,11 @@ class setup_wave(object):
     rhozero=1.
     drho=0.
     _rho_z_grid=None
+    glass_density_table=None
 
     def __init__(self):
         pass
-    def create(self,nx,distri=0,vm=0,entry='datafiles/alfvenwave128_preglass.00000',wavetype=0,ampl=1e-4):
+    def create(self,nx,distri=0,vm=0,entry='datafiles/alfvenwave128_preglass.00000',wavetype=0,ampl=3e-2):
     #--setup parameters
     # wavetype : 0=sound 1=fast 2=slow 3=Alfven ; ampl : eigenmode amplitude
         self.rhozero = 1.
@@ -159,8 +179,12 @@ class setup_wave(object):
         self.wk = 2.*np.pi/wavelength
         self.x0 = (-dx,-dy,-dz)
         self.xdot0 = -dx
-        # density-perturbation amplitude (0 for the incompressible Alfven mode)
-        self.drho = ampl*Rrho
+        # Density-perturbation amplitude.  The Alfven mode is exactly
+        # incompressible, but np.linalg.eig returns its rho component as
+        # roundoff (~1e-17) rather than 0, so snap it: the same 1e-12 the
+        # eigenvector sign fix uses.  Otherwise a mode with no density
+        # structure still triggers the stretch map and the glass table below.
+        self.drho = ampl*Rrho if abs(Rrho) > 1.e-12 else 0.
 
         if distri==0:
             distribute.setcloseddist(self,-dx,dx,-dy,dy,-dz,dz,deltax,periodic=True)
@@ -172,11 +196,25 @@ class setup_wave(object):
             self.y=tgdata[:,2]
             self.z=tgdata[:,3]
             self.rho=tgdata[:,7]
-        # realise the (longitudinal) density wave by displacing particles
-        if self.drho != 0 and distri!=2:
+        # A longitudinal mode carries a density perturbation.  Build its profile
+        # grid whatever the distribution: the stretch map below needs it, and it
+        # is ALSO the glass relaxer's target.
+        if self.drho != 0:
             xgrid = np.linspace(-dx, dx, 20001)
             self._rho_z_grid = (xgrid, self.getrho(xgrid))
-            fixdens.set_density_profile(self,-dx,dx)
+            # IC_createsetup writes this as a self-describing signed-x table;
+            # runtest feeds it to glassgen so the glass is RELAXED in the
+            # analytic profile.  Without it the target is the .param's
+            # dICdensprofile=1 (uniform) and the density wave does not survive
+            # the relaxation at all.
+            self.glass_density_table = (
+                xgrid.copy(), self._rho_z_grid[1].copy(), 'signed_x')
+            # Realise the wave by displacing particles -- lattice/rand only: a
+            # glass arrives already relaxed in the profile, and the pre-glass
+            # seed is about to be, so stretching either is work the relaxation
+            # overwrites.
+            if distri != 2 and not self.preglass:
+                fixdens.set_density_profile(self,-dx,dx)
 
         uuzero = P0/(gam1*self.rhozero)
 

@@ -74,8 +74,10 @@ DEFAULT_TIME = 10.0
 # amplitude, vadv sets the centre motion). -c/-d are the artificial viscosity
 # coefficients, carried for CLI parity but unused by the analytic.
 PARAM_SPEC = [
-    Param("a", "beta_v", 5.0, float, "vortex strength (Yee standard = 5)"),
-    Param("b", "vadv", 1.0, float, "uniform mean-flow (advection) velocity"),
+    Param("a", "beta_v", 5.0, float,
+          "vortex strength (Yee standard = 5)", "b"),
+    Param("b", "vadv", 1.0, float,
+          "uniform mean-flow (advection) velocity", "vadv"),
 ]
 
 

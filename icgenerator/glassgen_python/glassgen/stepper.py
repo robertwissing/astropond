@@ -279,8 +279,8 @@ class Icr0Stop:
     moves less than threshold*h per step' - a portable convergence criterion.
 
     In the confined refine stage icr0 self-regulates to the critical-step
-    SETPOINT (~2.8-3e-3*h, slowly declining as the glass stiffens - see the
-    rate-asymmetry analysis in PLAN task #6d), so threshold ~3e-3 stops right as
+    SETPOINT (~2.8-3e-3*h, slowly declining as the glass stiffens, set by
+    the shrink:grow rate asymmetry), so threshold ~3e-3 stops right as
     icr0 settles onto / drops below that setpoint, i.e. when the glass has
     reached its force-equilibrium stiffness.
 

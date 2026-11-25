@@ -3,7 +3,7 @@
 # (Reissl, Wolf & Brauer 2016; Reissl et al. 2019).
 #   - POLARIS : polaris-MCRT/POLARIS
 #
-# Used by the synchrotron export pipeline (POLARIS_EXPORT_PLAN.md): the testsuite
+# Used by the synchrotron export pipeline: the testsuite
 # writes an octree grid with setupfiles/IC_export_polaris.py and ray-traces it
 # with CMD_SYNCHROTRON. POLARIS is a CONSUMER of our ICs, not a code under test,
 # which is why it lives in utilities/ rather than codes/.

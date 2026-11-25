@@ -56,8 +56,10 @@ REG_NPTS = 101                 # points on the regression time grid
 #  Only carried for CLI/label parity; the analysis normalises by E_mag(0).
 # --------------------------------------------------------------------------- #
 PARAM_SPEC = [
-    Param("a", "beta", 0.1, float, "plasma beta (gas pressure = beta*B0^2/2)"),
-    Param("b", "v0", 0.1, float, "shear velocity perturbation amplitude"),
+    Param("a", "beta", 0.1, float,
+          "plasma beta (gas pressure = beta*B0^2/2)", "beta"),
+    Param("b", "v0", 0.1, float,
+          "shear velocity perturbation amplitude", "v"),
 ]
 
 

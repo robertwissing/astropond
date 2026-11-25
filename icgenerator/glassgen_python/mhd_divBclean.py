@@ -458,7 +458,12 @@ def main(argv=None):
         flat[:3 * ngas] = B_clean.ravel()
     else:                                    # component-file input: write packed
         flat = B_clean.ravel()
-    tip.writetipsyaux(flat, 'BField', out)
+    # vector writer: header = number of PARTICLES (len/3), x,y,z interleaved.
+    # The scalar writetipsyaux wrote len(flat) = 3N as the header, which
+    # ChaNGa's arrayFileExists rejects (header must equal nTotalParticles);
+    # with CkAssert compiled out it then parses the binary as ASCII and
+    # silently loads garbage into B.
+    tip.writetipsyVecaux(flat.reshape(-1, 3), 'BField', out)
     wrote = [f'{out}.BField ({len(flat)} values)']
     # component-file twins (BFieldx/y/z) are a second, independent copy of the
     # field that some consumers read INSTEAD of the packed file - every B

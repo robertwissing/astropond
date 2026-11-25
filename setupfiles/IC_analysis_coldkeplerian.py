@@ -15,9 +15,10 @@ The exact velocity field (point mass GM = 1) is purely azimuthal Keplerian,
 
     v_phi(r) = r^(-1/2),     v_r = 0,
 
-independent of the density power-law -d (q sets the surface-density slope and the
-thermal energy, NOT the orbital speed -- IC_setup_coldkeplerian.getveli hardcodes
-v_azi = r^(-1/2)). The simulated v_phi is recovered from the Cartesian velocity by
+independent of the thermal power-law -d (q sets P/rho proportional to r^-q, NOT
+the fixed Sigma proportional to r^-1/2 or the orbital speed --
+IC_setup_coldkeplerian.getveli hardcodes v_azi = r^(-1/2)). The simulated v_phi
+is recovered from the Cartesian velocity by
 v_phi = (x vy - y vx)/r_cyl and v_r = (x vx + y vy)/r_cyl (the inverse of the
 cyl->cart transform in the setup).
 
@@ -63,16 +64,18 @@ DEFAULT_TIME = 10.0     # ~one orbit at r=1 every 2*pi; deltastep=2pi/10, defaul
                         # comparison late enough for AV spreading to show, but the
                         # solution is steady so any time is valid.
 
-# runtest.sh setup_coldkeplerian() parameter order (runtest.sh:819). Only the ring
+# runtest.sh setup_coldkeplerian() parameter order. Only the ring
 # radii (rinner/rdisk) bound the analytic window; hr/q are carried for
 # labelling -- none of them change the Keplerian v_phi = r^(-1/2).
 PARAM_SPEC = [
-    Param("a", "hr", 0.05, float,
-          "aspect ratio hr (=1/Mach; small=cold; sets thermal/vertical scale)"),
-    Param("b", "rinner", 1.0, float, "inner ring radius"),
-    Param("c", "rdisk", 2.0, float, "outer ring radius"),
+    Param("a", "hr", 9.5e-7, float,
+          "P/rho at R=1 (nominal Mach=1/sqrt(gamma*hr); small=cold)",
+          "hr"),
+    Param("b", "rinner", 1.0, float, "inner ring radius", "ri"),
+    Param("c", "rdisk", 2.0, float, "outer ring radius", "ro"),
     Param("d", "q", 0.5, float,
-          "surface-density power-law (v_phi is Keplerian r^-1/2 regardless)"),
+          "thermal exponent in P/rho~r^-q (Sigma and v_phi stay r^-1/2)",
+          "q"),
 ]
 
 

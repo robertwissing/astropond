@@ -35,14 +35,19 @@ DKPCUNIT = 1.0        # IC_setup_blob.dkpcunit
 
 # -a..-h match runtest.sh setup_blob() (runtest.sh:474-494) with the same defaults.
 PARAM_SPEC = [
-    Param("a", "rhodiff",  10.0,  float, "density contrast (cloud/wind)"),
-    Param("b", "beta",     0.0,   float, "plasma beta (unused in hydro blob)"),
-    Param("c", "mach",     2.7,   float, "wind mach number"),
-    Param("d", "inflow",   0.0,   float, "inflow conditions"),
-    Param("e", "cool",     0.0,   float, "with cooling"),
-    Param("f", "windref",  0.0,   float, "reference frame of wind"),
-    Param("g", "winddens", 26.0,  float, "wind density 10^-g g/cm^3"),
-    Param("h", "tcloud",   4000.0, float, "cloud temperature [K]"),
+    Param("a", "rhodiff", 10.0, float,
+          "density contrast (cloud/wind)", "rhodiff"),
+    Param("b", "beta", 0.0, float,
+          "plasma beta (unused in hydro blob)", "beta"),
+    Param("c", "mach", 2.7, float, "wind mach number", "mach"),
+    Param("d", "inflow", 0.0, float, "inflow conditions", "inflow"),
+    Param("e", "cool", 0.0, float, "with cooling", "cool"),
+    Param("f", "windref", 0.0, float,
+          "reference frame of wind", "wr"),
+    Param("g", "winddens", 26.0, float,
+          "wind density 10^-g g/cm^3", "wd"),
+    Param("h", "tcloud", 4000.0, float,
+          "cloud temperature [K]", "tc"),
 ]
 
 # Both masses are normalised by the initial cloud mass (M_cloud at t=0).

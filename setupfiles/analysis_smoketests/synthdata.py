@@ -52,17 +52,37 @@ def gas_table(n):
 #  Writers (binary, big-endian -- matching readtipsy / try_aux)
 # --------------------------------------------------------------------------- #
 
-def write_snapshot(path, gas, time):
-    """Write a gas-only tipsy snapshot to `path` at `time` (big-endian binary,
-    the layout readtipsy.readtipsy reads: time f8, header 6*i4, gas ngas*12 f4)."""
+# tipsy star record: mass | x,y,z | vx,vy,vz | metals | tform | eps | phi
+NSTAR_COLS = 11
+
+
+def star_table(n, mass=0.0):
+    """An (n, 11) star array zeroed out, with a uniform particle mass."""
+    s = np.zeros((n, NSTAR_COLS), dtype=float)
+    s[:, 0] = mass
+    return s
+
+
+def write_snapshot(path, gas, time, stars=None):
+    """Write a tipsy snapshot to `path` at `time` (big-endian binary, the layout
+    readtipsy.readtipsy reads: time f8, header 6*i4, gas ngas*12 f4, then the
+    star block nstar*11 f4).
+
+    `stars` is optional: omit it for the gas-only snapshots most tests want.
+    A test that converts gas into stars (starform) passes both blocks, and the
+    header's nstar is what the analysis reads back."""
     gas = np.asarray(gas, dtype=float)
     ngas = len(gas)
-    header = np.array([ngas, 3, ngas, 0, 0, 0])
+    stars = (np.zeros((0, NSTAR_COLS)) if stars is None
+             else np.asarray(stars, dtype=float))
+    nstar = len(stars)
+    header = np.array([ngas + nstar, 3, ngas, 0, nstar, 0])
     with open(path, "wb") as fh:
         np.array([float(time)]).astype(_BE_F8).tofile(fh)
         header.astype(_BE_I4).tofile(fh)
         gas.astype(_BE_F4).tofile(fh)
-        # no dark / star particles
+        if nstar:
+            stars.astype(_BE_F4).tofile(fh)
 
 
 def write_scalar_aux(path, label, arr):
@@ -91,7 +111,7 @@ DEFAULT_LOG_PARAMS = dict(
 )
 
 
-def write_log(path, series=None, params=None):
+def write_log(path, series=None, params=None, extra_lines=None):
     """Write a gasoline '<runname>.log'.
 
     series : dict {LOG_COLUMNS name -> 1-D array}; rows are written for every
@@ -99,6 +119,10 @@ def write_log(path, series=None, params=None):
              provided so the per-timestep series has an x-axis.
     params : overrides for the '# key: value' header lines (dTuFac, dxPeriod,
              dMsolUnit, ...). See DEFAULT_LOG_PARAMS.
+    extra_lines : additional verbatim header lines, written after the standard
+             block -- for sections this template does not model (the
+             '# Preprocessor macros:' line, '# STAR FORMATION: ...'). They must
+             start with '#' to stay out of the numeric series.
     """
     p = dict(DEFAULT_LOG_PARAMS)
     if params:
@@ -114,6 +138,8 @@ def write_log(path, series=None, params=None):
         ("# GAS PHYSICS:  dConstGamma: {dConstGamma} dMeanMolWeight: 1 "
          "dGasConst: 1 dTuFac: {dTuFac}").format(**p),
     ]
+    if extra_lines:
+        lines.extend(extra_lines)
     if series:
         ncol = len(LOG_COLUMNS)
         nrow = max(len(v) for v in series.values())
@@ -133,7 +159,8 @@ def write_log(path, series=None, params=None):
 # --------------------------------------------------------------------------- #
 
 def make_run(parent, runname, snaps, start=10, step=10,
-             log_series=None, log_params=None):
+             log_series=None, log_params=None, log_extra_lines=None,
+             starlog=None):
     """Create a run directory `parent/runname/` and populate it.
 
     snaps : list of per-snapshot dicts, each:
@@ -141,7 +168,12 @@ def make_run(parent, runname, snaps, start=10, step=10,
              "aux": {"BField": (n,3), "DivB": (n,), ...}}   (aux optional)
             written as '<runname>.NNNNN' with NNNNN = start, start+step, ...
             (5-digit zero-padded, the suffix find_files keys on).
-    log_series / log_params : forwarded to write_log ('<runname>.log').
+    log_series / log_params / log_extra_lines : forwarded to write_log
+            ('<runname>.log').
+    starlog : optional structured array of star-formation events (the
+            IC_starlog dtype) written as '<runname>.starlog'; pass a 0-length
+            array to create the magic-number-only file a run with no events
+            leaves behind.
 
     Returns the run directory path (also a valid analysis input argument).
     """
@@ -150,7 +182,7 @@ def make_run(parent, runname, snaps, start=10, step=10,
     for k, snap in enumerate(snaps):
         suffix = start + k * step
         base = os.path.join(rundir, "%s.%05d" % (runname, suffix))
-        write_snapshot(base, snap["gas"], snap["time"])
+        write_snapshot(base, snap["gas"], snap["time"], snap.get("stars"))
         for label, data in snap.get("aux", {}).items():
             data = np.asarray(data, dtype=float)
             if data.ndim == 2:
@@ -158,5 +190,26 @@ def make_run(parent, runname, snaps, start=10, step=10,
             else:
                 write_scalar_aux(base, label, data)
     write_log(os.path.join(rundir, runname + ".log"),
-              series=log_series, params=log_params)
+              series=log_series, params=log_params, extra_lines=log_extra_lines)
+    if starlog is not None:
+        write_starlog(os.path.join(rundir, runname + ".starlog"), starlog)
     return rundir
+
+
+def write_starlog(path, events):
+    """Write a gasoline '<runname>.starlog': the record-size magic, then the
+    events (an IC_starlog-dtype structured array, possibly empty).
+
+    The dtype is forced back to big-endian first: numpy normalises a structured
+    dtype to NATIVE byte order across ordinary operations (concatenate, fancy
+    indexing), so a caller that assembled rows row-by-row would otherwise write
+    a little-endian body under a header claiming the on-disk layout."""
+    events = np.asarray(events)
+    be = np.dtype([(name, events.dtype.fields[name][0].str
+                    .replace("<", ">").replace("=", ">"))
+                   for name in (events.dtype.names or ())])
+    events = events.astype(be)
+    with open(path, "wb") as fh:
+        np.array([be.itemsize]).astype(_BE_I4).tofile(fh)
+        if len(events):
+            events.tofile(fh)

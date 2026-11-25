@@ -287,7 +287,11 @@ def get_mass_rcyl(D,rcyl,rmin):
 @njit
 def get_mass(x,xmin,xgrid,rho_grid):
      dx = (x - xmin)/ngrid
-     dmprev   = 0.
+     # Trapezoidal integration needs the value at the left endpoint.  Starting
+     # at zero omits half of the first interval, so even rho=constant reports
+     # M=(x-xmin)*(1-1/(2*ngrid)).  Besides the misleading total-mass printout,
+     # that makes the inverse stretch map weakly dependent on ngrid.
+     dmprev   = np.interp(xmin, xgrid, rho_grid)*dx
      get_mass = 0.
      delta=0.0025
      for i in range(1, ngrid + 1):   # inclusive, reach xmax (Fortran do i=1,ngrid)
@@ -324,9 +328,9 @@ def get_mass_tab_r(rhotab,rtab):
      dmprev     = 0.
      rprev      = rtab[0]
      for i in range(1,len(rhotab)):
-        ri     = rtab(i)
+        ri     = rtab[i]
         dr     = ri - rprev
-        dmi    = ri*ri*rhotab(i)*dr
+        dmi    = ri*ri*rhotab[i]*dr
         masstab[i] = masstab[i-1] + 0.5*(dmi + dmprev) # trapezoidal rule
         dmprev = dmi
         rprev  = ri
@@ -343,7 +347,7 @@ def get_mass_tab_rcyl(rhotab,rtab):
      for i in range(1,len(rhotab)):
         ri     = rtab[i]
         dr     = ri - rprev
-        dmi    = ri*rhotab(i)*dr
+        dmi    = ri*rhotab[i]*dr
         masstab[i] = masstab[i-1] + 0.5*(dmi + dmprev) # trapezoidal rule
         dmprev = dmi
         rprev  = ri

@@ -64,9 +64,14 @@ from IC_analysis_render import (
 )
 
 
-# A single -a..-h parameter: which letter, its long name, default value, the
-# type to parse it as, and a help string. `default` must match runtest.sh.
-Param = namedtuple("Param", ["letter", "name", "default", "type", "help"])
+# A single -a..-h parameter. ``runname`` optionally describes how
+# runtest.sh's runname_extra stores the value: a string is a numeric tag
+# (``"case"`` reads ``case3``), a dict maps name fragments to values, and a
+# callable accepts the input basename. Explicit CLI values always take
+# precedence. ``default`` must match runtest.sh.
+Param = namedtuple("Param", ["letter", "name", "default", "type", "help",
+                             "runname"])
+Param.__new__.__defaults__ = (None,)
 
 # A single plotted quantity returned by a test's analyze() callback.
 #   norm: optional metric key whose FIRST-snapshot value normalizes this metric
@@ -79,6 +84,235 @@ Metric.__new__.__defaults__ = ("value", "x", "linear", "o", None)  # ylabel..onw
 # --------------------------------------------------------------------------- #
 #  Argument parsing
 # --------------------------------------------------------------------------- #
+
+_CASE_NAME_RE = re.compile(r"case(\d+)(?!\d)", re.IGNORECASE)
+
+
+def _case_from_input_name(input_arg):
+    """Return the unique ``caseNR`` tag in an input basename, if present."""
+    run_name = os.path.basename(os.path.normpath(str(input_arg)))
+    cases = sorted({int(match.group(1))
+                    for match in _CASE_NAME_RE.finditer(run_name)})
+    if len(cases) > 1:
+        rendered = ", ".join(f"case{case}" for case in cases)
+        raise ValueError(
+            f"cannot infer one analysis case from {run_name!r}: its name "
+            f"contains {rendered}; pass -a/--case explicitly")
+    return cases[0] if cases else None
+
+
+def _infer_case_from_inputs(inputs, default_case, prompt=None):
+    """Infer one case from input basenames, confirming incomplete conflicts."""
+    records = [(str(input_arg), _case_from_input_name(input_arg))
+               for input_arg in inputs]
+    tagged = [(path, case) for path, case in records if case is not None]
+    missing = [path for path, case in records if case is None]
+
+    if not tagged:
+        print("WARNING: no -a/--case was given and no input directory name "
+              f"contains a caseNR tag; using the historical default case "
+              f"{int(default_case)}. Pass -a/--case to choose explicitly.",
+              file=sys.stderr)
+        return int(default_case)
+
+    cases = sorted({case for _, case in tagged})
+    if len(cases) == 1 and not missing:
+        plural = "name" if len(records) == 1 else "names"
+        print("analysis: no -a/--case given; inferred case "
+              f"{cases[0]} from {len(records)} input directory {plural}.",
+              file=sys.stderr)
+        return cases[0]
+
+    reason = ("input directory names encode different cases"
+              if len(cases) > 1 else
+              "not every input directory name contains a caseNR tag")
+    print(f"WARNING: no -a/--case was given and {reason}:",
+          file=sys.stderr)
+    for path, case in records:
+        label = f"case {case}" if case is not None else "no caseNR tag"
+        print(f"  {label}: {path}", file=sys.stderr)
+    print("The analyzer can use only one case for all inputs.",
+          file=sys.stderr)
+
+    chosen_path, chosen_case = tagged[0]
+    print(f"Continue using case {chosen_case} from the first tagged input "
+          f"({chosen_path})? [y/N] ", end="", file=sys.stderr, flush=True)
+    ask = input if prompt is None else prompt
+    try:
+        answer = ask()
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("analysis: stopped; rerun with an explicit -a/--case.",
+              file=sys.stderr)
+        raise SystemExit(2)
+    print(f"analysis: continuing with inferred case {chosen_case}.",
+          file=sys.stderr)
+    return chosen_case
+
+
+def _resolve_case(explicit_case, inputs, default_case, prompt=None):
+    """Honor an explicit case, otherwise infer it from the input names."""
+    if explicit_case is not None:
+        return int(explicit_case)
+    return _infer_case_from_inputs(inputs, default_case=default_case,
+                                   prompt=prompt)
+
+
+_RUNNAME_NUMBER_RE = re.compile(
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def _effective_runname_rule(spec):
+    """Return a Param's decoder, retaining the original caseN convention."""
+    if spec.runname is not None:
+        return spec.runname
+    if spec.letter == "a" and spec.name == "case":
+        return "case"
+    return None
+
+
+def _coerce_runname_value(raw_value, spec):
+    """Apply a Param's declared type to one decoded run-name value."""
+    if spec.type is int and isinstance(raw_value, str):
+        numeric = float(raw_value)
+        if not numeric.is_integer():
+            raise ValueError(
+                f"run name encodes non-integer {raw_value!r} for "
+                f"-{spec.letter}/--{spec.name}")
+        return int(numeric)
+    return spec.type(raw_value)
+
+
+def _runname_value(input_arg, spec):
+    """Decode one parameter from one input basename, or return None."""
+    rule = _effective_runname_rule(spec)
+    if rule is None:
+        return None
+    run_name = os.path.basename(os.path.normpath(str(input_arg)))
+
+    if isinstance(rule, re.Pattern):
+        raw_values = []
+        for match in rule.finditer(run_name):
+            if match.lastindex != 1:
+                raise ValueError(
+                    f"run-name pattern for -{spec.letter}/--{spec.name} "
+                    "must contain exactly one capture group")
+            raw_values.append(match.group(1))
+    elif callable(rule):
+        raw_values = [rule(run_name)]
+    elif isinstance(rule, dict):
+        folded_name = run_name.casefold()
+        raw_values = [value for token, value in rule.items()
+                      if str(token).casefold() in folded_name]
+    else:
+        tag = re.escape(str(rule))
+        raw_values = [match.group(0)[len(str(rule)):]
+                      for match in re.finditer(
+                          tag + _RUNNAME_NUMBER_RE.pattern, run_name)]
+
+    values = []
+    for raw_value in raw_values:
+        if raw_value is None:
+            continue
+        value = _coerce_runname_value(raw_value, spec)
+        if value not in values:
+            values.append(value)
+    if len(values) > 1:
+        rendered = ", ".join(map(str, values))
+        raise ValueError(
+            f"cannot infer one -{spec.letter}/--{spec.name} value from "
+            f"{run_name!r}: its name encodes {rendered}; pass the option "
+            "explicitly")
+    return values[0] if values else None
+
+
+def _format_param_option(spec, value):
+    return f"-{spec.letter}/--{spec.name}={value}"
+
+
+def _infer_runname_params(args, param_spec, params, prompt=None):
+    """Fill omitted Param values from run names, confirming conflicts once."""
+    specs = [spec for spec in param_spec
+             if _effective_runname_rule(spec) is not None
+             and params[spec.name] is None]
+    if not specs:
+        return params
+
+    inputs = [str(input_arg) for input_arg in getattr(args, "inputs", ())]
+    decoded = {spec.name: [_runname_value(path, spec) for path in inputs]
+               for spec in specs}
+    inferred = []
+    defaulted = []
+    conflicts = []
+
+    for spec in specs:
+        values = decoded[spec.name]
+        present = [value for value in values if value is not None]
+        unique = []
+        for value in present:
+            if value not in unique:
+                unique.append(value)
+        if not present:
+            params[spec.name] = spec.default
+            defaulted.append(spec)
+        elif len(unique) == 1 and len(present) == len(inputs):
+            params[spec.name] = unique[0]
+            inferred.append(spec)
+        else:
+            # A comparison is analyzed with one parameter set. Use the first
+            # input as the proposed authority; if its tag is absent, preserve
+            # the declared default rather than silently borrowing another run.
+            params[spec.name] = (values[0] if values and values[0] is not None
+                                 else spec.default)
+            conflicts.append(spec)
+
+    if inferred:
+        rendered = ", ".join(
+            _format_param_option(spec, params[spec.name]) for spec in inferred)
+        plural = "name" if len(inputs) == 1 else "names"
+        print(f"analysis: inferred {rendered} from {len(inputs)} input "
+              f"directory {plural}.", file=sys.stderr)
+
+    if defaulted:
+        rendered = ", ".join(
+            _format_param_option(spec, spec.default) for spec in defaulted)
+        print("WARNING: omitted parameter tags were not found in any input "
+              f"directory name; using declared defaults: {rendered}.",
+              file=sys.stderr)
+
+    if conflicts:
+        print("WARNING: omitted analysis parameters differ across input "
+              "directory names, or are missing from only some inputs:",
+              file=sys.stderr)
+        for index, path in enumerate(inputs):
+            cells = []
+            for spec in conflicts:
+                value = decoded[spec.name][index]
+                cells.append(_format_param_option(
+                    spec, value if value is not None else "<not encoded>"))
+            print(f"  {path}: {', '.join(cells)}", file=sys.stderr)
+        selected = ", ".join(
+            _format_param_option(spec, params[spec.name]) for spec in conflicts)
+        print("The analyzer can use only one parameter set for all inputs.",
+              file=sys.stderr)
+        print("Continue using the first input's values (declared defaults "
+              f"where absent): {selected}? [y/N] ", end="", file=sys.stderr,
+              flush=True)
+        ask = input if prompt is None else prompt
+        try:
+            answer = ask()
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("analysis: stopped; pass the differing options explicitly.",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        print(f"analysis: continuing with {selected}.", file=sys.stderr)
+
+    for spec in specs:
+        setattr(args, spec.name, params[spec.name])
+    return params
 
 def build_parser(param_spec, description=""):
     """Build the argparse parser shared by every analysis script.
@@ -96,9 +330,13 @@ def build_parser(param_spec, description=""):
              "(files ending with a 5-digit snapshot suffix)",
     )
     for spec in param_spec:
+        # A None sentinel distinguishes an omitted value from an explicit one
+        # equal to the default. params_from_args resolves tagged run names.
+        default = (None if _effective_runname_rule(spec) is not None
+                   else spec.default)
         p.add_argument(
             f"-{spec.letter}", f"--{spec.name}",
-            dest=spec.name, type=spec.type, default=spec.default,
+            dest=spec.name, type=spec.type, default=default,
             help=f"{spec.help} (runtest -{spec.letter}; default {spec.default})",
         )
     p.add_argument("--labels", nargs="+",
@@ -208,7 +446,23 @@ def build_parser(param_spec, description=""):
 
 def params_from_args(args, param_spec):
     """Extract the {name: value} parameter dict from parsed args."""
-    return {spec.name: getattr(args, spec.name) for spec in param_spec}
+    params = {spec.name: getattr(args, spec.name) for spec in param_spec}
+    try:
+        params = _infer_runname_params(args, param_spec, params)
+    except ValueError as error:
+        print(f"analysis: error: {error}", file=sys.stderr)
+        raise SystemExit(2)
+    case_spec = next((spec for spec in param_spec
+                      if spec.letter == "a" and spec.name == "case"), None)
+    if case_spec is not None and params[case_spec.name] is None:
+        try:
+            params[case_spec.name] = _resolve_case(
+                None, getattr(args, "inputs", ()), case_spec.default)
+        except ValueError as error:
+            print(f"analysis: error: {error}", file=sys.stderr)
+            raise SystemExit(2)
+        setattr(args, case_spec.name, params[case_spec.name])
+    return params
 
 
 def check_residual_args(parser, args):
@@ -433,9 +687,13 @@ def series_from_log_or_snapshots(inp, log_cols, per_snapshot, valid=None):
 #  Plotting
 # --------------------------------------------------------------------------- #
 
-def plot_compare(results, ref_table, analytic, params, metrics, save=None):
-    """One figure per metric, with the legend drawn BELOW the figure (one
-    self-contained image, not a separate legend file).
+def plot_compare(results, ref_table, analytic, params, metrics, save=None,
+                 show_legend=True):
+    """One figure per metric, optionally with the legend BELOW the figure.
+
+    The legend remains part of the same self-contained image, never a separate
+    legend file. When it is disabled, a labelled analytic curve gets a compact
+    in-axis annotation instead.
 
     results : list of (label, table, ...) for each input.
     """
@@ -455,11 +713,16 @@ def plot_compare(results, ref_table, analytic, params, metrics, save=None):
             plotfn(ref_table["x"], ref_table[met.key], marker="x",
                    linestyle="--", color="red", label="reference")
 
+        analytic_label = None
         if analytic is not None:
             curve = analytic(met.key, params)
             if curve is not None:
-                xa, ya = curve
-                plotfn(xa, ya, "k:", linewidth=2.0, label="analytic")
+                if len(curve) == 3:
+                    xa, ya, analytic_label = curve
+                else:
+                    xa, ya = curve
+                    analytic_label = "analytic"
+                plotfn(xa, ya, "k:", linewidth=2.0, label=analytic_label)
 
         ax.set_xlabel(met.xlabel)
         ax.set_ylabel(met.ylabel)
@@ -467,21 +730,25 @@ def plot_compare(results, ref_table, analytic, params, metrics, save=None):
         # Legend below the figure (not on the axes, not a separate file).
         handles, labels = ax.get_legend_handles_labels()
         extra = ()
-        if handles:
+        if show_legend and handles:
             leg = fig.legend(handles, labels, loc="upper center",
                              bbox_to_anchor=(0.5, 0.0), ncol=min(3, len(labels)),
                              frameon=False, handlelength=2.5, handletextpad=0.8,
                              columnspacing=1.5)
             extra = (leg,)
+        elif analytic_label:
+            # Some compact diagnostic figures deliberately omit a legend. Keep
+            # the meaning of a prediction line explicit with a small in-axis
+            # note instead of an external legend block.
+            ax.text(0.02, 0.98, analytic_label, transform=ax.transAxes,
+                    ha="left", va="top", fontsize=9, color="0.2")
         fig.tight_layout()
 
         if save:
             out = f"{save}_{met.key}.png"
             fig.savefig(out, bbox_inches="tight", bbox_extra_artists=extra)
             print(f"saved figure -> {out}")
-            print("hello")
-            tg.send_message("Trolol")
-            tg.send_photo(out, "{out}")
+            tg.send_photo(out, os.path.basename(out))
             plt.close(fig)
         else:
             plt.show()
@@ -573,7 +840,8 @@ def _cut_binned_profile(inp, t, y0, qfn, axis_x, axis_y, strip_cells):
 
 def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
                    time_label="t", title_prefix="", axis_x=1, axis_y=2,
-                   strip_cells=1.0, reference=None, bless=False):
+                   strip_cells=1.0, reference=None, bless=False,
+                   separate_lines=False):
     """1-D cuts of fields vs x along the horizontal line y=y0, as a single figure
     with one ROW per quantity and one COLUMN per time (nearest snapshot chosen),
     so a single requested time is one column and several times tile across.
@@ -582,8 +850,11 @@ def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
     times   : the times to cut at (one column each).
     y0_of   : callable t -> y0 (the cut height); annotated per column.
     Particles within |y - y0| < strip_cells / n_x (n_x from the run name) are
-    scattered vs x and overlaid with a binned-mean line. axis_x/axis_y are the
-    tgdata column indices of the in-plane coordinates (default x=1, y=2).
+    scattered vs x and, by default, overlaid with a binned-mean line.
+    ``separate_lines=True`` keeps ``<save>_cut.png`` as a particle-only figure
+    and writes the binned means/reference overlays separately to
+    ``<save>_cut_binned.png``. axis_x/axis_y are the tgdata column indices of
+    the in-plane coordinates (default x=1, y=2).
 
     bless   : instead of drawing, save the FIRST input's binned cut profiles as
               the baseline (one npz per quantity/time in references/<runname>/).
@@ -618,13 +889,21 @@ def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
     # is opt-in (--reference) and only for a single input.
     ref_dir = (resolve_reference_dir(inputs[0], reference)
                if reference is not None and len(inputs) == 1 else None)
-    fig, axes = plt.subplots(nq, nt,
-                             figsize=(1.0 + 3.2 * nt, 2.2 * nq + 1.0),
-                             sharex=True, sharey="row", squeeze=False)
+    def make_axes():
+        return plt.subplots(nq, nt,
+                            figsize=(1.0 + 3.2 * nt, 2.2 * nq + 1.0),
+                            sharex=True, sharey="row", squeeze=False)
+
+    particle_fig, particle_axes = make_axes()
+    if separate_lines:
+        line_fig, line_axes = make_axes()
+    else:
+        line_fig, line_axes = particle_fig, particle_axes
     any_data_any = False
     for tj, t in enumerate(times):
         y0 = y0_of(t)
-        col = axes[:, tj]
+        particle_col = particle_axes[:, tj]
+        line_col = line_axes[:, tj]
         any_data = False
         for ci, (inp, lab) in enumerate(zip(inputs, labels)):
             nx = parse_resolution(inp) or 64
@@ -633,15 +912,20 @@ def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
                                            strip_cells)
                 if x is None:
                     continue
-                col[qi].scatter(x, q, s=4, alpha=0.4, color=f"C{ci}",
-                                rasterized=True,
-                                label=lab if (qi == 0 and tj == 0) else None)
+                particle_col[qi].scatter(
+                    x, q, s=4, alpha=0.4, color=f"C{ci}", rasterized=True,
+                    label=lab if (qi == 0 and tj == 0) else None)
                 if x.size > 8:                       # binned-mean line
                     xc, qm = binned_profile(x, q, nbins=min(nx, 128), min_bins=1)
                     if xc is not None:
-                        col[qi].plot(xc, qm, "-", color=f"C{ci}", lw=1.5)
+                        line_col[qi].plot(
+                            xc, qm, "-", color=f"C{ci}", lw=1.5,
+                            label=(lab if separate_lines and qi == 0 and tj == 0
+                                   else None))
                 if tj == 0:
-                    col[qi].set_ylabel(ylabel)
+                    particle_col[qi].set_ylabel(ylabel)
+                    if separate_lines:
+                        line_col[qi].set_ylabel(ylabel)
                 any_data = True
                 any_data_any = True
         if ref_dir is not None:                      # blessed baseline (dashed red)
@@ -649,45 +933,65 @@ def horizontal_cut(inputs, labels, quants, times, y0_of, save=None,
                 cand = os.path.join(ref_dir, f"cut_{slug}_t{t:g}.npz")
                 if os.path.isfile(cand):
                     d = np.load(cand)
-                    col[qi].plot(d["x"], d["q"], "--", color="red", lw=1.3,
-                                 label="reference" if (qi == 0 and tj == 0)
-                                 else None)
+                    line_col[qi].plot(
+                        d["x"], d["q"], "--", color="red", lw=1.3,
+                        label="reference" if (qi == 0 and tj == 0) else None)
                 else:
                     print(f"horizontal_cut: no cut reference for {slug}/t{t:g} "
                           f"in {ref_dir}", file=sys.stderr)
-        for ax in col:
+        # A zero guide belongs with the curve/reference view. Keeping it off the
+        # split particle view makes that figure genuinely line-free.
+        for ax in line_col:
             ax.axhline(0.0, color="0.85", lw=0.8, zorder=0)
-        col[-1].set_xlabel(xname)
-        col[0].set_title(f"{time_label} = {t:g}  "
-                         f"({'xyz'[axis_y - 1]}0 = {y0:g})")
+        particle_col[-1].set_xlabel(xname)
+        if separate_lines:
+            line_col[-1].set_xlabel(xname)
+        title = (f"{time_label} = {t:g}  "
+                 f"({'xyz'[axis_y - 1]}0 = {y0:g})")
+        particle_col[0].set_title(title)
+        if separate_lines:
+            line_col[0].set_title(title)
         if not any_data:
             print(f"horizontal_cut: no data at {time_label}={t:g}",
                   file=sys.stderr)
-    # Pooled legend BELOW the figure (sim labels + the dashed red reference),
-    # matching the project convention -- not on the axes, not a separate file.
-    handles, labels = [], []
-    seen = set()
-    for a in axes.flat:
-        for h, l in zip(*a.get_legend_handles_labels()):
-            if l and l not in seen:
-                seen.add(l); handles.append(h); labels.append(l)
-    extra = ()
-    if handles:
-        leg = fig.legend(handles, labels, loc="upper center",
-                         bbox_to_anchor=(0.5, 0.0), ncol=min(4, len(labels)),
-                         frameon=False)
-        extra = (leg,)
-    if title_prefix:
-        fig.suptitle(f"{title_prefix}horizontal cut")
-    fig.tight_layout()
-    if save:
-        out = f"{save}_cut.png"
-        fig.savefig(out, bbox_inches="tight", bbox_extra_artists=extra)
-        print(f"saved cut -> {out}")
-        tg.send_message("Trolol")
-        tg.send_photo(out, "{out}")
-        plt.close(fig)
-    else:
+
+    def finish_cut(fig, axes, qualifier, out):
+        # Pooled legend BELOW the figure (sim labels + dashed reference), not on
+        # the axes and not as a separate legend file.
+        handles, legend_labels = [], []
+        seen = set()
+        for a in axes.flat:
+            for h, label in zip(*a.get_legend_handles_labels()):
+                if label and label not in seen:
+                    seen.add(label)
+                    handles.append(h)
+                    legend_labels.append(label)
+        extra = []
+        if handles:
+            leg = fig.legend(handles, legend_labels, loc="upper center",
+                             bbox_to_anchor=(0.5, 0.0),
+                             ncol=min(4, len(legend_labels)), frameon=False)
+            extra.append(leg)
+        if title_prefix:
+            fig.suptitle(f"{title_prefix}horizontal cut — {qualifier}")
+        suptitle = getattr(fig, "_suptitle", None)
+        if suptitle is not None and suptitle.get_text():
+            extra.append(suptitle)
+        fig.tight_layout()
+        if out:
+            fig.savefig(out, bbox_inches="tight",
+                        bbox_extra_artists=tuple(extra))
+            print(f"saved cut -> {out}")
+            tg.send_photo(out, os.path.basename(out))
+            plt.close(fig)
+
+    finish_cut(particle_fig, particle_axes,
+               "particle samples" if separate_lines else "particles and means",
+               f"{save}_cut.png" if save else None)
+    if separate_lines:
+        finish_cut(line_fig, line_axes, "binned means",
+                   f"{save}_cut_binned.png" if save else None)
+    if not save:
         plt.show()
 
 
@@ -785,7 +1089,7 @@ def movie_render_specs(inp, label, specs, args, save, test, plane="z0",
 
 def run_cli(test, param_spec, analyze, analytic, metrics, description="",
             seed=None, render_spec=None, stream_spec=None, time_to_x=None,
-            time_label="t"):
+            time_label="t", show_legend=True):
     """Entry point a test's main() delegates to.
 
     test        : str, e.g. "kh" (used for reference metadata / messages).
@@ -807,6 +1111,9 @@ def run_cli(test, param_spec, analyze, analytic, metrics, description="",
     time_to_x   : optional callable(raw_time, params) -> x, so `--render-times`
                   is expressed in the analysis x-axis (e.g. t/t_crush for blob).
     time_label  : axis label used in render panel titles (e.g. "t/t_crush").
+    show_legend : draw the below-figure legend on metric-history figures.
+                  Tests with a single unambiguous series may disable it; an
+                  analytic curve then receives a compact in-axis label.
     """
     parser = build_parser(param_spec, description=description)
     # CI gate (added here, not in build_parser, so it doesn't collide with the
@@ -874,7 +1181,8 @@ def run_cli(test, param_spec, analyze, analytic, metrics, description="",
                 worst_l2 = l2 if worst_l2 is None else max(worst_l2, l2)
                 print(f"  {met.key}: max|res|={mx:.4g}  L2={l2:.4g}")
 
-    plot_compare(results, ref_table, analytic, params, metrics, save=args.save)
+    plot_compare(results, ref_table, analytic, params, metrics, save=args.save,
+                 show_legend=show_legend)
 
     # Optional: render field maps. All inputs go into ONE figure (directories as
     # columns, times as rows when there are several).

@@ -11,8 +11,8 @@ equals the particle mass to high precision.
 `exact_interpolate` to an axis-aligned cube with the PARTICLE at the origin,
 returning the fraction of the (unit-normalized) kernel mass contained in the cube.
 
-The per-triangle cone integral `_cone_tri` is REGIME-DISPATCHED (2026-07-02,
-see its block comment + PLAN_PETKOVA_FIX.md): exact solid angle when saturated,
+The per-triangle cone integral `_cone_tri` is REGIME-DISPATCHED (see its
+block comment): exact solid angle when saturated,
 calibrated-order Duffy quadrature when converged, and an exact analytic-radial
 wedge decomposition for scale-separated triangles; cell integrals additionally
 take a closed-form regime-0 shortcut when the kernel crosses at most one face
@@ -190,24 +190,19 @@ _CUBE_FACES = np.array([
 
 
 # --------------------------------------------------------------------------- #
-#  The per-triangle cone integral: regime-dispatched (2026-07-02 rewrite).
+#  The per-triangle cone integral: regime-dispatched.
 #
 #  cone = int_{Omega in tri} g(R(Omega)) dOmega
 #       = int int_tri g(|Q|) * r0/|Q|^3 dA,     g(R) = gcum3D(R/h)/pi,
 #  with the particle at the origin, Q the point on the triangle and r0 the
 #  perpendicular particle->plane distance.
 #
-#  History: the original analytic wedge (`_vertex_integral` + foot-point
-#  cond/sign assembly) was exact for generic positions but its (h/r0)^3 and
-#  R_0/r0 terms blew up for lattice-aligned near-face particles (striping,
-#  +2% net mass). The 2026-07-01 "conefix" replaced it with a fixed 12x12
-#  Duffy tensor Gauss rule — robust near faces, but ~20x slower everywhere
-#  and silently UNCONVERGED whenever h or r0 << triangle size (a fixed-order
-#  rule cannot resolve the kernel bump or the solid-angle peak inside a much
-#  larger triangle): +1.66%/+0.81% mass on coarse grids, 2.4e-3 on collapsed
-#  cores. This rewrite dispatches per triangle on cheap geometry to a rung
-#  that is BOTH converged (<=~1e-12 abs, calibrated) and near-minimal cost.
-#  Prototype + calibration battery: PLAN_PETKOVA_FIX.md ("Step-1 results").
+#  The analytic wedge (`_vertex_integral` + foot-point cond/sign assembly)
+#  blows up via its (h/r0)^3 and R_0/r0 terms for lattice-aligned near-face
+#  particles, and a fixed-order Duffy rule is unconverged whenever h or r0 <<
+#  triangle size (it cannot resolve the kernel bump or the solid-angle peak).
+#  So each triangle is dispatched on cheap geometry to the cheapest regime
+#  that is converged (<=~1e-12 abs, calibrated).
 # --------------------------------------------------------------------------- #
 
 # Regime-2 ratio thresholds (squared): use Duffy order n when
@@ -570,7 +565,7 @@ def _cone_tri(ax, ay, az, bx, by, bz, cx, cy, cz, h):
     Building block of the signed-tetrahedralization cell integral:
      int_cell W = sum over faces (front/back sign) * sum over fan-triangles
     _cone_tri. Regime-dispatched on cheap geometry (see the block comment
-    above and PLAN_PETKOVA_FIX.md):
+    above):
       1. whole triangle beyond 2h -> exact solid angle (Van Oosterom-Strijbos);
       2. converged-by-calibration Duffy tensor Gauss at order 3/6/12, with a
          stricter ladder when the triangle straddles a kernel break (T=h/2h);
@@ -1006,20 +1001,10 @@ def _needs_weights(names):
 
 # Particles are usually stored in spatially coherent order, so equal-size
 # prange chunks give some threads all the big-h (expensive) particles.
-#
-# MEASURED 2026-07-28: this chunk-size knob does NOT fix that — it does nothing
-# at all. On numba 0.65.1 the deposit takes 21.1 s at _CHUNKSIZE = 1, 4, 16,
-# 256, 4096 and 0 alike, i.e. `set_parallel_chunksize` never reaches this loop.
-# The imbalance it was meant to cure is severe and was still fully present:
-# on the bench's clustered 200k set the last 3 of 12 equal blocks of the
-# particle array hold 99.5% of the work, and petkova scaled 1.03x on 2 threads
-# and 1.04x on 4 (a pure-compute control in the same process scaled 2.01x and
-# 3.94x, so threading itself was fine).
-#
-# `_balanced_order` below fixes it where the scheduler would not: it reorders
+# `set_parallel_chunksize` does not reach this loop (numba 0.65.1), so this
+# knob has no effect; `_balanced_order` below fixes the imbalance by reordering
 # the particles so that ANY contiguous chunk holds a representative mix of
-# cheap and expensive ones. Kept alongside rather than deleted, since it is
-# harmless and would start helping again if numba honours it in future.
+# cheap and expensive ones.
 _CHUNKSIZE = 16
 
 # Below this, threading is not the bottleneck and the permutation is not worth
@@ -1121,8 +1106,6 @@ def _deposit_petkova_uniform(x, y, z, h, mass, volw, vals,
                         # half. So the slab test is done in WRAPPED index space,
                         # per cell, and placed before the geometry so a cell
                         # outside this slab costs one modulo and a compare.
-                        # (This is the piece `prof_slab.py` left unsolved: the
-                        # probe slabs a non-periodic axis only.)
                         kw = kz % nz
                         if kw < kz0 or kw >= kz1:
                             continue
@@ -1465,11 +1448,10 @@ def _voro_cell_integral(px, py, pz, h, gx, gy, gz, c,
 
     Signed tetrahedralization from the particle: one front/back sign per face
     (the generator gives the interior side to orient the outward normal),
-    fan-triangulate each polygonal face, sum `_cone_tri`. This replaces the old
-    foot-point wedge assembly (`_vertex_integral` + cond1/cond2 + sign_M), which
-    failed to telescope for cells straddling the kernel break (h/2h) when the
-    particle is outside the cell — the ~1-1.5% Voronoi conservation error on
-    high-dynamic-range (collapsed-core) meshes. Now machine-precision conserving.
+    fan-triangulate each polygonal face, sum `_cone_tri`. Machine-precision
+    conserving, unlike the foot-point wedge assembly (`_vertex_integral`), which
+    fails to telescope for cells straddling the kernel break (h/2h) when the
+    particle is outside the cell.
 
     Regime-0 pre-pass (h << cell), as in `_cube_integral` but per face plane
     of the convex polyhedron: if the kernel sphere crosses no plane the

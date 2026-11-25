@@ -32,8 +32,11 @@ D_ij = rho_i F(rho_i, rho_j) = rho_i * ig_pair(1, .)[0], which is what
 diff_weight returns. Consumers that need an energy-conserving pair (e.g.
 the mhd_divBclean psi <-> B exchange) must take BOTH operators from this
 registry; a new flavour added here inherits its conjugate difference form
-automatically. gdforce: D_ij = 1/rho_j (volume-weighted); rho2:
-D_ij = 1/rho_i (the Tricco & Price / Phantom convention).
+automatically. The weight family is the CORRPARTITION force/gradient volume
+exponent sigma_f (gasoline dFacQf): g_i = f_i / (rho_i^(2-sigma_f) rho_j^sigma_f),
+so D_ij = rho_i^(sigma_f-1) rho_j^-sigma_f. gdforce (sigma_f=1, GDSPH):
+D_ij = 1/rho_j (volume-weighted); rho2 (sigma_f=0, TSPH): D_ij = 1/rho_i (the
+Tricco & Price / Phantom convention).
 
 Future ISPH flavours additionally replace the separation vector dx by the
 matrix-corrected -(C @ dx) and weight pairs by the kernel value instead of
@@ -122,10 +125,11 @@ from .kernels import dw_wc2, w_wc2
 M_1_PI = 1.0 / np.pi
 DIVBERR_FLOOR_FRACTION = 1.0e-12
 
-# weight-family ids consumed by ig_pair/diff_weight (the force loop's axis)
+# weight families by name -> their sigma_f, the value ig_pair/diff_weight
+# consume (the force loop takes sigma_f directly, any value in [0, 1])
 FLAVOURS = {
-    'gdforce': 0,
-    'rho2': 1,
+    'gdforce': 1.0,
+    'rho2': 0.0,
 }
 
 # kernel-window mode ids: how the two smoothing-length windows combine.
@@ -139,10 +143,9 @@ FLAVOURS = {
 KMODE_AVG = 0
 KMODE_OWN = 1
 
-# full flavour registry: name -> (weight id, kernel-window mode). The force
-# loop (sph_core) implements only the avg mode today, so FLAVOURS above
-# stays its authoritative choice list; operator consumers that honour both
-# axes (e.g. mhd_divBclean, the operator family below) select from here.
+# full flavour registry: name -> (sigma_f, kernel-window mode). Operator
+# consumers that honour both axes (e.g. mhd_divBclean, the operator family
+# below) select from here; the force loop takes sigma_f + its own gradient.
 FLAVOUR_SPECS = {
     'gdforce': (FLAVOURS['gdforce'], KMODE_AVG),
     'rho2': (FLAVOURS['rho2'], KMODE_AVG),
@@ -163,13 +166,16 @@ def flavour_spec(name):
 
 
 @njit(cache=True, inline='always')
-def ig_pair(iflav, pP_i, pP_j, rho_i, rho_j):
-    """(g_i, g_j) prefactors of the flavour's SYMMETRIC gradient pair term."""
-    if iflav == 0:  # gdforce
+def ig_pair(sigf, pP_i, pP_j, rho_i, rho_j):
+    """(g_i, g_j) prefactors of the SYMMETRIC gradient pair term for weight
+    exponent sigf: g_i = pP_i / (rho_i^(2-sigf) rho_j^sigf)."""
+    if sigf == 1.0:  # gdforce
         ig = 1.0 / (rho_i * rho_j)
         return pP_i * ig, pP_j * ig
-    # rho2
-    return pP_i / (rho_i * rho_i), pP_j / (rho_j * rho_j)
+    if sigf == 0.0:  # rho2
+        return pP_i / (rho_i * rho_i), pP_j / (rho_j * rho_j)
+    return (pP_i / (rho_i ** (2.0 - sigf) * rho_j ** sigf),
+            pP_j / (rho_j ** (2.0 - sigf) * rho_i ** sigf))
 
 
 @njit(cache=True, inline='always')

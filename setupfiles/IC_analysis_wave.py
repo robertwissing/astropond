@@ -67,8 +67,8 @@ VARS = (r"$\delta\rho$", r"$\delta v_x$", r"$\delta v_y$", r"$\delta v_z$",
 # runtest.sh setup_wave() parameter order; wavetype and ampl enter the analysis.
 PARAM_SPEC = [
     Param("a", "wavetype", 0, int,
-          "eigenmode: 0 sound, 1 fast, 2 slow, 3 Alfven"),
-    Param("b", "ampl", 1e-4, float, "eigenmode amplitude"),
+          "eigenmode: 0 sound, 1 fast, 2 slow, 3 Alfven", "wt"),
+    Param("b", "ampl", 3e-2, float, "eigenmode amplitude", "a"),
 ]
 
 

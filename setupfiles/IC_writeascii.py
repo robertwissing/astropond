@@ -246,6 +246,11 @@ def convertfromcodeunits(D2,dKpcUnit,dMsolUnit,Tin,vin,Bin):
     # if dKPC 1 dMsol 1 convert all inputs kpc and msol
 
     dConstGamma = D2.gamma
+    # Some scientifically isothermal setups retain gamma=1 for their analytic
+    # equations but use a finite epsilon offset in Gasoline's internal-energy
+    # storage.  Let those setups provide that storage gamma explicitly so the
+    # temperature conversion does not erase their thermal field.
+    dTemperatureGamma = getattr(D2, 'gamma_eos', dConstGamma)
     dMeanMolWeight = D2.molweight
     dGasConst = dKpcUnit*KPCCM*KBOLTZ/(MHYDR*GCGS*dMsolUnit*MSOLG);
     print("gas and mol",dGasConst," ",dMeanMolWeight,"gamma",dConstGamma)
@@ -256,7 +261,7 @@ def convertfromcodeunits(D2,dKpcUnit,dMsolUnit,Tin,vin,Bin):
     if(Tin==0):
         duTFac = 1.0
     else:
-        duTFac = (dConstGamma - 1)*dMeanMolWeight/dGasConst
+        duTFac = (dTemperatureGamma - 1)*dMeanMolWeight/dGasConst
 
     if(vin==0):
         vFac = 1.0

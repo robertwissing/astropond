@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build POLARIS for the synchrotron export pipeline (POLARIS_EXPORT_PLAN.md M0).
+# Build POLARIS for the synchrotron export pipeline.
 #
 # DEPENDENCIES: CMake >= 3.5, a C and C++ compiler, and OpenMP. cfitsio and
 #   CCfits ship as tarballs in lib/ and are built here -- nothing external is

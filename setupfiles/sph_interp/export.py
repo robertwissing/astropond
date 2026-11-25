@@ -546,8 +546,8 @@ def to_polaris(result, path, fields, data_ids=None, units=None,
     validate : reject non-finite values (they would ray-trace to garbage rather
                than fail) -- keep on unless deliberately inspecting a bad grid.
 
-    Returns a metadata dict for the run's sidecar (`<out>.polaris.json`, §5.3 of
-    POLARIS_EXPORT_PLAN.md): cell/record counts, level range, `cube_length`, the
+    Returns a metadata dict for the run's sidecar (`<out>.polaris.json`):
+    cell/record counts, level range, `cube_length`, the
     implied `recentre_shift` (POLARIS pins the root cube to [-L/2, L/2]^3, so a
     domain that was not origin-centred is translated by this vector), the
     field/id order and the per-field min/max actually written.
@@ -666,7 +666,7 @@ def to_polaris(result, path, fields, data_ids=None, units=None,
 def read_polaris(path):
     """Read a POLARIS octree grid file back into leaf arrays (validation tool).
 
-    A deliberately independent implementation of the §1.2 format: a recursive
+    A deliberately independent implementation of the grid format: a recursive
     descent that re-derives every leaf's geometry from the tree walk alone and
     re-checks POLARIS's own invariants (8 children per internal node,
     parent.level + 1 == level, the stream ending exactly when the root closes).

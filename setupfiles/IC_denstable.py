@@ -45,8 +45,8 @@ def generate_density_table(D, dim=1, n=1000):
 
 
 def write_density_table_npz(filename, grid, densities, mapping='r_sph'):
-    """Write the SELF-DESCRIBING .npz density table (the glassgen format,
-    CLEANUP_PLAN C6): ax0..ax{dim-1} + values + the coordinate mapping in
+    """Write the SELF-DESCRIBING .npz density table (the glassgen format):
+    ax0..ax{dim-1} + values + the coordinate mapping in
     the header (1D/2D; a 3D table is (x,y,z)-indexed and carries none).
     Consumed directly by glassgen/glassrelax --table TABLE.npz - no
     --direction flag at the point of use. Layout owned by
@@ -225,7 +225,28 @@ def compute_total_mass(D, N):
         
         # Vectorized density calculation
         rho_vals = D.getrho_vec(R_vals)
-        
+
+        total_mass = np.sum(rho_vals) * dV
+        return total_mass
+
+def compute_total_mass_nonSpherical(D, N):
+        # As compute_total_mass, for a profile in x: getrho_vec takes x, not r.
+        V=D.dxbound*D.dybound*D.dzbound;
+        dV = V*(1/N)**3  # Volume per particle
+        dx=D.dxbound/N
+        dy=D.dybound/N
+        dz=D.dzbound/N
+
+        # Coordinates for particle centers
+        x = np.linspace(-D.dxbound/2 + dx/2, D.dxbound/2 - dx/2, N)
+        y = np.linspace(-D.dybound/2 + dy/2, D.dybound/2 - dy/2, N)
+        z = np.linspace(-D.dzbound/2 + dz/2, D.dzbound/2 - dz/2, N)
+
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+
+        # Vectorized density calculation
+        rho_vals = D.getrho_vec(X)
+
         total_mass = np.sum(rho_vals) * dV
         return total_mass
 

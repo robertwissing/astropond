@@ -20,7 +20,10 @@ dd = np.dtype('>d')
 
 intauxfiles = ["iord","igasorder"]
 banauxfiles = ["AHF","grid"]
-vecauxfiles = ["BField","CurlB"]
+# qcond/qconddot are the hyperbolic-conduction heat flux and its rate
+# (gasoline outtype.c OUT_QCOND_VECTOR / OUT_QCONDDOT_VECTOR); both are
+# vectors, so they must be listed here or they read back as scalars.
+vecauxfiles = ["BField","CurlB","qcond","qconddot"]
 
 
 def readtipsy(file_string,endian=1,strict=True):

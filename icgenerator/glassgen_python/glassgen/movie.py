@@ -3,8 +3,8 @@
 RelaxMovie is a relax() callback (chainable with any other): every call it
 renders the current ensemble as two scatter panels (xy and xz), coloured by
 log10(rho/rho0) - the pseudo-pressure drive - so overpressure bubbles, edge
-strays and the step-controller stall are all directly visible as they develop
-(RECONSTRUCT_PLAN.md task M1, the galaxy-hole diagnostic). finish() assembles
+strays and the step-controller stall are all directly visible as they develop.
+finish() assembles
 the frames into an mp4 with ffmpeg.
 
 Frame cadence is the relax's callback_every (the movie renders every call it
@@ -35,7 +35,7 @@ class RelaxMovie:
     clim       : colour range in DECADES of rho/rho0 (symmetric about 0).
     cmap       : matplotlib colormap for log10(rho/rho0). Default 'turbo'
                  (rainbow: blue = underdense, green = relaxed, red = over-
-                 pressure). 'coolwarm' is the old diverging render, whose
+                 pressure). 'coolwarm' is a diverging render, whose
                  midpoint reads WHITE = relaxed - on a rainbow the converged
                  state is mid-spectrum instead, so judge convergence by the
                  colourbar, not by "washes out".

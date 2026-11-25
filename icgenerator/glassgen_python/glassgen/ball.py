@@ -227,12 +227,12 @@ def _ball_scatter(orig, nt, chunk, tbuf, tcap, loc_start, indptr, indices):
 
 @njit(cache=True, parallel=True)
 def _ball_floor(pos, box, indptr, indices, h_in, nsmoothmin, hout, fail, ws):
-    """Post-gather nsmoothmin floor (the fast build path, 2026-07-11): count
+    """Post-gather nsmoothmin floor (the fast build path): count
     each row's members within 2*h_in; where short, floor h to half the
     nsmoothmin-th smallest distance WITHIN THE PADDED ROW - exact whenever
     the row holds >= nsmoothmin members (everything closer than that
     distance is inside the gather radius, so the row's k-th IS the true
-    k-th), sharper than the old 1.6-step retry overshoot. Rows whose padded
+    k-th), sharper than the 1.6-step expand-retry overshoot. Rows whose padded
     ball itself holds < nsmoothmin members are flagged (fail) - the caller
     falls back to the robust expand-retry build. ws: per-thread
     (nsmoothmin,) workspace. Positions in particle-id order, min-image."""
@@ -400,9 +400,9 @@ class BallNeighborList:
         pdisp[i] + pdisp[k] <= pdisp[i] + dmax. So a rebuild is needed iff some
         i has  pdisp[i] + dmax > slack_i = R_cached_i - 2*h_now_i.
 
-        This is strictly tighter than the old global test (2*dmax >
-        min_i slack_i): there, one fast interface mover (large dmax) coupled to
-        an unrelated small-slack particle forced a full rebuild. Pairing each
+        This is strictly tighter than the global test (2*dmax >
+        min_i slack_i), where one fast interface mover (large dmax) coupled to
+        an unrelated small-slack particle forces a full rebuild. Pairing each
         particle's own slack with its own displacement cuts the rebuild rate
         in sharp-gradient regions. Falls back to the global bound when no
         per-particle displacement array is wired (standalone use)."""
@@ -521,12 +521,12 @@ class BallNeighborList:
         self.nbuilds += 1
 
     def _fast_build(self, pos, posg, orig, box, ncell, cellptr, h_in, rcap):
-        """One-walk build (2026-07-11; phase 1 was ~45% of the rebuild and
-        the anneal rebuilds every iteration): size the gather buffers from
+        """One-walk build (the counting phase 1 is ~45% of a rebuild and the
+        anneal rebuilds every iteration): size the gather buffers from
         the PREVIOUS build's padded row counts instead of a counting
         pre-scan, gather the padded ball at 2*h_in*(1+skin) directly, and
         recover the nsmoothmin floor in an O(edges) post-pass (_ball_floor -
-        exact k-th distance, sharper than the old 1.6-step retry overshoot).
+        exact k-th distance).
         Returns (indptr, indices, hout, rfull), or None to fall back to the
         robust two-phase build (buffer overflow after a violent kick, or a
         row whose padded ball holds < nsmoothmin members - vacuum strays

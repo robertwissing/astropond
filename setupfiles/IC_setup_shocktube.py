@@ -147,8 +147,16 @@ class setup_shocktube(object):
             uuleft  = self.leftstate[1]/(gam1*self.leftstate[0])
             uuright = self.rightstate[1]/(gam1*self.rightstate[0])
          else:
-            uuleft  = 3.*self.leftstate[1]/(2.*self.rho)
-            uuright = 3.*self.rightstate[1]/(2.*self.rho)
+            # Isothermal presets: the EOS constant is polyk, i.e. P = polyk*rho
+            # = c_s^2*rho, so the state PRESSURE entry plays no part (it is dead
+            # in Phantom's table too -- #7 carries 0.006 with polyk=0.01).
+            # Gasoline's isothermal path freezes u and evaluates
+            # P/rho = (dConstGamma-1)*u, so store u in the SAME gamma -> 1
+            # convention the .param declares. (self.rho here was a per-particle
+            # list, which is neither a state density nor broadcastable: it made
+            # every gamma=1 preset raise rather than run.)
+            uuleft  = self.polyk/(self.isothermal_gamma - 1.)
+            uuright = uuleft
         
         
          for i in range(self.npart):
@@ -319,11 +327,36 @@ class setup_shocktube(object):
                 self.rightstate = [1.,1.,-10.,0.,0.,5./const,5./const, 0.]
                 #MHD discontinuity shocktube
             elif(choice==10): 
+                #--MHD discontinuity: B_x itself jumps 20/sqrt(4pi) ->
+                #  5/sqrt(4pi), so the IC carries a real div B error at x=0.
+                #  That is the point of the test -- it is the divergence
+                #  cleaning that has to remove it -- but it also means the
+                #  preset needs its OWN timing.  On the class default
+                #  (0.01 x 200 = t 2.0) the first output at t=0.1 is already
+                #  past the window in which the tube is a clean pair of Riemann
+                #  problems: with c_f = 8.03 on the strong-field side the
+                #  central fan meets its periodic image at |x| = L/4 at
+                #  t = 0.062.  Run to t = 0.05 instead, 10 outputs.
+                shocktype = "MHD discontinuity"
                 self.gamma      = 5./3.
+                self.tmax = 0.05
+                self.deltastep = 0.0005
+                self.nsteps = 100
+                self.freqout = 10
                 self.leftstate  = [1.,1.,0.,0.,0.,20./const,20./const, 0.]
                 self.rightstate = [1.,1.,0.,0.,0.,5./const,5./const, 0.]
             elif(choice==11):
+                #--strong blast (Toro test 3 variant): a 1000 -> 0.1 pressure
+                #  jump at equal density, so c_s = 37.4 on the left.  Needs its
+                #  OWN timing: on the class default (0.01 x 200 = t 2.0) every
+                #  snapshot lands long after the fan has met its periodic image
+                #  at |x| = L/4 (t = L/(2 c_s) = 0.0134), and the Courant-limited
+                #  run costs ~150x more than the test needs.
+                shocktype = "strong blast"
                 self.gamma = 1.4
+                self.tmax = 0.012
+                self.deltastep = 0.00012
+                self.nsteps = 100
                 self.leftstate  = [1.,1000.,0.,0.,0.,0.,0., 0.]
                 self.rightstate = [1.,0.1,0.,0.,0.,0.,0., 0.]
             elif(choice==12):
@@ -367,6 +400,45 @@ class setup_shocktube(object):
                 self.nsteps=100
                 self.leftstate  = [1.0,1.0,-1.0,0.,0.,0.,1.0,0.]
                 self.rightstate = [1.0,1.0, 1.0,0.,0.,0.,1.0,0.]
+            elif(choice==16 or choice==17 or choice==18):
+                #--Weak hydro shock series (B=0), uniform density with a pure
+                #  pressure jump, so shock strength is set by one number.  Fills
+                #  the gap between Sod (choice 1) and the strong blast (11):
+                #  nothing else in this list is both hydro and weak.  Used to
+                #  test whether an AV shock TRIGGER (e.g. RECON_DIVGATE, which
+                #  fires on h|div v| > K c) still detects a weak shock.
+                pratio = {16: 1.2, 17: 2.0, 18: 5.0}[choice]
+                shocktype = "weak shock p%g" % pratio
+                self.gamma      = 5./3.
+                self.deltastep  = 0.002
+                self.nsteps     = 100
+                self.leftstate  = [1.0, pratio, 0.,0.,0., 0.,0.,0.]
+                self.rightstate = [1.0, 1.0,    0.,0.,0., 0.,0.,0.]
+            elif(choice==19):
+                #--Brio-Wu (choice 6) with every B component scaled by 1e-3:
+                #  beta = 1.3e6 left, 1.3e5 right, so the field is passive and
+                #  v_A ~ 1e-3 c_s.  Tests whether the artificial resistivity
+                #  still acts on the shock and on the By sign flip at the
+                #  contact when its signal speed is the Alfven speed.
+                shocktype = "weak field Brio-Wu"
+                self.gamma      = 2.0
+                self.deltastep=0.001
+                self.nsteps=100
+                self.leftstate  = [1.000,1.0,0.,0.,0.,0.75e-3, 1.e-3,0.]
+                self.rightstate = [0.125,0.1,0.,0.,0.,0.75e-3,-1.e-3,0.]
+
+            # gamma = 1 presets (C-shock, steady shock, isothermal B98) are
+            # ISOTHERMAL: run them on Gasoline's runtime bGasIsothermal (u
+            # frozen) at gamma -> 1, which gives P = rho*c_s^2 and the
+            # isothermal signal speed -- bGasAdiabatic with dConstGamma = 1
+            # exactly would make the gas PRESSURELESS.  gamma_eos is the storage
+            # gamma for the u -> T write, for the same reason: at gamma = 1
+            # duTFac = (gamma-1)*mu/R vanishes and convertfromcodeunits would
+            # zero the thermal field on its way into the tipsy file.
+            if (np.abs(self.gamma - 1.) <= 1.e-3):
+                self.adi = 0
+                self.isothermal_gamma = 1.0000000001
+                self.gamma_eos = self.isothermal_gamma
 
             if (abs(xright)  < np.finfo(float).eps):
                   xright  = -xleft

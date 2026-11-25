@@ -2,10 +2,10 @@
 # Get the public ChaNGa code and the utilities it needs (code=1 in runtest.sh).
 #   - changa-public : N-BodyShop/ChaNGa (the simulation code)
 #   - utility       : N-BodyShop/utility (provides STRUCT_DIR for the build)
-#   - charm         : charmplusplus/charm (Charm++ runtime, built by build_changa.sh)
-# Idempotent: skips any clone whose directory already exists. To build the MHD fork
-# instead, set CHANGA_URL=https://github.com/robertwissing/changa_uw and check out
-# branch MHD_tp_replication in build_changa.sh (see its MHD NOTE).
+#   - charm         : charmplusplus/charm (Charm++ runtime; build one architecture
+#                     before invoking the content-addressed ChaNGa resolver)
+# Idempotent: skips any clone whose directory already exists. Fork capability
+# mappings belong in CHANGA_BUILD_CONFIG; the resolver never changes branches.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
@@ -18,3 +18,9 @@ echo "Getting public ChaNGa + required utilities into $here"
 [ -d changa-public ] || git clone "$CHANGA_URL" changa-public
 [ -d utility ]       || git clone "$UTIL_URL"
 [ -d charm ]         || git clone "$CHARM_URL"
+
+cat <<'EOF'
+Sources are present. If Charm++ has not been built yet, build the desired
+architecture in codes/changa/charm first. Then run build_changa.sh; its default
+profile uses changa-public, or set CHANGA_BUILD_CONFIG for a compatible fork.
+EOF

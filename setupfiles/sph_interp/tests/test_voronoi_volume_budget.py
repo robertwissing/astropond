@@ -2,11 +2,8 @@
 
 A Voronoi tessellation partitions its container, so the central cells of a
 periodic mesh must sum to exactly one box volume. `_from_points_periodic` grows
-the image shell until that closes -- but until 2026-07-28 its two failure exits
-called `warnings.warn` and handed the mesh back anyway, while the non-periodic
-`_tessellate` raised on the same budget. That asymmetry is what these tests
-remove: warnings are invisible in a batch run, which is exactly how task 3's
-+50%-per-axis error survived.
+the image shell until that closes, and its two failure exits raise, like the
+non-periodic `_tessellate` (a warning would be invisible in a batch run).
 
 The two exits are NOT the same failure and are checked separately:
   * a DEFICIT is mesher volume error (gaps between cells) -- growing the shell
@@ -44,8 +41,7 @@ def _scale_volumes(monkeypatch, factor):
 
     Perturbing the RESULT rather than the input is deliberate: it reproduces
     'the mesher handed back something that does not tile' without needing a
-    mesher bug, which is precisely the class of failure the budget exists for
-    (task 3's pad, task 13's `radii=[]`).
+    mesher bug, which is precisely the class of failure the budget exists for.
     """
     orig = VoronoiGrid._tessellate.__func__
 
@@ -98,16 +94,11 @@ def test_a_healthy_periodic_mesh_still_tiles_its_box():
                                  (1.0, 1.0, 0.09375)])        # slab2d, quasi-2D
 def test_a_high_aspect_box_closes_the_budget(box):
     """A thin box must still tile, and the shell must be able to GROW to get
-    there. Both halves of this were broken until 2026-07-29.
+    there.
 
     The thin axes here hold ~5 generator spacings, so a boundary cell's Voronoi
-    reach runs past a half-period and the old half-period ceiling could not cut
-    it -- slab1d's coarse 1500-generator mesh stuck at +2.3e-05 and closed to
-    exactly 0 only at a shell of ~L. And because the ceiling was
-    `max(min(margin, 3L), 0.5L)`, the 3x-spacing floor on a thin axis already
-    exceeded it, so `margin_max` equalled the STARTING margin: the doubling
-    loop could not take a single step before raising 'even at the maximum
-    shell'. A ceiling anchored on the period fixes both.
+    reach runs past a half-period and the budget closes only at a shell of ~L;
+    the shell ceiling is therefore anchored on the period.
     """
     L = np.asarray(box, dtype=float)
     bounds = [(-0.5 * L[a], 0.5 * L[a]) for a in range(3)]
@@ -121,8 +112,8 @@ def test_a_high_aspect_box_closes_the_budget(box):
 
 
 def test_the_non_periodic_path_is_unchanged():
-    """The open budget already raised; this pins that it still does, from the
-    same entry point, so the two paths stay symmetric."""
+    """The open budget is checked from the same entry point, so the two paths
+    stay symmetric."""
     vg = VoronoiGrid.from_points(_pts(), bounds=BOUNDS, periodic=False,
                                  backend=MESHER, periodic_background=0)
     assert float(vg.volumes().sum()) == pytest.approx(1.0, rel=1e-9)

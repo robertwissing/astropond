@@ -38,7 +38,7 @@ def _find_param(tipsy_input):
 
 
 def _param_dict(path):
-    """Thin delegate to the shared parser (CONSOLIDATION_PLAN D1).
+    """Thin delegate to the shared parser.
     Kept as a module-level name because other modules import it."""
     return read_gasoline_param(path)
 

@@ -24,9 +24,10 @@ Diagnostics (mirroring IC_analysis_alfven):
                 name, e.g. 'gresho32...' -> 32), and plot L1(v_phi) vs n_x on
                 log-log axes against the n_x^-2 line (ideal 2nd-order
                 convergence), at the first of --times.
-  energy        the kinetic energy E_kin(t) is always plotted vs time against its
-                analytic (constant) value -- it should be conserved by the steady
-                vortex; numerical dissipation shows up as a decay.
+  energy        the retained kinetic energy E_kin(t)/E_kin(0) is always plotted
+                vs time against its analytic constant value of one. It removes
+                the resolution-dependent thin-slab volume; numerical
+                dissipation shows up as a decay.
   --render      velocity streamlines (framework streamline_panels, colored by
                 |v|), a density field map, and a particle slice (scatter colored
                 by density) at the --render-times.
@@ -65,7 +66,8 @@ DEFAULT_TIMES = (1.0, 3.0)      # comparison times (~1 and ~3 turnovers at RIN)
 # only for labelling / bookkeeping; the velocity comparison is mach-independent.
 PARAM_SPEC = [
     Param("a", "mach", float(np.sqrt(3.0 / 25.0)), float,
-          "flow Mach number (sets pressure; v_phi profile is mach-independent)"),
+          "flow Mach number (sets pressure; v_phi profile is mach-independent)",
+          "mach"),
 ]
 
 
@@ -137,37 +139,40 @@ def kinetic_energy_series(inp):
 
 
 def plot_energy_vs_time(inputs, labels, save=None, ref_table=None):
-    """E_kin(t) for each run against its analytic (constant) value.
+    """E_kin(t)/E_kin(0) for each run against its constant value of one.
 
     Uses the dense '.log' Ekin series when available (see kinetic_energy_series).
-    The analytic constant is always evaluated on the run's particle set. When a
-    reference is supplied its blessed (raw) E_kin(t) is overlaid as a dashed line."""
+    Normalising each run by its own initial energy removes the extensive,
+    resolution-dependent thin-slab volume and exposes the retained vortex
+    energy directly. When a reference is supplied its blessed normalised
+    E_kin(t)/E_kin(0) is overlaid as a dashed line."""
     import matplotlib.pyplot as plt
     setup_rcparams()
     fig, ax = plt.subplots(figsize=(8, 5))
-    if ref_table is not None and "Ekin_raw" in ref_table:
-        ax.plot(ref_table["te_raw"], ref_table["Ekin_raw"], "--", color="0.35",
+    if (ref_table is not None and "x" in ref_table
+            and "Ekin" in ref_table):
+        ax.plot(ref_table["x"], ref_table["Ekin"], "--", color="0.35",
                 lw=1.5, zorder=5, label="reference")
     for inp, lab in zip(inputs, labels):
         ts, ek, source = kinetic_energy_series(inp)
         if ts is None:
             print(f"gresho: no snapshots/.log for '{inp}'", file=sys.stderr)
             continue
+        e0 = float(ek[0])
+        if not np.isfinite(e0) or e0 == 0.0:
+            print(f"gresho[{lab}]: invalid initial kinetic energy {e0}; "
+                  "skipping.", file=sys.stderr)
+            continue
+        retained = ek / e0
         style = "-" if source == "log" else "o-"   # dense log -> line
-        line, = ax.plot(ts, ek, style, ms=3, label=lab)
-        # Per-run analytic constant (depends on the thin-slab volume / resolution);
-        # needs a snapshot's particle set, so skip it if only the .log is present.
-        try:
-            files = find_files(inp)
-        except FileNotFoundError:
-            files = []
-        if files:
-            e_an = analytic_kinetic_energy(files[0])
-            ax.axhline(e_an, color=line.get_color(), ls="--", lw=1.0, alpha=0.7)
+        ax.plot(ts, retained, style, ms=3, label=lab)
+        print(f"gresho[{lab}]: E_kin(0)={e0:.6g}  "
+              f"E_kin({ts[-1]:.4g})/E_kin(0)={retained[-1]:.6g}")
+    ax.axhline(1.0, color="k", ls="--", lw=1.2,
+               label="analytic steady state")
     ax.set_xlabel("t")
-    ax.set_ylabel(r"$E_{kin}=\sum\frac{1}{2} m_i|v_i|^2$")
-    ax.set_title("Gresho vortex kinetic energy vs time "
-                 "(dashed = analytic constant)")
+    ax.set_ylabel(r"$E_{kin}(t)/E_{kin}(0)$")
+    ax.set_title("Gresho vortex kinetic-energy retention")
     fig.tight_layout()
     finish_figure_with_legend(fig, ax,
                               save=(f"{save}_energy.png" if save else None))
@@ -308,9 +313,18 @@ def plot_convergence(inputs, t, save=None, ref_table=None):
     setup_rcparams()
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.loglog(nxs, l1s, "o-", label=r"$L_1(v_\phi)$")
+    # Best-fit measured exponent, L1 = C n_x^p, reported in the legend.
+    good = np.isfinite(nxs) & (nxs > 0) & np.isfinite(l1s) & (l1s > 0)
+    if np.unique(nxs[good]).size >= 2:
+        p, log_c = np.polyfit(np.log(nxs[good]), np.log(l1s[good]), 1)
+        fit = np.exp(log_c) * nxs ** p
+        ax.loglog(nxs, fit, ":", color="C0", lw=1.8,
+                  label=rf"fit: $L_1\propto n_x^p$, $p={p:.2f}$")
+        print(f"gresho: fitted convergence exponent p={p:.6g} "
+              "for L1(v_phi) proportional to n_x^p")
     # Ideal 2nd-order reference, anchored at the coarsest resolution.
     ref = l1s[0] * (nxs / nxs[0]) ** (-2.0)
-    ax.loglog(nxs, ref, "k--", label=r"$\propto n_x^{-2}$")
+    ax.loglog(nxs, ref, "k--", label=r"ideal: $\propto n_x^{-2}$")
     # Blessed-baseline L1 point at its own resolution (if available).
     if (ref_table is not None and "n_x" in ref_table
             and "L1_vphi" in ref_table):
@@ -332,10 +346,9 @@ def reference_table(inp, t=None):
     """Multi-block regression table feeding ALL of gresho's non-render plots:
 
       gate / energy   x        : time grid
-                      Ekin     : E_kin(t)/E_kin(0)  (normalised, the gate key --
-                                 resolution-independent dissipation probe)
-                      te_raw   : time grid (the raw-axis energy plot's x)
-                      Ekin_raw : E_kin(t)           (raw, for the energy overlay)
+                      Ekin     : E_kin(t)/E_kin(0)  (normalised, the gate key
+                                 and plotted resolution-independent
+                                 dissipation probe)
       profile         r_prof   : r_cyl bin centres
                       v_phi    : binned v_phi(r) at the comparison time
                       L1_vphi  : volume-weighted L1 vs analytic (1-elt array)
@@ -348,7 +361,7 @@ def reference_table(inp, t=None):
     table = {}
     ts, ek, _src = kinetic_energy_series(inp)
     if ts is not None and np.isfinite(ek[0]) and ek[0] != 0:
-        table.update({"x": ts, "Ekin": ek / ek[0], "te_raw": ts, "Ekin_raw": ek})
+        table.update({"x": ts, "Ekin": ek / ek[0]})
     # Profile block (steady vortex -> blessed at the comparison time t).
     sel = select_at_time(inp, t)
     if sel is not None:

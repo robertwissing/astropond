@@ -68,7 +68,9 @@ DEFAULT_RENDER_TIMES_3D = [0.25, 0.5, 1.0, 2.5]   # default panel times (3-D)
 # slab-average renders + render-time defaults); the viscosities are carried for
 # CLI parity.
 PARAM_SPEC = [
-    Param("a", "dim3", 0.0, float, "0: 2-D slab, 1: true 3-D vortex (Helzel et al. 2011)"),
+    Param("a", "dim3", 0.0, float,
+          "0: 2-D slab, 1: true 3-D vortex (Helzel et al. 2011)",
+          {"_3d": 1.0}),
 ]
 
 
@@ -268,8 +270,9 @@ def _y0_for_time(t, override):
 
 def do_y0_cut(inputs, labels, args, save, bless=False):
     """1-D horizontal cuts of rho, Bx, By, div B vs x along y=y0, at each render
-    time (default y0 = centre, 0.3125 at t=0.5). Delegates to the framework's
-    generic `horizontal_cut`; --reference overlays the blessed cut baseline."""
+    time (default y0 = centre, 0.3125 at t=0.5). Particle samples and binned
+    curves are written as separate figures; --reference is confined to the
+    binned-curve figure. Delegates to the framework's generic `horizontal_cut`."""
     times = args.render_times if args.render_times else DEFAULT_RENDER_TIMES
     if not bless:                       # drop times with no snapshot (short runs)
         miss = set(missing_render_times(inputs[0], times))
@@ -277,7 +280,8 @@ def do_y0_cut(inputs, labels, args, save, bless=False):
     horizontal_cut(inputs, labels, mhd_field_cut_quants(), times,
                    lambda t: _y0_for_time(t, args.y0), save=save,
                    title_prefix="Orszag-Tang ",
-                   reference=args.reference, bless=bless)
+                   reference=args.reference, bless=bless,
+                   separate_lines=True)
 
 
 # --------------------------------------------------------------------------- #

@@ -98,7 +98,10 @@ class setup_evrard(object):
             
          self.npart=len(self.x)
          self.ngas=self.npart
-         if distri==1:
+         # Pre-glass only: integrate the total mass and export the relaxer's
+         # density table.  A placed IC (lattice/rand/glass) takes the exact
+         # analytic mass below instead.
+         if self.preglass:
              totmass = denstable.compute_total_mass(self,512)
              print("Numerically integrated mass(512**3) " , totmass)
              # Generate 1D radial density table
@@ -109,6 +112,13 @@ class setup_evrard(object):
              # self-describing npz: r_sph mapping in the table header
              # (glassgen: --table densitytable.npz)
              denstable.write_density_table_npz("densitytable.npz",gridtab,rhotab,mapping='r_sph')
+             # Force-matched relax table (glassgen --force-table, relax.config GLASS_FORCEMATCH):
+             # every particle starts at u0 (closure 1), P_t = (gamma-1) u0 rho_t and
+             # g = grad P_t/rho_t = -(gamma-1) u0/(r+eps). Not gravity: the collapse IC is not in
+             # equilibrium, g is the acceleration that holds the target.
+             r_t, rho_t = gridtab[0], np.asarray(rhotab, dtype=float)
+             np.savez("forcetable.npz", r=r_t, P=gam1*uzero*rho_t, g=-gam1*uzero/(r_t+self.eps),
+                      rho=rho_t, closure=1.0)
          else:
              totmass = self.M
              

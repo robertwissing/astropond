@@ -12,10 +12,7 @@ populated level (levels tried in descending leaf count), with trilinear
 Built from an sph_interp AMRGrid via `from_grid` (duck-typed - only reads
 `lo/hi/cell_level/base_npx/cell_lo/cell_size/periodic/ncell`), and round-trips
 through .npz with `save()`/`load()` WITHOUT sph_interp installed.
-
-Moved here from `reconstruct.py` so glassgen owns the relax-target lookup
-structure (the envelope port); `reconstruct.py` re-exports `AMRTable` for
-backwards compatibility.
+`reconstruct.py` re-exports `AMRTable`.
 """
 import json
 
@@ -76,7 +73,7 @@ def _lvl_lookup(tx, ty, tz, lv, dims, aoffsets, akeys, avals):
     coarser (walk lv..0 over the augmented blocks, first hit wins). This is
     what the trilinear stencil nodes must read: point-sampling a much finer
     leaf from inside a coarse cell stretches a point value across the whole
-    coarse width (the 2026-07-11 galaxy z-sheet bleed, 3+ decades).
+    coarse width (a bleed of 3+ decades off a thin disk).
     Returns (value, found)."""
     for l in range(lv, -1, -1):
         a = aoffsets[l]
@@ -136,7 +133,7 @@ def _amr_readout(tx, ty, tz, periodic, dims, offsets, keys, vals, order,
     flat_value is the containing leaf's own cell average - the occupancy
     decision must use THAT (a linear readout inside a truly-empty coarse
     cell ramps toward a dense neighbour's average and fabricates target
-    density over the whole coarse width - the 2026-07-11 galaxy z-sheet).
+    density over the whole coarse width).
     Shared by the plain table query and the fused padded-target query
     (envelope._padded_amr_query). Stencil nodes are read LEVEL-CONSISTENTLY
     (:func:`_lvl_lookup` on the augmented restricted blocks aoffsets/akeys/
@@ -146,8 +143,7 @@ def _amr_readout(tx, ty, tz, periodic, dims, offsets, keys, vals, order,
     (trilinear at the containing level), 2 = limited (MUSCL: cell average
     + per-axis minmod-limited slope from the 6 face neighbours, result
     clamped to the neighbour range - linear-exact in smooth regions,
-    flat at sharp jumps, never ramps above a bright neighbour: the cheap
-    monotone option of plan task M13)."""
+    flat at sharp jumps, never ramps above a bright neighbour)."""
     v, lv = _pwc_lookup(tx, ty, tz, dims, offsets, keys, vals, order)
     if lv < 0 or interp == 0:
         return v, v, lv
@@ -251,12 +247,11 @@ def _amr_query(pos, lo, box, periodic, dims, offsets, keys, vals, order,
     of the containing level's virtual uniform grid, each read
     LEVEL-CONSISTENTLY: the level's own leaf, the restricted average where
     the node's region is refined finer, or the covering coarser leaf
-    (2026-07-11 fix - point-sampling a finer leaf from a coarse cell
-    smeared refined disk densities decades above the coarse cell's true
-    average across its whole width: the galaxy z-sheet artifact). Inside a
-    uniform-level region this is exactly trilinear-on-cell-centres and
-    unchanged; across level jumps it interpolates between same-scale
-    averages. interp=2 (limited): MUSCL cell-average + minmod slopes (see
+    (point-sampling a finer leaf from a coarse cell would smear refined
+    densities decades above the coarse cell's true average across its
+    whole width). Inside a uniform-level region this is exactly
+    trilinear-on-cell-centres; across level jumps it interpolates between
+    same-scale averages. interp=2 (limited): MUSCL cell-average + minmod slopes (see
     _amr_readout). Returns the number of misses."""
     n = pos.shape[0]
     nmiss = 0
@@ -356,7 +351,7 @@ def _corner_tri(tx, ty, tz, idx, lv, dims, corners):
 @njit(cache=True, parallel=True)
 def _vertex_query(pos, lo, box, periodic, dims, offsets, keys, order,
                   corners, out):
-    """Conforming corner-trilinear readout ('vertex', plan M13 route a):
+    """Conforming corner-trilinear readout ('vertex'):
     locate the containing leaf, trilinear-blend its 8 CORNER values (corner
     k = a + 2b + 4c at offsets (a,b,c)) at the local cell coordinate.
     Corner values are built once with hanging vertices SLAVED to the coarse
@@ -379,6 +374,45 @@ def _vertex_query(pos, lo, box, periodic, dims, offsets, keys, order,
             nmiss += 1
             continue
         out[p] = _corner_tri(tx, ty, tz, idx, lv, dims, corners)
+    return nmiss
+
+
+@njit(cache=True, parallel=True)
+def _amr_stencil(pos, sup, offs, wts, lo, box, periodic, dims, offsets, keys,
+                 vals, order, interp, aoffsets, akeys, avals, corners, out):
+    """Kernel-matched readout ``sum_q w_q * table(x_i + sup_i * u_q)`` in one
+    pass, each stencil point read exactly as _amr_query / _vertex_query
+    (interp 3) read it. Returns the number of particles with a missed point."""
+    n = pos.shape[0]
+    nmiss = 0
+    for p in prange(n):
+        acc = 0.0
+        bad = False
+        for q in range(offs.shape[0]):
+            tx = (pos[p, 0] + sup[p] * offs[q, 0] - lo[0]) / box[0]
+            ty = (pos[p, 1] + sup[p] * offs[q, 1] - lo[1]) / box[1]
+            tz = (pos[p, 2] + sup[p] * offs[q, 2] - lo[2]) / box[2]
+            if periodic:
+                tx -= np.floor(tx)
+                ty -= np.floor(ty)
+                tz -= np.floor(tz)
+            if interp == 3:
+                idx, lv = _pwc_index(tx, ty, tz, dims, offsets, keys, order)
+                if idx < 0:
+                    bad = True
+                    continue
+                v = _corner_tri(tx, ty, tz, idx, lv, dims, corners)
+            else:
+                v, _, lv = _amr_readout(tx, ty, tz, periodic, dims, offsets,
+                                        keys, vals, order, interp, aoffsets,
+                                        akeys, avals)
+                if lv < 0:
+                    bad = True
+                    continue
+            acc += wts[q] * v
+        out[p] = acc
+        if bad:
+            nmiss += 1
     return nmiss
 
 
@@ -428,22 +462,15 @@ class AMRTable(DensityField):
     domain (lo, box) and per-level grid dims. A point query costs one
     binary search per populated level (levels tried in descending
     leaf-count order). Readout `interp`:
-      'linear' (default) - trilinear blend at the containing leaf's
-          resolution, stencil nodes read LEVEL-CONSISTENTLY (leaf,
-          restricted average of finer refinement, or covering coarser
-          leaf - never a point sample of a finer leaf): continuous inside
-          uniform-level regions, no zeroth-order steps fed to the relax
-          force at cell faces, no level-jump bleed (2026-07-11).
-      'flat'   - the containing leaf's value (true piecewise-constant).
-      'limited' - MUSCL slope-limited (2026-07-13, plan M13): cell average
+      'limited' (default) - MUSCL slope-limited: cell average
           + per-axis minmod slope from the 6 face neighbours (level-
           consistent), clamped to the neighbour range. Exact on smooth
-          linear fields like 'linear', but NEVER ramps toward a bright
-          neighbour inside a faint cell (the graded z-line sawtooth lobes)
-          - flat-like at sharp jumps. Still discontinuous at level faces
-          (the basis switch; true continuity = 'vertex').
-      'vertex' - conforming corner-trilinear (2026-07-13, plan M13 route
-          a): the cell field is promoted ONCE to per-leaf CORNER values
+          linear fields, but NEVER ramps toward a bright neighbour inside
+          a faint cell (the graded z-line sawtooth lobes) - flat-like at
+          sharp jumps. Still discontinuous at level faces (the basis
+          switch; true continuity = 'vertex').
+      'flat'   - the containing leaf's value (true piecewise-constant).
+      'vertex' - conforming corner-trilinear: the cell field is promoted ONCE to per-leaf CORNER values
           (mean of the leaves sharing each vertex), hanging vertices (fine
           corners on a coarser face/edge) SLAVED to the coarse cell's own
           interpolant at that position - both sides of every face restrict
@@ -452,6 +479,10 @@ class AMRTable(DensityField):
           corner mean next to a bright cell lifts the faint side ~1 cell;
           combine judgment with 'limited' if lobes matter more than
           continuity). Corner table built lazily on first query.
+      'linear' - trilinear blend with level-consistent stencil nodes; it
+          overshoots across level jumps, so a constructor request is
+          mapped to 'limited' with a warning (diagnostics may still set
+          .interp='linear' directly).
     Built from an sph_interp AMRGrid via `from_grid`; round-trips through
     .npz with save()/load() so a table can be captured once and reused
     without sph_interp installed."""
@@ -459,7 +490,7 @@ class AMRTable(DensityField):
     _INTERP_CODE = {'flat': 0, 'linear': 1, 'limited': 2, 'vertex': 3}
 
     def __init__(self, lo, box, dims, offsets, keys, vals, order, periodic,
-                 interp='linear'):
+                 interp='limited'):
         self.lo = np.ascontiguousarray(lo, dtype=np.float64)
         self.box = np.ascontiguousarray(box, dtype=np.float64)
         self.dims = np.ascontiguousarray(dims, dtype=np.int64)
@@ -469,13 +500,10 @@ class AMRTable(DensityField):
         self.order = np.ascontiguousarray(order, dtype=np.int64)
         self.periodic = bool(periodic)
         if interp == 'linear':
-            # RETIRED 2026-07-13 (user): trilinear overshoots across level
-            # jumps (detached lobes 1-3 decades above truth on thin-disk
-            # flanks - the bumps_flat_vs_vertex probe); 'limited' is the
-            # same stencil with minmod slopes (== linear in smooth regions,
-            # flat at jumps). The trilinear code stays as the internal
-            # substrate (limited/vertex build on it; diagnostics may set
-            # .interp='linear' directly).
+            # trilinear overshoots across level jumps (lobes 1-3 decades
+            # above truth on thin-disk flanks); 'limited' is the same stencil
+            # with minmod slopes. The trilinear code remains the substrate of
+            # limited/vertex; diagnostics may set .interp='linear' directly.
             import warnings
             warnings.warn("interp='linear' is retired (level-jump overshoot"
                           " lobes); using 'limited'", stacklevel=2)
@@ -650,6 +678,22 @@ class AMRTable(DensityField):
                              'by the AMR table (leaf set not space-filling?)')
         return out
 
+    def rho0_stencil(self, pos, support, offsets, weights):
+        """Fused kernel-matched readout (density.KernelMatchedDensity)."""
+        pos = np.ascontiguousarray(pos, dtype=np.float64)
+        corners = (self._corner_table() if self.interp == 'vertex'
+                   else np.zeros((1, 8)))
+        out = np.empty(len(pos))
+        nmiss = _amr_stencil(pos, np.ascontiguousarray(support, dtype=np.float64),
+                             offsets, weights, self.lo, self.box, self.periodic,
+                             self.dims, self.offsets, self.keys, self.vals,
+                             self.order, self._INTERP_CODE[self.interp],
+                             self.aoffsets, self.akeys, self.avals, corners, out)
+        if nmiss:
+            raise ValueError(f'{nmiss}/{len(pos)} stencil points not covered '
+                             'by the AMR table (leaf set not space-filling?)')
+        return out
+
     __call__ = rho0
 
     def save(self, path):
@@ -668,8 +712,8 @@ class AMRTable(DensityField):
     def load(cls, path):
         d = np.load(path)
         interp = str(d['interp'][0]) if 'interp' in d.files else 'limited'
-        if interp == 'linear':                # pre-retirement save:
-            interp = 'limited'                # remap quietly, no warning
+        if interp == 'linear':                # a saved 'linear' table loads
+            interp = 'limited'                # as 'limited', no warning
         out = cls(d['lo'], d['box'], d['dims'], d['offsets'], d['keys'],
                   d['vals'], d['order'], bool(d['periodic'][0]),
                   interp=interp)

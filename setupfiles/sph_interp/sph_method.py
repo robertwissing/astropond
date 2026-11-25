@@ -839,7 +839,7 @@ def scatter_to_points(pos, h, mass, values, gen, gen_vol=None, hmin=None,
 
     (`interpolate_voronoi_scatter`'s mass-weighted cell average is
     content/recv_mass; a conservative IC transfer divides content by the
-    OUTPUT particle mass instead — RECONSTRUCT_PLAN M22 / plan item 10.)
+    OUTPUT particle mass instead.)
 
     pos, h, mass : donors (h = SPH smoothing length, support = RADKERNEL*h).
     values       : dict name -> (N,) or (N,ncomp) donor fields.

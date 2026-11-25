@@ -13,10 +13,11 @@ smoothing-length modes and the symmetric vs one-sided force walk.
 Every case is driven through the REAL test-suite pipeline rather than a synth
 box or a committed pre-IC file:
 
-  1. front end - the `rand` pre-IC is generated on demand with the runtest.sh
-     contract `IC_createsetup.py <test> <nx> <vm> 1 <out> [extra]`, into a work
-     dir (default <pkg>/_pipeline). If the pre-IC already exists it is reused
-     (no regeneration), mirroring runtest.sh's "Skipping creation".
+  1. front end - the random pre-glass IC is generated on demand with the
+     runtest.sh contract `IC_createsetup.py <test> <nx> <vm> preglass <out>
+     [extra]`, into a work dir (default <pkg>/_pipeline). If the pre-IC already
+     exists it is reused (no regeneration), mirroring runtest.sh's "Skipping
+     creation".
   2. relax  - glassgen relaxes it; box + target density come straight from the
      generated .param's dICdens*/dPeriod fields (port of pkdUpdateDensity
      profiles 1/2/3) - no analytic profiles hardcoded.
@@ -77,9 +78,8 @@ CASES = {
     'shocktube256':  dict(test='shocktube',   nx=256),
     # uniform current-sheet box (profile 1)
     'currentsheet64':dict(test='currentsheet',nx=64),
-    # accdisk (profile 7, disk, dir=5 r_cyl) is the hardest case but its target
-    # is not yet ported - see PLAN.md "Future tasks" (needs a density table
-    # generated in setupfiles). Enable here once that lands:
+    # accdisk (profile 7, disk, dir=5 r_cyl): its target is not ported (needs a
+    # density table generated in setupfiles), so the case is disabled:
     # 'accdisk64': dict(test='accdisk', nx=64, extra=['0.1']),
 }
 
@@ -131,15 +131,19 @@ def _ensure_workdir(workdir):
 
 
 def gen_pre_ic(test, nx, vm, extra, workdir, force=False):
-    """Generate (or reuse) a `rand` pre-IC via the runtest.sh IC_createsetup
-    contract. Returns (pre_path, param_path), both absolute.
+    """Generate (or reuse) the random pre-glass IC via the runtest.sh
+    IC_createsetup contract. Returns (pre_path, param_path), both absolute.
+
+    entry="preglass" (not "1"): the .param must carry the dICdens* target
+    profile this module reads back with target_from_param, which a plain `rand`
+    IC -- a runnable IC in its own right -- does not write.
 
     If datafiles/<prefile>.00000 already exists and not `force`, it is reused
     (no regeneration) - same test/nx/extra always maps to the same file."""
     nx = int(nx)
     extra = [str(e) for e in (extra or [])]
     df = _ensure_workdir(workdir)
-    prefile = f'{test}{nx}_rand'
+    prefile = f'{test}{nx}_preglass'
     if extra:
         prefile += '_' + _slug(extra)
     pre = os.path.join(df, prefile + '.00000')
@@ -147,7 +151,7 @@ def gen_pre_ic(test, nx, vm, extra, workdir, force=False):
     if os.path.exists(pre) and not force:
         print(f'  reusing pre-IC {os.path.relpath(pre, workdir)}', flush=True)
         return pre, param
-    cmd = [sys.executable, _CREATESETUP, test, str(nx), str(vm), '1',
+    cmd = [sys.executable, _CREATESETUP, test, str(nx), str(vm), 'preglass',
            prefile, *extra]
     env = dict(os.environ, PYTHONPATH=_SETUPFILES)
     print(f'  IC_createsetup: {" ".join(cmd[2:])}', flush=True)
@@ -312,7 +316,7 @@ def plot_run(res, target, param, box, path, title=None, show=True):
     from IC_analysis_framework import binned_profile
 
     # Pick an INTERACTIVE backend when a display is available so plt.show() opens
-    # a window (the user asked for it); fall back to the always-available Agg
+    # a window; fall back to the always-available Agg
     # (save-only) on a headless node. switch_backend actually imports the
     # backend, so a missing GUI toolkit (e.g. no Qt/Tk bindings) is caught here.
     can_show = show
@@ -408,7 +412,7 @@ def load_case(name, spec, workdir, gen_nx=None, gen_vm=0.0, force_gen=False):
 
 
 def accuracy(res, mass, box, target, nsmooth, flavour='gdforce', nsmoothmin=32,
-             rhopow=2.0):
+             rhopow=2.0, sigma_f=1.0, gradient='onesided-isph'):
     """Density error + residual force + the operator consistency hierarchy on
     the final glass, measured CONSISTENTLY with the variant.
 
@@ -440,7 +444,7 @@ def accuracy(res, mass, box, target, nsmooth, flavour='gdforce', nsmoothmin=32,
     rho0 = target(pos)
     err = np.abs(1.0 - rho / rho0)
     force = residual_force(pos, mass, h, rho, rho0, box, rhopow=rhopow,
-                           nsmooth=nsmooth, flavour=flavour,
+                           nsmooth=nsmooth, sigma_f=sigma_f, gradient=gradient,
                            nsmoothmin=nsmoothmin)
     q0, q1, e0, e1 = operator_consistency(
         pos, mass, h, rho, box, nsmooth=nsmooth, flavour=flavour,

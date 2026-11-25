@@ -23,6 +23,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 
 import numpy as np
@@ -42,13 +43,23 @@ from IC_analysis_general import (
 GAMMA = 5.0 / 3.0               # IC_setup_noh.gamma
 DEFAULT_TIME = 0.6             # end time = nsteps*deltastep (shock at R=v0 t/3)
 
+
+def _inflow_speed_from_runname(run_name):
+    """Decode runtest's signed ``v`` tag as the positive Noh speed."""
+    match = re.search(r"v([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+                      run_name)
+    return abs(float(match.group(1))) if match else None
+
 # runtest.sh setup_noh() parameter order (runtest.sh:743-761). `is3d` and `v0`
 # set the analytic solution; `pini` is the (tiny) ambient pressure; the rest are
 # carried for CLI/label parity.
 PARAM_SPEC = [
-    Param("a", "is3d", 1, int, "3D spherical (1) vs 2D cylindrical (0) geometry"),
-    Param("b", "pini", 1e-6, float, "initial (tiny) pressure -> cold gas"),
-    Param("c", "v0", 1.0, float, "radial inflow speed"),
+    Param("a", "is3d", 1, int,
+          "3D spherical (1) vs 2D cylindrical (0) geometry", "d3"),
+    Param("b", "pini", 1e-6, float,
+          "initial (tiny) pressure -> cold gas", "p"),
+    Param("c", "v0", 1.0, float,
+          "radial inflow speed", _inflow_speed_from_runname),
 ]
 
 

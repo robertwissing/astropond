@@ -15,8 +15,8 @@ patch read it. The SAME file drives a uniform run (levelmin=levelmax) or an AMR 
   input    tipsy snapshot (datafiles/run.00000).
   rundir   RAMSES run dir; writes <rundir>/ic_gridic.bin and <rundir>/run.nml.
 
-Run times/gamma come from the gasoline .param beside the input. Cubic boxes only
-(first cut). MHD: a genuinely NONZERO BField aux switches to the MHD GridIC
+Run times/gamma come from the gasoline .param beside the input. Cubic boxes only.
+MHD: a genuinely NONZERO BField aux switches to the MHD GridIC
 (6 div-free face-B components) + an hlld MHD namelist for ramses3d_mhd (built
 with the suite_mhd condinit patch); an all-zero BField aux (e.g. sedov) stays
 on the hydro path.
@@ -34,7 +34,7 @@ from ICconvert_common import find_sibling_param, read_gasoline_param, has_nonzer
 
 
 def _param(path):
-    """Thin delegate to the shared parser (CONSOLIDATION_PLAN D1).
+    """Thin delegate to the shared parser.
     Kept as a module-level name because other modules import it."""
     return read_gasoline_param(path)
 
@@ -158,7 +158,7 @@ def main(argv=None):
 
     # RAMSES's base grid is a 2^levelmin CUBE: a non-cubic suite box (kh/orzag
     # slabs) cannot be represented — depositing it into a cubic GridIC would
-    # silently produce wrong ICs. Fail loudly instead (see GRID_CODES_PLAN.md).
+    # silently produce wrong ICs. Fail loudly instead.
     dy = _f(gas, "dyPeriod", boxlen)
     dz = _f(gas, "dzPeriod", boxlen)
     if abs(dy - boxlen) > 1e-12 * boxlen or abs(dz - boxlen) > 1e-12 * boxlen:

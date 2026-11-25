@@ -20,7 +20,9 @@ Two modes:
                 resolutions (n_x = the '<test><nx>' number in the run-folder
                 name, e.g. 'alfven32...' -> 32), and
                 plot L1(B_orth) and L1(v_orth) vs n_x on log-log axes against
-                the n_x^-2 line (ideal 2nd-order convergence).
+                the n_x^-2 line (ideal 2nd-order convergence). A second figure
+                separates the fundamental-mode amplitude and wrapped phase
+                errors, which the endpoint L1 norm mixes together.
 
 Usage:
     python IC_analysis_alfven.py <run-dir> [-a 1] [--time 5] [--save out]
@@ -62,7 +64,8 @@ DEFAULT_TIME = 5.0              # compare at 5 wave periods by default
 
 # -a matches runtest.sh setup_alfven() (runtest.sh:197) with the same default.
 PARAM_SPEC = [
-    Param("a", "rotate", 1, int, "rotated (1) vs cartesian (0) wave geometry"),
+    Param("a", "rotate", 1, int,
+          "rotated (1) vs cartesian (0) wave geometry", "rot"),
 ]
 
 
@@ -88,8 +91,13 @@ def analytic_orth(x_par, t, xdot0):
     return AMPL * np.sin(WK * ((x_par - xdot0) - VWAVE * t))
 
 
-def profile(fn, rotate):
-    """Per-particle (x_par, B_orth, v_orth) and the snapshot time for run file fn."""
+def profile(fn, rotate, with_volume=False):
+    """Per-particle wave fields and time for run file ``fn``.
+
+    ``with_volume=True`` inserts the physical-volume weights before the time in
+    the returned tuple; the default preserves the analysis helper's historical
+    five-value return contract.
+    """
     runit, e_perp, xdot0 = geometry(rotate)
     tgdata, _td, _ts, _hdr, time, _N, ngas, _nd, _ns, _h = loaddata(fn)
     pos = tgdata[:, 1:4]
@@ -103,12 +111,59 @@ def profile(fn, rotate):
         B_orth = np.full(len(x_par), np.nan)
     else:
         B_orth = np.asarray(B, dtype=float) @ e_perp
-    return x_par, B_orth, v_orth, float(np.asarray(time).ravel()[0]), xdot0
+    volume = tgdata[:, 0] / tgdata[:, 7]
+    snapshot_time = float(np.asarray(time).ravel()[0])
+    if with_volume:
+        return x_par, B_orth, v_orth, volume, snapshot_time, xdot0
+    return x_par, B_orth, v_orth, snapshot_time, xdot0
 
 
 def l1_error(x_par, B_orth, t, xdot0):
     """L1 error of B_orth: mean per-particle |B_orth_sim - B_orth_analytic|."""
     return float(np.mean(np.abs(B_orth - analytic_orth(x_par, t, xdot0))))
+
+
+def fundamental_mode(x_par, values, volume, xdot0):
+    """Volume-weighted complex coefficient of the spatial fundamental.
+
+    Fits ``offset + A_c cos(theta) + A_s sin(theta)`` with
+    ``theta = k (x_par - xdot0)`` and returns ``A_c - i A_s``.  Including an
+    offset and solving the weighted least-squares problem makes the coefficient
+    insensitive to the imperfect sine/cosine orthogonality of a finite glass.
+    """
+    x_par = np.asarray(x_par, dtype=float)
+    values = np.asarray(values, dtype=float)
+    volume = np.asarray(volume, dtype=float)
+    good = (np.isfinite(x_par) & np.isfinite(values) & np.isfinite(volume)
+            & (volume > 0.0))
+    if np.count_nonzero(good) < 3:
+        return complex(np.nan, np.nan)
+
+    theta = WK * (x_par[good] - xdot0)
+    design = np.column_stack((np.ones(theta.size),
+                              np.cos(theta), np.sin(theta)))
+    root_weight = np.sqrt(volume[good])
+    coeff, _resid, rank, _singular = np.linalg.lstsq(
+        design * root_weight[:, None], values[good] * root_weight, rcond=None)
+    if rank < 3:
+        return complex(np.nan, np.nan)
+    return complex(coeff[1], -coeff[2])
+
+
+def mode_diagnostics(x_par, values, volume, t, xdot0):
+    """Return ``(A/A_exact, wrapped phase error)`` for one wave field.
+
+    The signed phase error is in ``[-pi, pi]``.  For the analytic profile
+    ``AMPL sin(k(x_par-xdot0-v_wave*t))``, the matching complex coefficient is
+    ``-i AMPL exp(-i k v_wave t)``.
+    """
+    measured = fundamental_mode(x_par, values, volume, xdot0)
+    if not (np.isfinite(measured.real) and np.isfinite(measured.imag)):
+        return np.nan, np.nan
+    expected = -1j * AMPL * np.exp(-1j * WK * VWAVE * t)
+    amplitude_ratio = abs(measured) / abs(expected)
+    phase_error = float(np.angle(measured / expected))
+    return float(amplitude_ratio), phase_error
 
 
 # --------------------------------------------------------------------------- #
@@ -214,18 +269,14 @@ def plot_profiles(inputs, labels, rotate, t, save=None, ref_table=None):
         x_par, B_orth, v_orth, _time, xdot0 = profile(fn, rotate)
         xpar_all.append(x_par)
         color = f"C{i % 10}"
-        # Faint scatter (behind) + the run's binned-mean line highlighted on top.
+        # Direct particle samples only. The former per-run binned mean obscured
+        # the particle distribution and added no information beyond the exact
+        # wave/reference curves drawn below. Binning remains part of the saved
+        # regression baseline, but is not drawn through these particles.
         axB.scatter(x_par, B_orth, s=3, alpha=0.12, color=color, rasterized=True,
                     zorder=1, label=f"{lab} (t={tt:.3g})")
         axv.scatter(x_par, v_orth, s=3, alpha=0.12, color=color, rasterized=True,
                     zorder=1, label=f"{lab} (t={tt:.3g})")
-        # Binned-mean curve of THIS run (same binning used for the reference);
-        # bin count tracks the run's own resolution (reg_nbins ~ n_x).
-        cx, Bb, vb = _binned_profile(x_par, B_orth, v_orth,
-                                     nbins=reg_nbins(inp))
-        if cx is not None:
-            axB.plot(cx, Bb, "-", color=color, lw=1.8, zorder=4)
-            axv.plot(cx, vb, "-", color=color, lw=1.8, zorder=4)
         l1B = l1_error(x_par, B_orth, tt, xdot0)
         l1v = l1_error(x_par, v_orth, tt, xdot0)
         print(f"alfven[{lab}]: t={tt:.4g}  "
@@ -270,12 +321,13 @@ def plot_profiles(inputs, labels, rotate, t, save=None, ref_table=None):
 
 
 # --------------------------------------------------------------------------- #
-#  Convergence mode: L1(B_orth) vs resolution, against n_x^-2
+#  Convergence mode: endpoint L1 plus separated amplitude/phase errors
 # --------------------------------------------------------------------------- #
 
 def plot_convergence(inputs, rotate, t, save=None, ref_table=None):
     import matplotlib.pyplot as plt
     nxs, l1Bs, l1vs = [], [], []
+    ampB_ratios, ampv_ratios, phaseBs, phasevs = [], [], [], []
     for inp in inputs:
         nx = parse_resolution(inp)
         if nx is None:
@@ -286,14 +338,28 @@ def plot_convergence(inputs, rotate, t, save=None, ref_table=None):
         if sel is None:
             continue
         fn, tt = sel
-        x_par, B_orth, v_orth, _time, xdot0 = profile(fn, rotate)
+        x_par, B_orth, v_orth, volume, _time, xdot0 = profile(
+            fn, rotate, with_volume=True)
         l1B = l1_error(x_par, B_orth, tt, xdot0)
         l1v = l1_error(x_par, v_orth, tt, xdot0)
+        ampB_ratio, phaseB = mode_diagnostics(
+            x_par, B_orth, volume, tt, xdot0)
+        ampv_ratio, phasev = mode_diagnostics(
+            x_par, v_orth, volume, tt, xdot0)
         nxs.append(nx)
         l1Bs.append(l1B)
         l1vs.append(l1v)
+        ampB_ratios.append(ampB_ratio)
+        ampv_ratios.append(ampv_ratio)
+        phaseBs.append(phaseB)
+        phasevs.append(phasev)
         print(f"alfven: n_x={nx:<5d} t={tt:.4g}  "
               f"L1(B_orth)={l1B:.6g}  L1(v_orth)={l1v:.6g}")
+        print(f"alfven[mode]: n_x={nx:<5d} "
+              f"A(B_orth)/A_exact={ampB_ratio:.6g}  "
+              f"dphi(B_orth)={np.degrees(phaseB):+.6g} deg  "
+              f"A(v_orth)/A_exact={ampv_ratio:.6g}  "
+              f"dphi(v_orth)={np.degrees(phasev):+.6g} deg")
 
     if len(nxs) < 2:
         print("alfven: need >=2 resolutions with a valid '<test><nx>' number "
@@ -304,6 +370,10 @@ def plot_convergence(inputs, rotate, t, save=None, ref_table=None):
     nxs = np.array(nxs)[order]
     l1Bs = np.array(l1Bs)[order]
     l1vs = np.array(l1vs)[order]
+    ampB_ratios = np.array(ampB_ratios)[order]
+    ampv_ratios = np.array(ampv_ratios)[order]
+    phaseBs = np.array(phaseBs)[order]
+    phasevs = np.array(phasevs)[order]
 
     setup_rcparams()
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -326,6 +396,42 @@ def plot_convergence(inputs, rotate, t, save=None, ref_table=None):
     fig.tight_layout()
     finish_figure_with_legend(fig, ax,
                               save=(f"{save}_convergence.png" if save else None))
+
+    # The endpoint L1 above combines damping and phase shift.  The fundamental
+    # fit separates them: amplitude is phase-independent, while phase is the
+    # principal (wrapped) offset from the analytic wave at the selected time.
+    ampB_err = np.abs(ampB_ratios - 1.0)
+    ampv_err = np.abs(ampv_ratios - 1.0)
+    phaseB_err = np.abs(phaseBs)
+    phasev_err = np.abs(phasevs)
+
+    fig_mode, (axA, axP) = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
+    axA.loglog(nxs, ampB_err, "o-", label=r"$B_\perp$")
+    axA.loglog(nxs, ampv_err, "s-", label=r"$v_\perp$")
+    axP.loglog(nxs, phaseB_err, "o-", label=r"$B_\perp$")
+    axP.loglog(nxs, phasev_err, "s-", label=r"$v_\perp$")
+
+    # Ideal 2nd-order guides, independently anchored at the coarsest finite,
+    # positive B-field error in each panel.
+    for axis, values in ((axA, ampB_err), (axP, phaseB_err)):
+        valid = np.flatnonzero(np.isfinite(values) & (values > 0.0))
+        if valid.size:
+            i0 = valid[0]
+            guide = values[i0] * (nxs / nxs[i0]) ** (-2.0)
+            axis.loglog(nxs, guide, "k--", label=r"$\propto n_x^{-2}$")
+
+    axA.set_ylabel("relative error")
+    axP.set_ylabel(r"$|\Delta\phi|$ [rad]")
+    axP.set_xlabel(r"$n_x$")
+    axA.set_title(r"Fundamental amplitude error $|A/A_{\rm exact}-1|$")
+    axP.set_title("Wrapped fundamental phase error")
+    fig_mode.suptitle(
+        f"Alfven wave amplitude and phase convergence "
+        f"(rotate={rotate}, t={t:g})")
+    fig_mode.tight_layout()
+    finish_figure_with_legend(
+        fig_mode, (axA, axP),
+        save=(f"{save}_amplitude_phase_convergence.png" if save else None))
 
 
 # --------------------------------------------------------------------------- #
@@ -460,7 +566,8 @@ def main():
                              f"A single comparison time is just --times <t>.")
     parser.add_argument("--convergence", action="store_true",
                         help="treat inputs as different resolutions and plot "
-                             "L1(B_orth) vs n_x against the n_x^-2 line")
+                             "L1 plus separate fundamental-mode amplitude and "
+                             "wrapped phase errors vs n_x")
     parser.add_argument("--reg-tol", type=float, default=None,
                         help="CI gate: exit non-zero if the worst RMS residual "
                              "vs the regression baseline exceeds this tolerance")

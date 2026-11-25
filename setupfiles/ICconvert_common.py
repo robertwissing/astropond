@@ -28,22 +28,10 @@ def read_gasoline_param(path, missing="empty", duplicates="last"):
     `bVDetails`, `PGAL.param` repeats `bDoDensity` - because the suite
     concatenates a few IC variants into one file.
     `sph_interp/_arepo/arepo_param.py` deliberately takes 'first' for that
-    reason; every converter here has always taken 'last'.
+    reason; the converters take 'last'.
 
-    MEASURED 2026-07-29: in every current instance the repeated assignments
-    carry the SAME value (`1` twice in both files above), so the two semantics
-    agree on all 6 .param files in `test_cases/` today. The flag therefore
-    guards a latent divergence rather than fixing a live one - but it keeps
-    arepo_param's documented intent expressible instead of quietly overriding
-    it the first time a duplicate DOES differ (CONSOLIDATION_PLAN D1).
-
-    ONE DELIBERATE DIVERGENCE from the converter copies this replaces: a
-    malformed line with an empty key (` = orphan`) used to be stored as
-    `{'': 'orphan'}`; it is now skipped, matching what arepo_param always did.
-    No caller can look up `''`, and no .param in `test_cases/` contains such a
-    line (all 6 parse identically old-vs-new). Every other edge case - inline
-    `#`, full-line `#`, `=` inside the value, missing trailing newline,
-    whitespace, repeated keys - is byte-identical to the old behaviour.
+    A malformed line with an empty key (` = orphan`) is skipped, as in
+    arepo_param: no caller can look up `''`.
     """
     if duplicates not in ("last", "first"):
         raise ValueError("duplicates must be 'last' or 'first'")
@@ -67,11 +55,6 @@ def read_gasoline_param(path, missing="empty", duplicates="last"):
 def find_sibling_param(tipsy_input):
     """The gasoline `.param` beside a tipsy snapshot `<name>.NNNNN`: try
     `<name>.param` (strip the snapshot index). Returns None if absent.
-
-    Was copied into five converters under two names (`_find_gasoline_param` in
-    tipsytoarepo/tipsytogizmo/tipsytoopengadget3/IC_pkdgrav3_param,
-    `_find_param` in tipsytoramses) with identical behaviour; unified here
-    2026-07-29 (CONSOLIDATION_PLAN D3).
     """
     base = tipsy_input
     if "." in os.path.basename(base):
@@ -83,8 +66,7 @@ def find_sibling_param(tipsy_input):
 def gadget_particle_argv(args):
     """Argv for a 1:1 particle copy -> GADGET type-0 HDF5.
 
-    Shared by the GIZMO and OpenGadget3 converters, whose bodies were identical
-    apart from a comment naming the format. The "arepo" output format IS the
+    Shared by the GIZMO and OpenGadget3 converters. The "arepo" output format IS the
     GADGET writer; `--voronoi-particles` selects the straight copy path. Kept
     together deliberately: both consumers must stay in lockstep on how the
     GADGET writer is invoked.

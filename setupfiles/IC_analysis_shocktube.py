@@ -19,15 +19,41 @@ verbatim from IC_setup_shocktube.choose_shock
     6  Brio-Wu (Ryu 5a)       (MHD)
 
 The analysis plots the profiles of rho, v and P (plus the transverse v and B
-components for the MHD presets) vs x at the final snapshot, scattered over all
-particles. For the PURE-HYDRO presets (B=0, gamma>1: Sod and strong-blast) it
-overlays the EXACT adiabatic Riemann solution (Toro 2009, ch. 4) and prints the
-volume-weighted L1 error of rho, v and P. For the standard MHD presets
-(Brio-Wu #6, Ryu 1a #2/Toth #9, Ryu 2a #4) it overlays the tabulated
+components for the MHD presets) vs x at the final snapshot in two coordinated
+figures: direct particle samples, then binned means. BOTH figures carry the
+same solution/reference overlays, so the raw particle scatter can be read
+against the analytic curve directly (the binning smooths exactly the scatter a
+shock-tube test is about). For the PURE-HYDRO presets (B=0, gamma>1: Sod and
+strong-blast) that overlay is the EXACT adiabatic Riemann solution (Toro 2009,
+ch. 4), and the analysis prints the volume-weighted L1 error of rho, v and P.
+For the standard MHD presets
+(Brio-Wu #6, Ryu 1a #2/Toth #9, Ryu 2a #4, ...) it overlays the tabulated
 piecewise-constant reference solution extracted from SPLASH's exact_mhdshock.f90
 (Ryu & Jones 1995 / Brio & Wu 1988; the MHD Riemann problem has no simple closed
-form) and L1s against it. The remaining MHD / isothermal presets get profiles
-only -- compare by eye, or pass a high-resolution run as a second input.
+form) and L1s against it. That table covers the CENTRAL fan only, so the box
+edges get the same periodic treatment as the hydro path: when both initial
+states are at rest the image problem is the exact mirror of the central one
+(`mhd_ref_mirrorable`) and `mhd_reference_periodic` draws it; otherwise no
+tabulated solution covers the edge, and the reference and the L1 are clipped to
+the part of the box the edge disturbance cannot have reached. Without this the
+edge structure -- which for Brio-Wu is a v_y spike to +-1.6 -- is scored as run
+error and inflates every MHD L1 by ~4x. The remaining MHD presets -- Ryu 1b #3,
+Ryu 2b #5 and MHD discontinuity #10 -- get profiles only. That is a limit of the
+TABLE, not of the test: SPLASH's exact_mhdshock ships exactly seven problems
+(all seven are transcribed into MHD_REF below) and those three are not among
+them.
+
+BOTH limits -- the missing presets AND the central-fan-only clipping above -- are
+lifted by setupfiles/shocktube_reference.py, which runs Athena++ (MHD/CT, 1-D,
+nx1=16384) over the run's OWN initial state (the periodic box AND
+IC_setup_shocktube's velocity taper) and tabulates the result into
+reference_solution_highres/shocktube/. One can be generated for ANY preset, and
+because it is the actual IC it is valid over the WHOLE box: no mirroring
+assumption, no clip, and the L1 covers every particle. `suite_reference` picks
+one up automatically when its box and time match the run, and it takes
+precedence over the tables above (hydro keeps its exact solution, which is
+better still). Without one, compare by eye or pass a high-resolution run as a
+second input.
 
 Standalone like sedov/noh: reuses the framework Param/build_parser/loaders, not
 run_cli. Several inputs overlay as separate marker series.
@@ -37,7 +63,9 @@ Usage:
     python IC_analysis_shocktube.py <lowres> <hires> -a 6 --labels low high
 """
 
+import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -105,13 +133,42 @@ SHOCKS = {
     15: dict(name="rarefaction", gamma=5./3., tmax=0.1,
              L=[1.0, 1.0, -1.0, 0., 0., 0., 1.0, 0.],
              R=[1.0, 1.0, 1.0, 0., 0., 0., 1.0, 0.]),
+    # Weak hydro shock series (B=0): uniform density, pure pressure jump, so
+    # shock strength is one number.  Fills the gap below Sod; used to test
+    # whether an AV shock trigger still fires on a weak shock.
+    16: dict(name="weak shock p1.2", gamma=5./3., tmax=0.2,
+             L=[1.0, 1.2, 0., 0., 0., 0., 0., 0.],
+             R=[1.0, 1.0, 0., 0., 0., 0., 0., 0.]),
+    17: dict(name="weak shock p2", gamma=5./3., tmax=0.2,
+             L=[1.0, 2.0, 0., 0., 0., 0., 0., 0.],
+             R=[1.0, 1.0, 0., 0., 0., 0., 0., 0.]),
+    18: dict(name="weak shock p5", gamma=5./3., tmax=0.2,
+             L=[1.0, 5.0, 0., 0., 0., 0., 0., 0.],
+             R=[1.0, 1.0, 0., 0., 0., 0., 0., 0.]),
+    # Brio-Wu with B scaled by 1e-3 (beta ~ 1e6): the field is passive, so this
+    # tests the artificial resistivity on a shock where v_A ~ 1e-3 c_s.
+    19: dict(name="weak field Brio-Wu", gamma=2.0, tmax=0.1,
+             L=[1.0, 1.0, 0., 0., 0., 0.75e-3, 1.e-3, 0.],
+             R=[0.125, 0.1, 0., 0., 0., 0.75e-3, -1.e-3, 0.]),
 }
 
 XSHOCK = 0.0
 DEFAULT_TIME = None             # None -> the last (final) snapshot
 
+# Exact runtest.sh shockname -> runname_extra spellings. The analyzer's
+# user-facing SHOCKS names are intentionally shorter for a few presets.
+RUNNAME_CHOICES = {
+    "Sod_shock": 1, "Ryu_1a": 2, "Ryu_1b": 3, "Ryu_2a": 4,
+    "Ryu_2b": 5, "Brio-Wu_Ryu_5a": 6, "C-shock": 7,
+    "Steady_shock": 8, "Toth": 9, "MHD_discontinuity": 10,
+    "strong_blast": 11, "fast_slow_shock": 12,
+    "isothermal_B98": 13, "Mach_25_DW94": 14, "rarefaction": 15,
+    "weak_field_Brio-Wu": 19,
+}
+
 PARAM_SPEC = [
-    Param("a", "choice", 1, int, "shock preset (1..11; see module docstring)"),
+    Param("a", "choice", 1, int,
+          "shock preset (1..18; see module docstring)", RUNNAME_CHOICES),
 ]
 
 
@@ -262,6 +319,25 @@ def exact_riemann_periodic(p, t, x, xmin, xmax):
     return rho, vx, P
 
 
+def max_wave_speed(p):
+    """Fastest signal speed of the exact fan (rarefaction head or shock speed).
+
+    Sets how long `exact_riemann_periodic` stays valid: the central and the
+    periodic-image fan collide at |x| = xmax/2, i.e. at t = xmax/(2 v_max)."""
+    g = p["gamma"]
+    L, R = p["L"], p["R"]
+    rhoL, uL, pL = L[0], L[2], L[1]
+    rhoR, uR, pR = R[0], R[2], R[1]
+    aL, aR = np.sqrt(g * pL / rhoL), np.sqrt(g * pR / rhoR)
+    pstar, _us = _star_state((rhoL, uL, pL), (rhoR, uR, pR), g)
+    gm, gp = g - 1.0, g + 1.0
+    sL = (uL - aL * np.sqrt(gp / (2 * g) * pstar / pL + gm / (2 * g))
+          if pstar > pL else uL - aL)
+    sR = (uR + aR * np.sqrt(gp / (2 * g) * pstar / pR + gm / (2 * g))
+          if pstar > pR else uR + aR)
+    return max(abs(sL), abs(sR))
+
+
 # --------------------------------------------------------------------------- #
 #  Tabulated MHD reference solutions (from SPLASH exact_mhdshock.f90)
 # --------------------------------------------------------------------------- #
@@ -393,6 +469,78 @@ CHOICE_TO_REF = {2: "ryu1a", 9: "ryu1a", 4: "ryu2a", 6: "briowu",
 
 
 # --------------------------------------------------------------------------- #
+#  Athena++ "suite IC" references (setupfiles/shocktube_reference.py)
+# --------------------------------------------------------------------------- #
+# The tables above describe the CLEAN single-fan Riemann problem. Our runs are a
+# periodic box twice as long as the shock region PLUS IC_setup_shocktube's
+# exponential velocity taper near the edges, so the table is only right over the
+# part of the box neither the image fan nor the taper has reached -- which for
+# the fast-inflow presets is a small fraction of it. shocktube_reference.py runs
+# Athena++ (MHD/CT) at high resolution over that SAME initial state and box and
+# tabulates it here, as a dense polyline in the same (x, {field}) shape. Because
+# the box and the taper set a length scale, such a reference is NOT self-similar:
+# it is valid at one box and one time, so the loader matches on both.
+SUITE_REF_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "reference_solution_highres", "shocktube"))
+
+SUITE_REF_KEYS = ("rho", "P", "vx", "vy", "vz", "By", "Bz")
+
+
+def read_suite_ref(path):
+    """(meta, x, {field: values}) of one shocktube_reference.py CSV."""
+    meta, rows = {}, []
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                mm = re.match(r"#\s*(choice|gamma|box|time|mode):\s*(.+)", line)
+                if mm:
+                    meta[mm.group(1)] = mm.group(2).strip()
+            elif line.strip():
+                rows.append(line)
+    names = [s.strip() for s in rows[0].split(",")]
+    arr = np.array([[float(v) for v in ln.split(",")] for ln in rows[1:]], float)
+    col = {n: arr[:, i] for i, n in enumerate(names)}
+    return meta, col["x"], {k: col[k] for k in SUITE_REF_KEYS if k in col}
+
+
+def suite_reference(p, t, xmin, xmax, verbose=True):
+    """The Athena++ suite reference for this preset AT THIS BOX AND TIME, or None.
+
+    Matching is on all three because the reference is not rescalable: a 2% box
+    tolerance (the particle extent falls just inside the periodic box) and a 1%
+    time tolerance. A near-miss is reported rather than silently ignored -- it
+    means the file exists but was generated for a different run."""
+    if not os.path.isdir(SUITE_REF_DIR):
+        return None
+    near = []
+    for path in sorted(glob.glob(os.path.join(SUITE_REF_DIR, "*.csv"))):
+        try:
+            meta, x, state = read_suite_ref(path)
+        except (ValueError, KeyError, IndexError):
+            continue
+        if meta.get("mode", "").split()[0] != "suite":
+            continue
+        if int(float(meta.get("choice", -1))) != p["choice"]:
+            continue
+        blo, bhi = (float(v) for v in meta["box"].split())
+        tref = float(meta["time"])
+        span = bhi - blo
+        dbox = max(abs(blo - xmin), abs(bhi - xmax)) / span
+        dt = abs(tref - t) / max(abs(t), 1e-30)
+        if dbox <= 0.02 and dt <= 0.01:
+            return x, state, os.path.basename(path)
+        near.append((os.path.basename(path), blo, bhi, tref, dbox, dt))
+    if near and verbose:
+        for nm, blo, bhi, tref, dbox, dt in near:
+            print(f"shocktube[{p['name']}]: NOTE -- suite reference {nm} does not "
+                  f"apply here (its box=[{blo:g},{bhi:g}] t={tref:g} vs the run's "
+                  f"[{xmin:g},{xmax:g}] t={t:g}); regenerate with "
+                  f"shocktube_reference.py for this run.", file=sys.stderr)
+    return None
+
+
+# --------------------------------------------------------------------------- #
 #  Exact oblique C-shock (ported from SPLASH exact_Cshock.f90)
 # --------------------------------------------------------------------------- #
 # Isothermal MHD shock with ambipolar diffusion, Mac-Low, Norman, Konigl &
@@ -510,6 +658,123 @@ def mhd_reference(refname, t, xmin, xmax):
     return x, state
 
 
+def mhd_max_wave_speed(p, xmax=None):
+    """Fastest signal speed max(|v_x| + c_f) of the two states AT THE BOX EDGE.
+
+    Bounds how far the periodic-image fan at the wrapped edge can have spread,
+    so a central-fan-only reference can be trimmed to the part of the box that
+    fan still governs. IC_setup_shocktube tapers the state velocities as
+    exp(-8(|x| - 0.4 L)) beyond |x| = 0.4 L, so with `xmax` given the edge sees
+    only exp(-1.6 xmax) of v_x -- a much weaker image problem than the states
+    themselves imply for the fast-inflow presets."""
+    g = p["gamma"]
+    taper = 1.0 if xmax is None else float(np.exp(-1.6 * abs(xmax)))
+    vmax = 0.0
+    for S in (p["L"], p["R"]):
+        rho, P, vx = float(S[0]), float(S[1]), taper * float(S[2])
+        Bx, By, Bz = float(S[5]), float(S[6]), float(S[7])
+        a2 = p.get("cs2", 1.0) if g <= 1.0 + 1e-6 else g * P / rho
+        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+        cA2 = Bx * Bx / rho
+        cf = np.sqrt(0.5 * ((a2 + b2)
+                            + np.sqrt(max((a2 + b2) ** 2 - 4.0 * a2 * cA2, 0.0))))
+        vmax = max(vmax, abs(vx) + cf)
+    return vmax
+
+
+def mhd_ref_mirrorable(p):
+    """Is the periodic-image Riemann problem the MIRROR of the central one?
+
+    The 1-D ideal-MHD system (B_x const) is invariant under the reflection
+        x -> -x,   (v_x, v_y, v_z) -> -(v_x, v_y, v_z),   B unchanged
+    (the y-momentum and induction equations fix the relative sign: flipping v
+    perpendicular forces B perpendicular to stay put, and vice versa). So the
+    image problem (R|L) at the wrapped edge is the mirrored central solution --
+    but only if that reflection maps each initial state to ITSELF, i.e. only if
+    both states are at rest. The alternative reflection (v_perp kept, B_perp
+    flipped) would instead need By=Bz=0 in both states, which no preset here
+    has. Any preset with a non-zero initial velocity therefore has a genuinely
+    different image problem, with no tabulated solution -- and the setup's
+    exponential velocity taper near |x| > 0.4 L makes its edge not even a clean
+    Riemann problem."""
+    return max(abs(float(c)) for S in (p["L"], p["R"]) for c in S[2:5]) < 1e-12
+
+
+_MHD_KEYS = ("rho", "vx", "vy", "vz", "P", "By", "Bz")
+
+
+def _mhd_nodes(refname, t, xspan):
+    """(q, {k: values}) of the tabulated polyline: interior wave positions at
+    time t, with the two open endpoints pinned far outside the box so the flat
+    L/R plateaus extend over any window we clip to."""
+    r = MHD_REF[refname]
+    tfac = t / r["tref"]
+    big = 1.0e3 * max(1.0, abs(xspan))
+    q = np.array([(-big if (c is None and i == 0) else
+                   big if c is None else float(c) * tfac)
+                  for i, c in enumerate(r["xc"])], float)
+    return q, {k: np.asarray(r[k], float) for k in _MHD_KEYS}
+
+
+def _polyline_window(q, vals, a, s, lo, hi, flip):
+    """Clip the polyline x = a + s*q to [lo, hi], keeping its jumps crisp.
+
+    `q` is non-decreasing; s = +1 keeps the orientation, s = -1 reverses it
+    (which also reverses each repeated-x pair, so a jump stays a jump). The two
+    window edges are added as interpolated nodes so the piece spans [lo, hi].
+    With `flip`, the three velocity components change sign (the reflection)."""
+    x = a + s * q
+    order = slice(None) if s > 0 else slice(None, None, -1)
+    xs = x[order]
+    keep = (xs > lo) & (xs < hi)
+    xseg = np.concatenate(([lo], xs[keep], [hi]))
+    vseg = {}
+    for k in _MHD_KEYS:
+        v = vals[k][order]
+        edge = np.interp([(lo - a) / s, (hi - a) / s], q, vals[k])
+        vv = np.concatenate(([edge[0]], v[keep], [edge[1]]))
+        vseg[k] = -vv if (flip and k in ("vx", "vy", "vz")) else vv
+    return xseg, vseg
+
+
+def mhd_ref_reach(refname, t):
+    """How far the tabulated fan's outermost wave has travelled by time t."""
+    r = MHD_REF[refname]
+    return max(abs(float(c)) for c in r["xc"] if c is not None) * t / r["tref"]
+
+
+def mhd_reference_periodic(refname, t, xmin, xmax, p=None):
+    """Tabulated reference PLUS its periodic image fan, mirrored about the edge.
+
+    The image discontinuity sits at the wrapped edge xmin == xmax. A point at
+    signed distance d from it (d<0 -> x = xmax+d, d>0 -> x = xmin+d) carries the
+    reflected central state at -d, so a central node at position q maps to an
+    image node at xmax-q (q>0, just inside the right edge) or xmin-q (q<0, just
+    inside the left edge), with v negated. Each discontinuity governs the half
+    box nearest it; the two share the L/R plateau at |x| = xmax/2, so the joins
+    at the quarter points are seamless. Only valid until the fans meet there --
+    the caller checks that with `mhd_max_wave_speed`."""
+    q, vals = _mhd_nodes(refname, t, max(abs(xmin), abs(xmax)))
+    xh = 0.5 * xmax
+    pieces = [_polyline_window(q, vals, xmin, -1.0, xmin, -xh, True),
+              _polyline_window(q, vals, 0.0, +1.0, -xh, xh, False),
+              _polyline_window(q, vals, xmax, -1.0, xh, xmax, True)]
+    x = np.concatenate([pc[0] for pc in pieces])
+    state = {k: np.concatenate([pc[1][k] for pc in pieces]) for k in _MHD_KEYS}
+    return x, state
+
+
+def mhd_reference_clipped(refname, t, xmin, xmax, xcut):
+    """The central-fan tabulated reference, clipped to |x| <= xcut.
+
+    For a preset whose image problem is NOT the mirror of the central one, the
+    box edges carry structure this table knows nothing about; comparing there
+    inflates every L1. Clip instead, and report the clip."""
+    q, vals = _mhd_nodes(refname, t, max(abs(xmin), abs(xmax)))
+    lo, hi = max(xmin, -xcut), min(xmax, xcut)
+    return _polyline_window(q, vals, 0.0, +1.0, lo, hi, False)
+
+
 # --------------------------------------------------------------------------- #
 #  Profile extraction
 # --------------------------------------------------------------------------- #
@@ -561,9 +826,38 @@ def plot_profiles(inputs, labels, params, t, save=None, cshock_opts=None,
         keys = [("rho", r"$\rho$"), ("vx", r"$v_x$"),
                 ("P", r"$P$"), ("u", r"$u$")]
         nrow, ncol = 2, 2
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 4 * nrow),
-                             sharex=True)
-    axd = {k: axes.ravel()[i] for i, (k, _lab) in enumerate(keys)}
+    def make_axes():
+        return plt.subplots(nrow, ncol, figsize=(5 * ncol, 4 * nrow),
+                            sharex=True)
+
+    particle_fig, particle_axes = make_axes()
+    line_fig, line_axes = make_axes()
+    axp = {k: particle_axes.ravel()[i] for i, (k, _lab) in enumerate(keys)}
+    axl = {k: line_axes.ravel()[i] for i, (k, _lab) in enumerate(keys)}
+
+    # Every solution/reference curve is drawn on BOTH figures -- the binned
+    # panels and the particle panels -- so each of the overlay branches below
+    # goes through these three helpers instead of touching `axl` directly.
+    def overlay(xg, state, label, **kw):
+        """One solution curve on every panel of both figures (keys it covers)."""
+        for k, _lab in keys:
+            if k in state and state[k] is not None:
+                for ax in (axl[k], axp[k]):
+                    ax.plot(xg, state[k], label=label, **kw)
+
+    def mark_clip(xcut):
+        """Dotted bounds of the window the overlay (and the L1) is valid over."""
+        for k, _lab in keys:
+            for ax in (axl[k], axp[k]):
+                for xb in (-xcut, xcut):
+                    ax.axvline(xb, color="0.6", ls=":", lw=1.0, zorder=4)
+
+    def l1_box(text):
+        """The L1 annotation, on the rho panel of both figures."""
+        abox = dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85)
+        for ax in (axl["rho"], axp["rho"]):
+            ax.text(0.03, 0.95, text, transform=ax.transAxes, fontsize=8,
+                    va="top", ha="left", bbox=abox, zorder=7)
 
     xs_all = []
     for i, (inp, lab) in enumerate(zip(inputs, labels)):
@@ -574,40 +868,66 @@ def plot_profiles(inputs, labels, params, t, save=None, cshock_opts=None,
         d, _time = profile(fn, p)
         xs_all.append((d["x"], tt))
         color = f"C{i % 10}"
-        # Binned-mean curve of THIS run (same binning used for the reference), so
-        # every panel shows a clean line through its own scatter. The scatter is
-        # kept faint (low alpha, behind) so the line is highlighted on top.
-        # Bin count tracks the run's own resolution (reg_nbins ~ n_x).
+        # Keep direct particles and binned means in separate figures. Bin count
+        # tracks the run's own resolution (reg_nbins ~ n_x), and the line view
+        # uses exactly the same binning as the regression reference.
         cx, binned = _binned_multi(d["x"], d, [k for k, _l in keys],
                                    nbins=reg_nbins(inp))
         for k, _lab in keys:
-            axd[k].scatter(d["x"], d[k], s=4, alpha=0.12, color=color,
-                           rasterized=True, zorder=1,
+            axp[k].scatter(d["x"], d[k], s=4, alpha=0.12, color=color,
+                           rasterized=True,
                            label=f"{lab} (t={tt:.3g})")
             if cx is not None and k in binned:
-                axd[k].plot(cx, binned[k], "-", color=color, lw=1.8, zorder=4)
+                axl[k].plot(cx, binned[k], "-", color=color, lw=1.8,
+                            label=f"{lab} (t={tt:.3g})")
 
-    # Reference overlay: the blessed binned profile on EVERY panel (dashed line).
+    # Reference overlay: the blessed binned profile on every panel.
     if ref_table is not None and "x" in ref_table:
-        for k, _lab in keys:
-            if k in ref_table:
-                axd[k].plot(ref_table["x"], ref_table[k], "--", color="0.35",
-                            lw=1.6, zorder=5, label="reference")
+        overlay(ref_table["x"], ref_table, "reference", ls="--", color="0.35",
+                lw=1.6, zorder=5)
 
-    # Exact overlay + L1 (hydro presets only). PERIODIC domain: include the
-    # boundary (wrapped) Riemann fan as well as the central one.
-    if p["hydro_exact"] and xs_all:
+    # Domain and comparison time, shared by every overlay branch below.
+    if xs_all:
         xx = np.concatenate([x for x, _ in xs_all])
         tt = xs_all[0][1]
         xmin, xmax = float(xx.min()), float(xx.max())
+
+    # An Athena++ reference generated over THIS run's own initial state (periodic
+    # box + IC_setup_shocktube's velocity taper) beats every table below: it is
+    # valid over the whole box, so there is no mirroring assumption, no clip, and
+    # the L1 covers every particle. Hydro keeps its exact solution, which is
+    # better still -- those presets are at rest, so their taper is a no-op and
+    # exact_riemann_periodic is exact.
+    sref = suite_reference(p, tt, xmin, xmax) if (xs_all and p["mhd"]) else None
+    if sref is not None:
+        rx, rstate, srcname = sref
+        overlay(rx, rstate, "Athena++ reference (suite IC)", color="k", lw=1.6,
+                zorder=6)
+        sel = select_at_time(inputs[0], t)
+        if sel is not None:
+            d, tt0 = profile(sel[0], p)
+            l1s = {k: l1_error(d["x"], d[k], np.interp(d["x"], rx, rstate[k]),
+                               d["vol"])
+                   for k in ("rho", "vx", "P", "By") if k in rstate}
+            print(f"shocktube[{p['name']}]: t={tt0:.4g}  "
+                  + "  ".join(f"L1({k})={v:.4g}" for k, v in l1s.items())
+                  + f"  (vs {srcname} -- whole box, no clip)")
+            l1_box("L1 vs Athena++\n"
+                   + "\n".join(f"{k} {v:.2g}" for k, v in l1s.items()))
+    # Exact overlay + L1 (hydro presets only). PERIODIC domain: include the
+    # boundary (wrapped) Riemann fan as well as the central one.
+    elif p["hydro_exact"] and xs_all:
         xg = np.linspace(xmin, xmax, 2000)       # denser: two fans + sharp edges
+        tvalid = xmax / (2.0 * max_wave_speed(p))
+        if tt > tvalid:
+            print(f"shocktube[{p['name']}]: WARNING -- t={tt:.4g} is past "
+                  f"t={tvalid:.3g}, where the central fan meets its periodic "
+                  f"image; the exact overlay does not apply here. Compare at an "
+                  f"earlier --times, or shorten the run.", file=sys.stderr)
         rho_a, vx_a, P_a = exact_riemann_periodic(p, tt, xg, xmin, xmax)
         ana = {"rho": rho_a, "vx": vx_a, "P": P_a,
                "u": P_a / ((p["gamma"] - 1.0) * rho_a)}
-        for k, _lab in keys:
-            if k in ana:
-                axd[k].plot(xg, ana[k], "k-", lw=1.6, zorder=6,
-                            label="exact (periodic)")
+        overlay(xg, ana, "exact (periodic)", color="k", lw=1.6, zorder=6)
         # L1 against the exact (periodic) solution at each particle, first input.
         sel = select_at_time(inputs[0], t)
         if sel is not None:
@@ -619,52 +939,88 @@ def plot_profiles(inputs, labels, params, t, save=None, cshock_opts=None,
             l1p = l1_error(d["x"], d["P"], P_a, d["vol"])
             print(f"shocktube[{p['name']}]: t={tt0:.4g}  L1(rho)={l1r:.4g}  "
                   f"L1(vx)={l1v:.4g}  L1(P)={l1p:.4g}")
-            abox = dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85)
-            axd["rho"].text(0.03, 0.95,
-                            f"L1: rho {l1r:.2g}\n     vx {l1v:.2g}\n      P {l1p:.2g}",
-                            transform=axd["rho"].transAxes, fontsize=8,
-                            va="top", ha="left", bbox=abox)
+            l1_box(f"L1: rho {l1r:.2g}\n     vx {l1v:.2g}\n      P {l1p:.2g}")
     elif p["ref"] and xs_all:
-        # MHD preset with a tabulated reference (SPLASH exact_mhdshock): overlay
-        # the piecewise-constant solution and L1 the first input against it.
-        xx = np.concatenate([x for x, _ in xs_all])
-        tt = xs_all[0][1]
-        rx, rstate = mhd_reference(p["ref"], tt, xx.min(), xx.max())
-        for k, _lab in keys:
-            if k in rstate:
-                axd[k].plot(rx, rstate[k], "k-", lw=1.6, zorder=6,
-                            label="reference (RJ95/BW)")
+        # MHD preset with a tabulated reference (SPLASH exact_mhdshock). The box
+        # is PERIODIC, so the table's flat L/R plateaus are wrong at the edges:
+        # a second fan lives there. When both initial states are at rest that
+        # image fan is the exact mirror of the central one, so draw it; when
+        # they are not, no tabulated solution covers it, so clip the reference
+        # (and the L1) to the part of the box the central fan still governs.
+        # (setupfiles/shocktube_reference.py retires this whole compromise for
+        #  any preset you generate a suite reference for.)
+        mirror = mhd_ref_mirrorable(p)
+        vmax = mhd_max_wave_speed(p, xmax)
+        xh = 0.5 * xmax
+
+        def _ref_at(tref, xlo, xhi):
+            """(x, state, xcut) of the reference to compare against at `tref`.
+
+            Mirrored presets get the whole periodic solution (xcut None). The
+            rest get the central table clipped to the box the edge disturbance
+            cannot have reached: its outermost wave is a rarefaction head or a
+            shock, so |v|+c_f of the edge states bounds it from below and is the
+            standard signal-speed estimate. Never clip past the quarter point --
+            beyond it the image jump is the nearer discontinuity anyway."""
+            if mirror:
+                rxx, rss = mhd_reference_periodic(p["ref"], tref, xlo, xhi)
+                return rxx, rss, None
+            cut = xhi - vmax * tref
+            if cut <= 0.0:
+                print(f"shocktube[{p['name']}]: WARNING -- at t={tref:.4g} the "
+                      f"box-edge disturbance (signal speed {vmax:.3g}) can have "
+                      f"crossed the whole half-box {xhi:.3g}; comparing over "
+                      f"|x|<={0.5 * xhi:.3g} anyway, so the L1 is a lower "
+                      f"bound.", file=sys.stderr)
+                cut = 0.5 * xhi
+            return mhd_reference_clipped(p["ref"], tref, xlo, xhi, cut) + (cut,)
+
+        if mirror:
+            treach = mhd_ref_reach(p["ref"], tt)
+            if treach > xh:
+                print(f"shocktube[{p['name']}]: WARNING -- at t={tt:.4g} the "
+                      f"tabulated fan reaches |x|={treach:.3g}, past the "
+                      f"quarter point {xh:.3g} where it meets its periodic "
+                      f"image; the overlay does not apply there.",
+                      file=sys.stderr)
+        rx, rstate, xcut = _ref_at(tt, xmin, xmax)
+        reflab = ("reference + periodic image" if mirror
+                  else "reference (central fan only)")
+        overlay(rx, rstate, reflab, color="k", lw=1.6, zorder=6)
+        if xcut is not None:
+            mark_clip(xcut)
         sel = select_at_time(inputs[0], t)
         if sel is not None:
             d, tt0 = profile(sel[0], p)
-            rx0, rstate0 = mhd_reference(p["ref"], tt0, d["x"].min(), d["x"].max())
+            rx0, rstate0, xcut0 = _ref_at(tt0, float(d["x"].min()),
+                                          float(d["x"].max()))
+            m = (np.abs(d["x"]) <= xcut0) if xcut0 is not None else Ellipsis
             l1s = {}
             for k in ("rho", "vx", "P", "By"):
-                ref_at = np.interp(d["x"], rx0, rstate0[k])
-                l1s[k] = l1_error(d["x"], d[k], ref_at, d["vol"])
+                ref_at = np.interp(d["x"][m], rx0, rstate0[k])
+                l1s[k] = l1_error(d["x"][m], d[k][m], ref_at, d["vol"][m])
+            if xcut0 is None:
+                scope = "vs SPLASH/RJ95 reference + periodic image"
+            else:
+                frac = float(np.count_nonzero(m)) / len(d["x"])
+                scope = (f"vs SPLASH/RJ95 reference over |x|<={xcut0:.3g} "
+                         f"({100 * frac:.0f}% of the box; the periodic-image "
+                         f"fan is not tabulated)")
             print(f"shocktube[{p['name']}]: t={tt0:.4g}  "
                   + "  ".join(f"L1({k})={v:.4g}" for k, v in l1s.items())
-                  + "  (vs SPLASH/RJ95 reference)")
-            abox = dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85)
-            axd["rho"].text(0.03, 0.95,
-                            "L1 vs ref\n" + "\n".join(f"{k} {v:.2g}"
-                                                      for k, v in l1s.items()),
-                            transform=axd["rho"].transAxes, fontsize=8,
-                            va="top", ha="left", bbox=abox)
+                  + f"  ({scope})")
+            l1_box("L1 vs ref\n"
+                   + "\n".join(f"{k} {v:.2g}" for k, v in l1s.items())
+                   + ("" if xcut0 is None else f"\n|x|<={xcut0:.2g}"))
     elif p["choice"] == 7 and xs_all:
         # C-shock (#7): overlay the Mac-Low et al. (1995) ambipolar C-shock
         # (SPLASH exact_Cshock) using the supplied Mach numbers / shock length.
         co = cshock_opts or {}
-        xx = np.concatenate([x for x, _ in xs_all])
-        tt = xs_all[0][1]
-        xg = np.linspace(xx.min(), xx.max(), 1500)
+        xg = np.linspace(xmin, xmax, 1500)
         cs = cshock_reference(co.get("machs", 50.0), co.get("macha", 5.0),
                               co.get("theta", np.pi / 4.0),
                               co.get("shockl", 0.3), tt, xg)
-        for k, _lab in keys:
-            if k in cs:
-                axd[k].plot(xg, cs[k], "k-", lw=1.6, zorder=6,
-                            label="C-shock (Mac-Low 95)")
+        overlay(xg, cs, "C-shock (Mac-Low 95)", color="k", lw=1.6, zorder=6)
         print(f"shocktube[{p['name']}]: C-shock overlay "
               f"(machs={co.get('machs', 50.0)}, macha={co.get('macha', 5.0)}, "
               f"shockl={co.get('shockl', 0.3)}). NOTE: matches the Mac-Low "
@@ -672,41 +1028,53 @@ def plot_profiles(inputs, labels, params, t, save=None, cshock_opts=None,
     elif p["choice"] == 8 and xs_all:
         # Steady shock (#8, Falle 2003): the IC satisfies the steady MHD jump
         # conditions, so the exact solution is the stationary step at xshock=0.
-        xx = np.concatenate([x for x, _ in xs_all])
-        xg = np.linspace(xx.min(), xx.max(), 1000)
+        xg = np.linspace(xmin, xmax, 1000)
         st = steady_step(p, xg)
-        for k, _lab in keys:
-            if k in st:
-                axd[k].plot(xg, st[k], "k-", lw=1.6, zorder=6,
-                            label="steady (stationary)")
+        overlay(xg, st, "steady (stationary)", color="k", lw=1.6, zorder=6)
         sel = select_at_time(inputs[0], t)
         if sel is not None:
             d, tt0 = profile(sel[0], p)
-            st0 = steady_step(p, d["x"])
-            l1s = {k: l1_error(d["x"], d[k], st0[k], d["vol"])
+            # Periodic box: the wrapped edge carries the REVERSED jump, which is
+            # not a steady shock, so keep the L1 to the part of the box the
+            # central step still governs.
+            xmax0 = float(d["x"].max())
+            xcut0 = max(0.5 * xmax0,
+                        xmax0 - mhd_max_wave_speed(p, xmax0) * tt0)
+            # (never trim past the quarter point: with a stationary solution the
+            #  remaining half-box is still the most this test can be asked for)
+            m = np.abs(d["x"]) <= xcut0
+            st0 = steady_step(p, d["x"][m])
+            l1s = {k: l1_error(d["x"][m], d[k][m], st0[k], d["vol"][m])
                    for k in ("rho", "vx", "vy", "By")}
+            mark_clip(xcut0)
             print(f"shocktube[{p['name']}]: t={tt0:.4g}  "
                   + "  ".join(f"L1({k})={v:.4g}" for k, v in l1s.items())
-                  + "  (vs the stationary steady-shock step)")
-            abox = dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85)
-            axd["rho"].text(0.03, 0.95, "L1 vs steady\n"
-                            + "\n".join(f"{k} {v:.2g}" for k, v in l1s.items()),
-                            transform=axd["rho"].transAxes, fontsize=8,
-                            va="top", ha="left", bbox=abox)
+                  + f"  (vs the stationary steady-shock step, |x|<={xcut0:.3g})")
+            l1_box("L1 vs steady\n"
+                   + "\n".join(f"{k} {v:.2g}" for k, v in l1s.items()))
     elif xs_all:
         print(f"shocktube[{p['name']}]: "
               + ("isothermal" if p["gamma"] <= 1.0 + 1e-6 else "MHD")
               + " preset -- no closed-form or tabulated solution; profiles only.")
 
-    for k, lab in keys:
-        axd[k].set_ylabel(lab)
-    for ax in axes.ravel()[ncol * (nrow - 1):]:
-        ax.set_xlabel("x")
-    fig.suptitle(f"Shock tube: {p['name']} (choice {p['choice']}, "
-                 f"gamma={p['gamma']:.3g})")
-    fig.tight_layout()
-    finish_figure_with_legend(fig, list(axes.ravel()),
-                              save=(f"{save}_profile.png" if save else None))
+    for k, label in keys:
+        axp[k].set_ylabel(label)
+        axl[k].set_ylabel(label)
+    for axes in (particle_axes, line_axes):
+        for ax in axes.ravel()[ncol * (nrow - 1):]:
+            ax.set_xlabel("x")
+    title = (f"Shock tube: {p['name']} (choice {p['choice']}, "
+             f"gamma={p['gamma']:.3g})")
+    particle_fig.suptitle(title + " — particle samples and solutions")
+    line_fig.suptitle(title + " — binned means and solutions")
+    particle_fig.tight_layout()
+    line_fig.tight_layout()
+    finish_figure_with_legend(
+        particle_fig, list(particle_axes.ravel()),
+        save=(f"{save}_profile.png" if save else None))
+    finish_figure_with_legend(
+        line_fig, list(line_axes.ravel()),
+        save=(f"{save}_profile_lines.png" if save else None))
 
 
 # --------------------------------------------------------------------------- #
@@ -820,13 +1188,15 @@ def main():
                        "shocktube", time=tref)
         return
 
-    overlay = ("exact Riemann" if params["hydro_exact"]
+    builtin = ("exact Riemann" if params["hydro_exact"]
                else f"tabulated ref ({params['ref']})" if params["ref"]
                else "C-shock (Mac-Low 95)" if params["choice"] == 7
                else "steady step (Falle 2003)" if params["choice"] == 8
                else "none (profiles only)")
+    # A matching Athena++ suite reference overrides this; plot_profiles says which
+    # overlay actually fired.
     print(f"[shocktube] choice {params['choice']} = {params['name']}  "
-          f"gamma={params['gamma']:.4g}  mhd={params['mhd']}  overlay={overlay}")
+          f"gamma={params['gamma']:.4g}  mhd={params['mhd']}  built-in={builtin}")
 
     # Auto-discover (or use --reference) the baseline once; overlay it on the
     # profile panels and reuse it for the first input's residual gate. Pass the

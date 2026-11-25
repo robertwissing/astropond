@@ -124,7 +124,9 @@ class setup_areablob(object):
              self.z=tgdata[:,3]
              self.rho=tgdata[:,7]
         
-         if multcloud > 1 and not distri==1:
+         # not for the pre-glass seed: one cloud is relaxed, then replicated
+         # when the final IC is built from the glass
+         if multcloud > 1 and not self.preglass:
             term = (np.arange(multcloud) - (multcloud-1)/2)
             x_offsets = term * self.dxbound
             y_offsets = term * self.dybound

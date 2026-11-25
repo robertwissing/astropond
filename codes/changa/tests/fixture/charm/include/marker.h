@@ -1,0 +1,1 @@
+#define FIXTURE_CHARM_INCLUDE 1

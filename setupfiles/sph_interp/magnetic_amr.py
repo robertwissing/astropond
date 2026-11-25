@@ -23,12 +23,8 @@ from .magnetic import _component_budget
 from .particles import Particles
 from .targets import AMRGrid
 
-# `_component_budget` is shared with the uniform capture path (magnetic.py) -
-# this module used to carry its own `_budget` twin, which had drifted and was
-# missing the per-component `relative` key, so the same diagnostic read
-# differently on the uniform and AMR audits (CONSOLIDATION_PLAN D6/D12-A1,
-# unified 2026-07-29). The AMR audits now gain that key; every consumer reads
-# only `relative_norm`, which is unchanged.
+# `_component_budget` is shared with the uniform capture path (magnetic.py), so
+# the uniform and AMR audits report the same budget keys.
 
 
 @dataclass

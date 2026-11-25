@@ -1,9 +1,7 @@
 # Shared helpers for the bin/ tool wrappers.  SOURCED, never executed.
 #
-# Why it lives here and not in bin/: bin/ holds tool wrappers and nothing else
-# (user constraint, 2026-07-29 - CONSOLIDATION_PLAN D2).  setupfiles/ is the
-# natural home because every wrapper already resolves this directory to build
-# PYTHONPATH, and setupfiles/telegram_send is precedent for a shell script here.
+# Why it lives here and not in bin/: bin/ holds tool wrappers and nothing else,
+# and every wrapper already resolves setupfiles/ to build PYTHONPATH.
 #
 # CONTRACT.  The caller must set `root` (the repository root) before sourcing,
 # because it needs `root` to find this file in the first place:

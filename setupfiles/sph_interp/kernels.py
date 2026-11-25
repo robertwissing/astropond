@@ -9,8 +9,8 @@ Normalization (3D): W(r,h) = cnorm3D(h) * w(q),  cnorm3D(h) = 1 / (pi h^3).
 """
 
 import numpy as np
-# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
-# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+# numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4); local alias, not a
+# global monkeypatch.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 from numba import njit
 
@@ -51,7 +51,7 @@ def gcum3D(q):
     G(R/h) / pi. Used by the exact (Petkova) cell integral, where each cell is
     decomposed into cones from the particle and the cone integral is
     int_solidangle g(R(Omega)) dOmega. Closed form (piecewise polynomial), so it
-    is breakpoint-exact at q=1 and q=2 — unlike the old per-face D2/D3 corrections.
+    is breakpoint-exact at q=1 and q=2.
     """
     if q <= 0.0:
         return 0.0

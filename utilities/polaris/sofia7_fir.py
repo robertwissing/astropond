@@ -1,5 +1,4 @@
-"""Far-infrared polarized dust emission, the SOFIA VII way -- M5b of
-POLARIS_EXPORT_PLAN.md §4.6.
+"""Far-infrared polarized dust emission, the SOFIA VII way.
 
 **POLARIS is not involved anywhere in this module.** Martin-Alvarez et al.
 (SALSA VII, arXiv:2311.06356) use POLARIS only for the radio synchrotron; their
@@ -7,8 +6,8 @@ FIR polarimetry is an analytic line-of-sight integral, their §3.1 Eqs. 4-6, wit
 no radiative transfer, no grain model, no dust temperature and no wavelength.
 This module reproduces exactly that, which is why it is NOT called
 `polaris_fir.py` -- in this repo the `polaris_` prefix means "feeds or reads the
-POLARIS binary". (POLARIS *can* do real dust polarimetry with RAT alignment; that
-is the separate, larger §4.6b route.)
+POLARIS binary". (POLARIS *can* do real dust polarimetry with RAT alignment; this
+module does not use it.)
 
 Their RAMSES run tracks no dust, so dust is assigned in post-processing as a
 fixed fraction of the metals:
@@ -68,7 +67,7 @@ M_DUST_KG = 1.26e-17
 #: maximum polarization fraction, from Planck. Stands in for grain alignment.
 P0_FIR = 0.25
 #: dust sublimation temperature in f_cut [K]. NOTE POLARIS's own silicate
-#: catalogue declares 1200 K; do not apply both cutoffs if §4.6b is ever built.
+#: catalogue declares 1200 K; do not apply both cutoffs with POLARIS dust RT.
 T_SUBLIMATION_K = 1500.0
 
 #: cyclic, right-handed (plane-of-sky-1, plane-of-sky-2, line-of-sight) triples.

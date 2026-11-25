@@ -38,10 +38,13 @@ from IC_analysis_framework import (
 
 # -a..-f match runtest.sh setup_square() flag-for-flag with the same defaults.
 PARAM_SPEC = [
-    Param("a", "rhodiff", 4.0,           float, "density contrast chi = rho_in/rho_out"),
-    Param("b", "przero",  2.5,           float, "uniform pressure P (sets the sound speed)"),
-    Param("c", "gamma",   5.0 / 3.0,     float, "adiabatic index"),
-    Param("d", "is3d",    0,             int,   "1 = 3D inner cube, 0 = 2D thin-slab square"),
+    Param("a", "rhodiff", 4.0, float,
+          "density contrast chi = rho_in/rho_out", "chi"),
+    Param("b", "przero", 2.5, float,
+          "uniform pressure P (sets the sound speed)", "P"),
+    Param("c", "gamma", 5.0 / 3.0, float, "adiabatic index", "g"),
+    Param("d", "is3d", 0, int,
+          "1 = 3D inner cube, 0 = 2D thin-slab square", "d3"),
 ]
 
 # Spurious-velocity diagnostics: ideal (static) = 0, so the analytic is a flat

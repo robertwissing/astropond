@@ -53,9 +53,12 @@ from IC_analysis_general import (
 # runtest.sh setup_mhdcollapse(): the three IC physics parameters. Carried for
 # labelling/context; the (reference) diagnostics here are parameter-agnostic.
 PARAM_SPEC = [
-    Param("a", "mu",      10.0,  float, "mass-to-flux ratio (sets Bz; mu=critical units)"),
-    Param("b", "rhodiff", 360.0, float, "cloud/medium density contrast"),
-    Param("c", "Erat",    0.045, float, "rotational energy ratio (sets the spin)"),
+    Param("a", "mu", 10.0, float,
+          "mass-to-flux ratio (sets Bz; mu=critical units)", "mu"),
+    Param("b", "rhodiff", 360.0, float,
+          "cloud/medium density contrast", "rd"),
+    Param("c", "Erat", 0.045, float,
+          "rotational energy ratio (sets the spin)", "Erat"),
 ]
 
 # Central render window: Wissing & Shen use L = 2000 AU (face-on and edge-on).

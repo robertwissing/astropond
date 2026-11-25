@@ -1,31 +1,26 @@
 #!/usr/bin/env python
-"""Interp perf/budget regression bench for `sph_interp` (SPH_INTERP_PLAN task 8).
+"""Interp perf/budget regression bench for `sph_interp`.
 
-The conefix 20x petkova regression shipped unnoticed because nothing timed the
-deposits. This script times mesh BUILD and INTERP per (dataset x geometry x
-method x backend) and verifies the conservation budgets, so a perf or accuracy
-regression shows up as a diffable number instead of a slow demo.
+Times mesh BUILD and INTERP per (dataset x geometry x method x backend) and
+verifies the conservation budgets, so a perf or accuracy regression shows up as
+a diffable number.
 
-Datasets -- ALL SELF-GENERATED, no snapshot files (changed 2026-07-28; the
-canonical mhdcollapse snapshots are not on this machine and are NOT being
-restored, so the bench now stands on `sph_interp.synthetic` instead):
-  clustered the historical baseline set: two Gaussian clumps + sparse halo in a
-            periodic box (seeded; h from cKDTree kNN, rho consistent). KEPT
-            unchanged -- every stored perf number in SPH_INTERP_PLAN task 14
-            is on this set, so replacing it would break comparability.
+Datasets -- ALL SELF-GENERATED, no snapshot files:
+  clustered the baseline set: two Gaussian clumps + sparse halo in a periodic
+            box (seeded; h from cKDTree kNN, rho consistent). Kept fixed so
+            stored perf numbers stay comparable.
   <family>  any of `sph_interp.synthetic.FAMILIES`, calibrated against the real
-            ICs in test_cases/isolated_galaxy (plan task 15):
+            ICs in test_cases/isolated_galaxy:
               uniform lattice closepacked glass slab1d slab2d
               disk merger cosmo collapse
-            `glass` replaces the old `early` (mild contrast, near-uniform) and
-            `collapse` replaces `core` (high dynamic range). disk/merger/cosmo
-            are OPEN captures and exercise the padded-domain path the snapshot
-            datasets never did.
+            `glass` is mild contrast (near-uniform), `collapse` high dynamic
+            range. disk/merger/cosmo are OPEN captures and exercise the
+            padded-domain path.
 
 Budgets asserted by --check (timings are informational, never asserted):
   sph-scatter deposited mass  == total particle mass   (rel tol 1e-12)
   petkova     deposited mass  == total particle mass   (uniform/AMR 1e-8;
-              Voronoi 1e-4 -- hull-face reconstruction floor, see plan task 6)
+              Voronoi 1e-4 -- hull-face reconstruction floor)
   Voronoi     Sum(cell volume) == box volume           (ghost path: the
               mesher noise tol from targets; arepo native 1e-5)
   sph-gather  is NOT mass-conserving by construction: reported, never checked.
@@ -61,9 +56,7 @@ except ImportError:                      # older targets.py: pre-noise-tol check
 # Domain bounds live in ONE place: the scaling bench owns `domain_bounds`
 # (periodic -> the particle box; open -> `open_domain_bounds(rho_edge_pad)`)
 # and `_npx_for` (cubic cells on a thin box). Importing them rather than
-# re-deriving keeps the two benches from drifting apart -- this bench used to
-# hand-roll a 2% pad on non-periodic input, which is exactly the mistake that
-# made `merger` petkova report -3.1e-3.
+# re-deriving keeps the two benches from drifting apart.
 from _bench_scaling import domain_bounds, _npx_for
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +169,7 @@ def effective_backend(backend, p):
     per-axis periodicity, so it keeps the periodic sets; but on a padded OPEN
     domain its guarded-open path fails its own volume budget (+9.3e-5 against
     1e-5 -- the float32 ConvexHull floor amplified by the cell-size spread a
-    pad creates; see plan task 6), and `auto` prefers arepo and so would refuse
+    pad creates), and `auto` prefers arepo and so would refuse
     outright rather than fall back. An explicit --backends choice still wins."""
     if backend in (None, "auto") and not any(np.atleast_1d(p.periodic)):
         return "multivoro"
@@ -184,7 +177,7 @@ def effective_backend(backend, p):
 
 
 def deposited_mass(res, grid):
-    """Total mass the deposit put on the mesh (see plan task 8 notes).
+    """Total mass the deposit put on the mesh.
     sph-scatter: norm IS the accumulated cell mass. petkova: the engines
     expose `_mass` (conserved per-cell mass); fall back to rho*V, which
     telescopes to the same thing. sph-gather: rho*V (NOT conserved --
@@ -206,9 +199,7 @@ def volume_error(grid, p):
     The reference is `grid.lo/hi`, not the particle box. An open mesh is still
     a closed region -- it is built on padded bounds plus a background guard
     lattice, and it tiles THOSE bounds. Comparing it to the particle box would
-    report a false error, which is why this check used to bail out on anything
-    non-periodic and so never ran on an open capture at all. For a periodic
-    mesh grid.lo/hi IS the box, so the periodic numbers are unchanged."""
+    report a false error. For a periodic mesh grid.lo/hi IS the box."""
     if not isinstance(grid, VoronoiGrid):
         return None
     span = np.asarray(grid.hi, dtype=np.float64) - np.asarray(grid.lo,

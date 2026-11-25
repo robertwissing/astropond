@@ -24,7 +24,7 @@ from .relax import relax
 from . import resample
 
 
-def _level_diag(pos, mass, h, rho, density, box, nsmooth, flavour, rhopow,
+def _level_diag(pos, mass, h, rho, density, box, nsmooth, force_kw, rhopow,
                 nsmoothmin):
     """End-of-stage error on a level's glass: denserr |1-rho/rho0| and the
     residual descent force |icvel|, each as mean/p95/max. Lets us see how well
@@ -34,11 +34,12 @@ def _level_diag(pos, mass, h, rho, density, box, nsmooth, flavour, rhopow,
         box = np.asarray(box, float)
         pos = pos - box * np.rint(pos / box)
     rho = np.asarray(rho, float)
-    rho0 = density.rho0(pos)
+    rho0 = (density.rho0_h(pos, h)
+            if getattr(density, 'smooth_readout', False)
+            else density.rho0(pos))
     err = np.abs(1.0 - rho / rho0)
     force = residual_force(pos, mass, h, rho, rho0, box, rhopow=rhopow,
-                           nsmooth=nsmooth, flavour=flavour,
-                           nsmoothmin=nsmoothmin)
+                           nsmooth=nsmooth, nsmoothmin=nsmoothmin, **force_kw)
     return dict(denserr_mean=float(err.mean()),
                 denserr_p95=float(np.percentile(err, 95)),
                 denserr_max=float(err.max()),
@@ -63,10 +64,16 @@ class _ShiftedField(DensityField):
         return _envelope._eval(self.field, np.asarray(pos) + self.shift)
 
     def rho0_h(self, pos, h):
-        # forward the kernel-matched readout (task M4) into the open frame
+        # forward the kernel-matched readout into the open frame
         if hasattr(self.field, 'rho0_h'):
             return self.field.rho0_h(np.asarray(pos) + self.shift, h)
         return self.rho0(pos)
+
+    def rho0_stencil(self, pos, support, offsets, weights):
+        if hasattr(self.field, 'rho0_stencil'):
+            return self.field.rho0_stencil(np.asarray(pos) + self.shift,
+                                           support, offsets, weights)
+        return super().rho0_stencil(pos, support, offsets, weights)
 
     @property
     def smooth_readout(self):
@@ -78,7 +85,7 @@ class _ShiftedField(DensityField):
 def _measure(pos, mass, density, box, nsmooth, relax_kw):
     """Measure (pos_wrapped, h, rho) on a STATIC particle set via one zero-step
     relax iteration (icr0=0 -> particles do not move), so the post-split state
-    is measured with exactly the same hmode/flavour conventions the fine
+    is measured with exactly the same hmode/force conventions the fine
     stage uses (the split itself only produces positions + mass; rho/h are not
     defined until a neighbour pass)."""
     mkw = {k: v for k, v in relax_kw.items()
@@ -210,8 +217,8 @@ def default_levels(nx_full, nx_coarse, coarse_kw=None, fine_kw=None,
                    icr0_stop=icr0_stop, polish_iter=polish_iter)
         lvl.update(coarse_defaults)
         # the single level IS the final relax: honour an explicit momentum=
-        # (was silently dropped - coarse_defaults carries none); coarse_kw
-        # still wins if it set momentum itself.
+        # (coarse_defaults carries none); coarse_kw still wins if it set
+        # momentum itself.
         lvl.setdefault('momentum', momentum)
         return [lvl]
     factor = _nearest_pow2((nx_full / nx_coarse) ** 3)
@@ -288,10 +295,9 @@ def cascade_levels(nx_full=None, nx_coarse=None, *, factor=None, inter_iter=10,
         lvl = dict(name='full', split_factor=1,
                    icr0_stop=icr0_stop, polish_iter=polish_iter)
         lvl.update(coarse_defaults)
-        # the single level IS the final relax: honour an explicit momentum=
-        # (was silently dropped, so envelope builds - merge factor 1 on sharp
-        # fields - could never receive momentum from ANY caller, including
-        # the glassgen CLI's --momentum 0.5 default); coarse_kw still wins.
+        # the single level IS the final relax (envelope builds on sharp
+        # fields run at merge factor 1): honour an explicit momentum=;
+        # coarse_kw still wins.
         lvl.setdefault('momentum', momentum)
         return [lvl]
     k = int(round(np.log2(total)))
@@ -321,7 +327,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                       filler_field_hook=None, verbose=False, **relax_kw):
     """Progressive coarse->split->fine glass relaxation.
 
-    envelope : optional free-surface padding (RECONSTRUCT_PLAN.md). A dict
+    envelope : optional free-surface padding. A dict
         with keys `density` (the PaddedDensity target, used instead of the
         `density` arg), `occupancy` (a field/callable ->~0/1 for the final
         spatial vacuum cull), `bg_pos`/`bg_mass` (background particles seeded
@@ -330,7 +336,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
         `gas_mass` (the real gas mass the survivors are renormalised to). If
         `box is None` the whole pipeline is framed in a padded periodic box
         (`_pad_periodic_box`, margin `open_pad`) and the output is shifted back
-        to the open coordinates. `None` = no padding (today's behaviour).
+        to the open coordinates. `None` = no padding.
 
     pos, mass : the FULL-resolution pre-IC (N = nx_full**3). In the default
         two-level path these positions are NOT relaxed directly - the coarse
@@ -347,7 +353,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
         total split factor (resample.coarsen) - so splitting it back restores the
         input count EXACTLY (1:1), with the coarse seed derived from the high-res
         pre-IC itself (no separate low-res file).
-    relax_kw : forwarded to every relax() call (e.g. flavour, hmode,
+    relax_kw : forwarded to every relax() call (e.g. sigma_f, gradient, hmode,
         one_sided, diagnostics). Per-level keys (confine, reanneal, icr0,
         icrloop0, max_iter, icr0_stop, momentum) come from the level dict.
     momentum : heavy-ball coefficient injected into the POST-SPLIT levels only
@@ -360,7 +366,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
     pos = np.asarray(pos, dtype=np.float64)
     mass = np.asarray(mass, dtype=np.float64)
     # --- envelope framing: pad open boxes, seed the background, use the
-    #     PaddedDensity target (see RECONSTRUCT_PLAN.md) --------------
+    #     PaddedDensity target ---------------------------------------
     env_shift = None
     env_gas_mass = None
     env_occupancy = None
@@ -373,7 +379,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
         env_occupancy = envelope['occupancy']
         if box is None:                       # open IC -> padded periodic frame
             if envelope.get('frame_box') is not None:
-                # M2 rule: the envelope sized the frame itself (per-axis
+                # the envelope sized the frame itself (per-axis
                 # margins + the kernel-fits-the-box cap from Delta_bg)
                 box = np.asarray(envelope['frame_box'], dtype=np.float64)
                 env_shift = np.asarray(envelope['frame_centre'],
@@ -477,7 +483,9 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
 
     result = None
     level_stats = []
-    diag_flavour = relax_kw.get('flavour', 'gdforce')
+    level_history = []
+    diag_force = {k: relax_kw[k] for k in ('sigma_f', 'gradient', 'kernel')
+                  if k in relax_kw}
     diag_rhopow = relax_kw.get('rhopow', 2.0)
     diag_nsmoothmin = relax_kw.get('nsmoothmin', 32)
     for lvl in levels:
@@ -497,7 +505,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                       niter=0, converged=True, wall=0.0,
                       stop_reason='post-split')
             ps.update(_level_diag(ps_pos, cur_mass, ps_h, ps_rho, density, box,
-                                  nsmooth, diag_flavour, diag_rhopow,
+                                  nsmooth, diag_force, diag_rhopow,
                                   diag_nsmoothmin))
             level_stats.append(ps)
             if verbose:
@@ -519,13 +527,14 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
         result = relax(cur_pos, cur_mass, density, box=box, nsmooth=nsmooth,
                        verbose=verbose, **kw)
         wall = time.perf_counter() - t_lvl
+        level_history.append((lvl.get('name'), result.history))
         stats = dict(name=lvl.get('name'), n=len(cur_pos), niter=result.niter,
                      converged=result.converged, wall=wall,
                      stop_reason=result.stop_reason)
         # end-of-stage error (denserr + residual force) so we can see how well
         # the coarse stage fit the field before the fine stage refined it
         stats.update(_level_diag(result.pos, cur_mass, result.h, result.rho,
-                                 density, box, nsmooth, diag_flavour,
+                                 density, box, nsmooth, diag_force,
                                  diag_rhopow, diag_nsmoothmin))
         level_stats.append(stats)
         if verbose:
@@ -538,6 +547,7 @@ def relax_progressive(pos, mass, density, box, *, nx_full=None, nx_coarse=64,
                   f"{stats['force_max']:.2e}", flush=True)
         cur_pos = result.pos
     result.levels = level_stats
+    result.level_history = level_history
     # mass-consistency sanity (legacy nx-based path only; the merge path is
     # exact by construction - split(coarsen(x,F),F) restores the input count).
     if not skip_coarse and nx_full is not None and not (
@@ -614,7 +624,7 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
                      km_hmode='particle', km_hscale=1.0,
                      tail_reach=None, n_frame=None, nl0=None, bg_over=0.0,
                      verbose=False, **relax_kw):
-    """THE glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10).
+    """THE glassgen table builder.
 
     Given a density table (AMRTable / 3D TableDensity) and a target count,
     sample the initial ``count`` positions from the table itself
@@ -628,22 +638,20 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
         AND the box is periodic - a filled box), 'on', or 'off'. 'off' with
         ``box=None`` is an error: an open relax cannot contain a free surface.
     kernel_match : evaluate the relax target as each particle's own KERNEL
-        AVERAGE of the table (:class:`density.KernelMatchedDensity`, plan
-        task M4 - default ON, approved 2026-07-10): where the table is
-        sharper than the N-particle kernel (thin-disk z profiles) the
-        pseudo-pressure ratio -> 1 instead of blowing the feature open.
-        Resolved regions are unaffected to second order. False = the point
-        read (pre-M4 behaviour).
+        AVERAGE of the table (:class:`density.KernelMatchedDensity`, default
+        ON): where the table is sharper than the N-particle kernel (thin-disk
+        z profiles) the pseudo-pressure ratio -> 1 instead of blowing the
+        feature open. Resolved regions are unaffected to second order.
+        False = the point read.
     alpha : the cascade resolvability tolerance (auto_coarse_count);
-        defaults to envelope.ALPHA_DEFAULT. The vacuum fill is the M18
-        no-floor profile (taper family retired C2, cubic scaffold deleted
-        C3, 2026-07-17); the background is always sampled backing (the
-        closure as sole sampler; lattice/bg_tail retired 2026-07-16, C1).
+        defaults to envelope.ALPHA_DEFAULT. The vacuum fill is the
+        no-floor profile; the background is always sampled backing (the
+        closure as sole sampler).
     gas_mass : the mass contract. Defaults to the table integral sum(rho*V);
         pass the input snapshot's exact gas mass when reconstructing.
     relax_kw : forwarded to :func:`relax_progressive` - its named cascade
         knobs (max_iter, icr0_stop, momentum, ...) bind there; the rest reach
-        every relax() call (callback, flavour, hmode, ...).
+        every relax() call (callback, sigma_f, gradient, hmode, ...).
 
     Returns the final RelaxResult: ``res.envelope_audit`` (always set; mf =
     the survivors' per-particle mass) + ``res.table_build`` (rho_edge/
@@ -680,10 +688,11 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
     target = env['density'] if env is not None else table
     if kernel_match:
         from .density import KernelMatchedDensity
-        # km_hmode='target' (2026-07-13): equilibrium-h readout - the
+        # km_hmode='target': equilibrium-h readout - the
         # averaging scale from the target's own density instead of each
         # particle's state (breaks the drained-region h-growth feedback)
         target = KernelMatchedDensity(target, hmode=km_hmode,
+                                      kernel=relax_kw.get('kernel', 'wendlandc2'),
                                       m=float(gas_mass) / int(count),
                                       nsmooth=nsmooth,
                                       rho_edge=(env['rho_edge']
@@ -696,9 +705,7 @@ def build_from_table(table, count, box=None, *, gas_mass=None, nsmooth=64,
     rkw = dict(relax_kw)
     rkw.pop('reanneal', None)                # the cascade sets these per stage
     rkw.pop('confine', None)
-    # ONE resolvability constant: the same alpha drives the cubic scaffold
-    # (above) and the cascade's auto_coarse_count bound (relax_progressive) -
-    # callers that used to pass alpha through relax_kw keep working
+    # alpha sets the cascade's auto_coarse_count bound unless relax_kw has one
     rkw.setdefault('alpha', alpha)
     res = relax_progressive(pos, mass, target,
                             box, coarse_seed='merge', nsmooth=nsmooth,

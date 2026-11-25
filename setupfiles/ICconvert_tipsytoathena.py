@@ -38,8 +38,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sph_interp.gridic import write_grid_ic
-# NB `_param`/`_f` are still private imports from the ramses converter -
-# they are the .param PARSER, which CONSOLIDATION_PLAN D1 unifies next.
+# NB `_param`/`_f` (the .param parser) are private imports from the ramses converter.
 from ICconvert_tipsytoramses import _param, _f
 from ICconvert_common import find_sibling_param, has_nonzero_b as _has_nonzero_b
 

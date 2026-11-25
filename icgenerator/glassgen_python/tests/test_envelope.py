@@ -2,7 +2,6 @@
 
 Grid-agnostic: the density field / occupancy / shell targets are simple
 callables here, so these tests need neither sph_interp nor a captured table.
-See RECONSTRUCT_PLAN.md.
 """
 import numpy as np
 
@@ -41,7 +40,7 @@ def test_edge_floor_spacing_relations():
     vals = np.array([0., 1., 2., 3., 4.])
     vols = np.ones_like(vals)
     # cumsum 0,1,3,6,10; c*m=3 first reached at density 2
-    # rho_floor retired (two-rung ladder, 2026-07-14): returns (rho_edge, delta_bg)
+    # returns (rho_edge, delta_bg)
     re, dbg = E.edge_floor_spacing(vals, vols, m=1.0, c=3.0, k=2.0)
     assert re == 2.0
     assert np.isclose(dbg, 2.0 * (1.0 / re) ** (1.0 / 3.0))
@@ -111,6 +110,74 @@ def test_place_background_graded_toward_gas():
     near = ((r > 1.0) & (r < 1.2)).sum() / (1.2 ** 3 - 1.0 ** 3)
     far = ((r > 1.4) & (r < 1.6)).sum() / (1.6 ** 3 - 1.4 ** 3)
     assert near > far                              # denser next to the gas
+
+
+def test_place_background_topup_is_exact_and_vacuum_only():
+    m = _m_for_spacing(0.15)
+    kwargs = dict(region_lo=[-2, -2, -2], region_hi=[2, 2, 2], seed=4)
+    base_pos, _ = E.place_background(
+        _Occ(), _Shell(), RHO_EDGE, RHO_FLOOR, m, **kwargs)
+    extra_pos, extra_mass = E.place_background(
+        _Occ(), _Shell(), RHO_EDGE, RHO_FLOOR, m,
+        n_extra=37, **kwargs)
+    assert len(extra_pos) == len(base_pos) + 37
+    np.testing.assert_array_equal(extra_pos[:len(base_pos)], base_pos)
+    assert np.allclose(extra_mass, m)
+    assert (_Occ().rho0(extra_pos[len(base_pos):]) < 0.5).all()
+    assert (_Shell().rho0(extra_pos[len(base_pos):]) > RHO_FLOOR).all()
+
+
+def _mapped_disk_table():
+    """Smooth axisymmetric target with a genuine faint skirt."""
+    from glassgen.density import TableDensity
+    radius = np.linspace(0.0, 1.6, 65)
+    height = np.linspace(0.0, 0.8, 49)
+    values = (2.0 * np.exp(-(radius[:, None] / 0.65) ** 4)
+              * np.exp(-0.5 * (height[None, :] / 0.18) ** 2)
+              + 1.0e-10)
+    return TableDensity((radius, height), values,
+                        mapping=('r_cyl', 'z'))
+
+
+def test_open_mapped_adapter_uses_table_contract_and_exact_target():
+    density = _mapped_disk_table()
+    rng = np.random.default_rng(8)
+    pos = rng.uniform([-0.9, -0.9, -0.4], [0.9, 0.9, 0.4], (1000, 3))
+    env = E.build_open_density_envelope(
+        density, pos, gas_mass=0.2, n_final=len(pos), c=16,
+        ngrid=24, nsmooth=32, n_frame=8, bg_over=0.0)
+
+    # The adapter really uses the table prescription: scaffold metadata and the
+    # whole-frame sampled mass contract are present, with no lattice closure.
+    assert env['quadrature_ngrid'] == 24
+    assert np.isclose(env['bg_k'], (32.0 / 8.0) ** (1.0 / 6.0))
+    assert 'tail_reach' in env and 'nl0' in env and 'M_target' in env
+    carried = env['gas_mass'] + env['bg_mass'].sum()
+    assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
+
+    # Cartesian cells are volume-correct: their faces reproduce the recorded
+    # quadrature region exactly, rather than extending half a cell beyond it.
+    centres, sizes, _, _ = E.table_cells(env['seed_table'])
+    np.testing.assert_allclose((centres - 0.5 * sizes).min(0),
+                               env['quadrature_region_lo'])
+    np.testing.assert_allclose((centres + 0.5 * sizes).max(0),
+                               env['quadrature_region_hi'])
+
+    # Grid values are not substituted for pointwise physics. The original
+    # mapped object is the gas-side target; occupancy is exact and every
+    # contour-straddling background draw has been rejected if it landed in gas.
+    assert env['density'].base is density
+    q = np.array([[0.23, 0.11, 0.047], [0.42, -0.08, -0.031]])
+    assert (env['occupancy'].rho0(q) == 1.0).all()
+    np.testing.assert_allclose(env['density'].rho0(q), density.rho0(q))
+    assert len(env['bg_pos']) > 0
+    assert (env['occupancy'].rho0(env['bg_pos']) < 0.5).all()
+
+    # An open -I caller can now take only its requested count and draw a fresh
+    # density-weighted seed from the volume table.
+    seed = E.sample_table(env['seed_table'], len(pos), seed=3)
+    assert seed.shape == pos.shape
+    assert not np.array_equal(seed, pos)
 
 
 def test_cull_vacuum_conserves_mass_and_removes_vacuum():
@@ -201,7 +268,7 @@ def test_build_table_envelope_ball():
     v = env['density'].rho0(np.array([[0., 0., 0.], [0.45, 0.45, 0.45]]))
     assert np.isclose(v[0], 10.0)
     assert 0.0 < v[1] <= env['rho_edge']
-    # seam contract (2026-07-10 fix): the VACUUM side of the padded target
+    # seam contract: the VACUUM side of the padded target
     # never exceeds rho_edge - without the cap/clamp, trilinear bleed from
     # the 10-density gas cells makes the shell read O(10) right outside the
     # contour while the base side hands over rho_edge (an O(1) value seam)
@@ -210,11 +277,11 @@ def test_build_table_envelope_ball():
     vac = env['occupancy'].rho0(q) < 0.5
     pv = env['density'].rho0(q[vac])
     assert pv.max() <= env['rho_edge'] * (1 + 1e-9)
-    # M6: the deep vacuum decays below the old rho_floor, but never below
-    # the frame floor rho_frame = rho_edge/k**6
+    # the deep vacuum decays, but never below the frame floor
+    # rho_frame = rho_edge/k**6
     assert pv.min() >= env['rho_frame'] * (1 - 1e-9)
-    # and the shell FILL starts at min(edge cell, rho_edge): filled (formerly
-    # sub-floor) cells never carry more than rho_edge (unwrap the M6
+    # and the shell FILL starts at min(edge cell, rho_edge): filled
+    # (sub-rho_edge) cells never carry more than rho_edge (unwrap the
     # _TailedShell to reach the cell table)
     shell = env['density'].shell
     _, _, _, shell_vals = E.table_cells(getattr(shell, 'shell', shell))
@@ -223,12 +290,12 @@ def test_build_table_envelope_ball():
 
 
 def test_vacuum_tail_monotone_home_pointing():
-    # M6 (whole-frame vacuum decay): the deep vacuum is never flat - away
-    # from the gas the padded target keeps decaying (exp taper -> power-law
-    # tail in the cells, analytic _TailedShell continuation beyond the table
-    # domain), reaching the frame floor rho_frame only toward the frame edge.
-    # A re-anneal-kicked stray anywhere in the frame feels a home-pointing
-    # gradient (the M4-rerun movie failure was the flat rho_floor).
+    # whole-frame vacuum decay: the deep vacuum is never flat - away from
+    # the gas the padded target keeps decaying (power-law profile in the
+    # cells, analytic _TailedShell continuation beyond the table domain),
+    # reaching the frame floor rho_frame only toward the frame edge. A
+    # re-anneal-kicked stray anywhere in the frame feels a home-pointing
+    # gradient.
     from glassgen.density import TableDensity
     n = 24
     ax = (np.arange(n) + 0.5) / n - 0.5
@@ -240,8 +307,7 @@ def test_vacuum_tail_monotone_home_pointing():
                                  c=64, k=2.0)
     assert np.isclose(env['rho_frame'], env['rho_edge'] / 2.0 ** 6)
     # radial ray: taper region, deep in-domain vacuum, outside the domain.
-    # Radii re-aimed 2026-07-16 (taper_len retired, CLEANUP_PLAN C1a): the
-    # frame is now 1.2 (half-extent 0.6), so probes must sit INSIDE it -
+    # The frame is 1.2 (half-extent 0.6), so probes must sit INSIDE it -
     # beyond the frame the readout clamps flat at rho_frame, but positions
     # wrap there and no particle can exist (benign, culled). 0.30/0.40/0.49
     # land in distinct cells (width 1/24; finer spacing would alias two
@@ -251,14 +317,12 @@ def test_vacuum_tail_monotone_home_pointing():
     v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
     assert (np.diff(v) < 0).all()                  # strictly decreasing
     assert v.min() >= env['rho_frame'] * (1 - 1e-9)
-    # the tail actually dips BELOW the old flat floor (where the pre-M6
-    # shell was constant at rho_floor there was no gradient at all)
+    # the tail dips below rho_edge/k**3
     assert v[-1] < env['rho_edge'] / 2.0 ** 3
-    # mass-contract closure (2026-07-13): the lattice population is topped
-    # up so the ensemble carries the target's WHOLE integral (gas + shell +
-    # analytic outside-domain tail) - tail-mass representatives may sit
-    # beyond the taper now (placement is free, the relax redistributes),
-    # but the BULK of the backing still lives in the taper
+    # mass-contract closure: the ensemble carries the target's WHOLE
+    # integral (gas + shell + analytic outside-domain tail) - tail-mass
+    # representatives may sit beyond the taper (placement is free, the
+    # relax redistributes), but the BULK of the backing lives in the taper
     assert len(env['bg_pos']) > 0
     carried = env['gas_mass'] + env['bg_mass'].sum()
     assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
@@ -267,10 +331,9 @@ def test_vacuum_tail_monotone_home_pointing():
 
 
 def test_fill_empty_no_floor_shelf_strictly_decreasing():
-    # M18 (retire the flat rho_floor shelf): with flat_floor=False the 'decay'
-    # fill is ONE strictly-decreasing profile edge*(1+d/r_scale)^-p from the
-    # nearest-occupied value down to tail_floor at the frame corner - NO
-    # rho_floor plateau (the parking lot). Build an explicit 1D ray from a
+    # the 'decay' fill is ONE strictly-decreasing profile edge*(1+d/r_scale)^-p
+    # from the nearest-occupied value down to tail_floor at the frame corner -
+    # NO plateau (the parking lot). Build an explicit 1D ray from a
     # single gas cell at the origin so the distance-from-gas is exact.
     d = np.concatenate([[0.0], np.linspace(0.03, 0.7, 40)])   # gas + ray
     centres = np.zeros((len(d), 3))
@@ -289,8 +352,7 @@ def test_fill_empty_no_floor_shelf_strictly_decreasing():
 
 def test_fill_empty_no_floor_needs_tail():
     # 'decay' is meaningless without the frame corner (tail_scale) and its
-    # floor (tail_floor) - the profile has nowhere to decay to. (The only
-    # fill since the taper family retired, CLEANUP_PLAN C2.)
+    # floor (tail_floor) - the profile has nowhere to decay to.
     import pytest
     centres = np.array([[0.0, 0, 0], [0.1, 0, 0]])
     vals = np.array([10.0, 0.0])
@@ -319,7 +381,7 @@ def test_fill_empty_tail_reach_steepens_midfield():
 
 
 # --------------------------------------------------------------------------- #
-#  M2: per-axis padding + kernel-fits-the-box rule (frame_open_box)
+#  Per-axis padding + kernel-fits-the-box rule (frame_open_box)
 # --------------------------------------------------------------------------- #
 
 def test_kernel_support_scaling():
@@ -343,8 +405,7 @@ def test_frame_open_box_thin_axis_capped_by_kernel():
 
 
 def test_frame_open_box_margins():
-    # margins are max(pad_frac*span, H_edge) -- taper_len retired 2026-07-16
-    # (CLEANUP_PLAN C1a), so only these two terms compete.
+    # margins are max(pad_frac*span, H_edge)
     # small kernel: the pad_frac margin (1.0 each side) wins
     box, _ = E.frame_open_box([0, 0, 0], [10, 10, 10], delta_bg=0.5,
                               nsmooth=64, pad_frac=0.1, k=2.0)
@@ -383,9 +444,8 @@ def _ball_table(n=24):
 
 def test_frame_open_box_cap_delta_grows_cap():
     # cap_delta grows the kernel-fits-the-box cap for sparser-than-delta_bg
-    # kernels (kept after the bg_tail retirement 2026-07-16: the sampled
-    # backing's faintest fillers can sit at spacing up to k*delta_bg - see
-    # CLEANUP_PLAN RECHECK caveat 2)
+    # kernels (the sampled backing's faintest fillers can sit at spacing up
+    # to k*delta_bg)
     kw = dict(delta_bg=4.0, nsmooth=64, pad_frac=0.1, k=2.0)
     box0, _ = E.frame_open_box([-50, -50, -2.5], [50, 50, 2.5], **kw)
     box1, _ = E.frame_open_box([-50, -50, -2.5], [50, 50, 2.5],
@@ -396,12 +456,8 @@ def test_frame_open_box_cap_delta_grows_cap():
 
 
 def test_sampled_backing_and_retired_kwargs():
-    # the post-cubic pivot: decay_spacing (lambda in output-spacing units,
-    # pinned to the legacy flat_floor=True taper it shapes - inert on the
-    # M18 no-floor profile) + sampled backing, the closure as the sole
-    # sampler (UNCONDITIONAL since the lattice retirement 2026-07-16,
-    # CLEANUP_PLAN C1). Closure contract exact; all backing at particle
-    # mass m in vacuum.
+    # sampled backing, the closure as the sole sampler: closure contract
+    # exact; all backing at particle mass m in vacuum.
     t = _ball_table()
     gm = E.table_mass(t)
     env = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0)
@@ -410,9 +466,8 @@ def test_sampled_backing_and_retired_kwargs():
     carried = env['gas_mass'] + env['bg_mass'].sum()
     assert abs(carried - env['M_target']) <= env['m'] * (1 + 1e-9)
     assert (env['occupancy'].rho0(env['bg_pos']) < 0.5).all()
-    # exp-shape target: monotone outward, floored at rho_frame (radii
-    # re-aimed inside the post-C1a frame, half-extent 0.6 - see
-    # test_vacuum_tail_monotone_home_pointing)
+    # target: monotone outward, floored at rho_frame (radii inside the
+    # frame, half-extent 0.6 - see test_vacuum_tail_monotone_home_pointing)
     radii = np.array([0.30, 0.40, 0.49, 0.58])
     v = env['density'].rho0(np.stack([radii, np.zeros(4), np.zeros(4)], 1))
     assert (np.diff(v) <= 0).all() and v[0] > v[-1]
@@ -424,13 +479,13 @@ def test_sampled_backing_and_retired_kwargs():
     v_in = 0.35 ** 3 - 0.25 ** 3
     v_out = 0.55 ** 3 - 0.45 ** 3
     assert n_in / v_in > 2.0 * n_out / v_out
-    # the retired lattice/bg_tail machinery is really gone (C1)
+    # bg_mode/bg_tail kwargs are rejected
     import pytest
     with pytest.raises(TypeError):
         E.build_table_envelope(t, gm, 5000, box=None, bg_mode='sample')
     with pytest.raises(TypeError):
         E.build_table_envelope(t, gm, 5000, box=None, bg_tail=True)
-    # ... and so is the taper family (C2)
+    # ... and so are the taper-family kwargs
     for kw in (dict(flat_floor=True), dict(shell_start='edge'),
                dict(decay_spacing=1.0), dict(decay_cells=4.0),
                dict(decay_local=True)):
@@ -439,10 +494,10 @@ def test_sampled_backing_and_retired_kwargs():
 
 
 def test_bg_over_oversubscribes_closure():
-    # M21 (2026-07-18): bg_over oversubscribes the mass-contract closure by
+    # bg_over oversubscribes the mass-contract closure by
     # bg_over*n_final extra fillers (ensemble mass ABOVE M_target), aimed at
     # cancelling the systematic post-cull count undershoot (renorm f > 1).
-    # Default 0 = the exact contract, byte-identical behaviour.
+    # Default 0 = the exact contract.
     t = _ball_table()
     gm = E.table_mass(t)
     env0 = E.build_table_envelope(t, gm, 5000, box=None, c=64, k=2.0)
@@ -463,12 +518,12 @@ def test_bg_over_oversubscribes_closure():
 
 
 # --------------------------------------------------------------------------- #
-#  M20: the (nl0, n_frame) reparametrization (RECONSTRUCT_PLAN M20)
+#  The (nl0, n_frame) scaffold parametrization
 # --------------------------------------------------------------------------- #
 
 def test_resolve_bg_k_mapping():
     import pytest
-    # pointwise ladder: k = (nsmooth/n_frame)^(1/6); n_frame=1 <=> old k=2
+    # k = (nsmooth/n_frame)^(1/6); n_frame=1 <=> k=2
     assert np.isclose(E.resolve_bg_k(n_frame=1.0, nsmooth=64), 2.0)
     assert np.isclose(E.resolve_bg_k(n_frame=16.0, nsmooth=64),
                       4.0 ** (1.0 / 6.0))
@@ -505,7 +560,7 @@ def test_scaffold_resolvability_guard():
 
     import pytest
     ts, sp, ns = 90.65, 4.53, 64
-    # the M19 valley cell (k1.5, tr6): LAUNCHES in the band on a thin floor
+    # the valley cell (k1.5, tr6): LAUNCHES in the band on a thin floor
     with pytest.warns(UserWarning, match='LAUNCHES in the N_L resonance'):
         E.check_scaffold_resolvability(ts, sp, 6.0, 1.5, nsmooth=ns)
     # k2-tr3: p = 3.0 exactly - N_L flat, the whole vacuum resonant
@@ -522,7 +577,7 @@ def test_scaffold_resolvability_guard():
         nl0_f, _ = E.check_scaffold_resolvability(ts, sp, 24.0, 1.25,
                                                   nsmooth=ns)
     assert 0.75 <= nl0_f <= 1.15
-    # the M20 default anchor (k1.25-tr12 equivalent): silent
+    # the default anchor (k1.25-tr12 equivalent): silent
     with _w.catch_warnings():
         _w.simplefilter('error')
         nl0, p = E.check_scaffold_resolvability(ts, sp, 12.0, 1.25,

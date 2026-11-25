@@ -109,7 +109,16 @@ class TelegramNotifier:
                 raise RuntimeError(f"Telegram API error: {result}")
             return result
 
-        raise RuntimeError(f"Telegram request failed after {self.retries} attempts: {last_error}")
+        # requests includes the full request URL in connection exceptions.  A
+        # Telegram Bot API URL contains the bot token, so never propagate that
+        # exception text without redacting the credential first.
+        error_detail = str(last_error)
+        if self.token:
+            error_detail = error_detail.replace(self.token, "<redacted>")
+        raise RuntimeError(
+            f"Telegram request failed after {self.retries} attempts: "
+            f"{error_detail}"
+        )
 
     @staticmethod
     def _rewind(files):

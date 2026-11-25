@@ -3,15 +3,9 @@
 A Voronoi tessellation of a point set PARTITIONS the container: the cell
 volumes sum to the container volume, exactly. Every conservation property in
 this package - petkova's mass budget, the periodic volume budget, the AMR
-capture ledgers - is downstream of that. Nothing else in the suite asserted it
-per backend, which is how a mesher that fails it at half the N values tried
-went unnoticed for so long: the default backend (arepo) is fine, and the tests
-that name a backend explicitly happened to use N values where the broken call
-still worked.
-
-The N values here include the ones that used to FAIL (400, 5000) as well as
-ones that always passed (1500, 3000), so this cannot go quiet again by luck of
-parameter choice.
+capture ledgers - is downstream of that. It is asserted per backend over
+several N values, so an N-dependent failure cannot pass by luck of parameter
+choice.
 
 Also asserts the meshers AGREE. The Voronoi tessellation of a point set is
 unique, so two correct implementations must produce identical volumes - a
@@ -44,11 +38,8 @@ def _available():
 
 AVAILABLE = _available()
 
-# No backend is expected to fail. This dict existed while pyvoro was thought
-# to be broken; the actual fault was our own call passing `radii=[]`, which
-# made pyvoro substitute a nonzero uniform radius and run a RADICAL
-# tessellation (see _tessellate). Kept as the mechanism for quarantining a
-# backend if one is ever found genuinely broken.
+# Backend -> xfail reason, for quarantining a genuinely broken backend; none is
+# expected to fail.
 BROKEN = {}
 
 
@@ -72,10 +63,9 @@ def test_cells_partition_the_container(backend, n):
                                  backend=backend)
     got = float(vg.volumes()[:vg.ncentral].sum())
     # 1e-5, not machine precision: arepo rebuilds each cell as a ConvexHull of
-    # float32 dumped vertices and carries a ~5e-7 volume floor for it (the
-    # accuracy gap of the dismissed task 6), while multivoro is exact to ~1e-12.
-    # The point of this guard is catastrophic failure - pyvoro misses it by a
-    # factor of 1000 - so a tolerance that accommodates arepo costs nothing.
+    # float32 dumped vertices and carries a ~5e-7 volume floor for it, while
+    # multivoro is exact to ~1e-12. The point of this guard is catastrophic
+    # failure, so a tolerance that accommodates arepo costs nothing.
     assert got == pytest.approx(BOX, rel=1e-5), (
         f'{backend} at N={n}: cell volumes sum to {got:.6g}, not {BOX} - '
         f'the mesh is not a partition of the container')
@@ -107,7 +97,7 @@ def test_the_working_backends_agree_exactly(n):
     the two mesh DIFFERENT generator sets - 1496 cells vs 1500 on this input -
     and a per-cell comparison would be meaningless. With the merge off they
     agree to 2e-6 worst case, which is arepo's float32 hull-reconstruction
-    floor (the dismissed task 6), not a disagreement about the geometry.
+    floor, not a disagreement about the geometry.
     """
     good = [b for b in AVAILABLE if b not in BROKEN]
     if len(good) < 2:

@@ -15,6 +15,49 @@ particles. D is data array and ranges are the domain ranges and delta is the giv
 spacing.
 """
 
+# --- which lattice a setup's distri==0 branch places ---------------------------
+# Historically each setup hardwired its lattice by calling either setcloseddist
+# (close-packed FCC) or setcubicdist (simple cubic).  runtest.sh now offers the
+# two as separate distributions (0 = FCC, 3 = cubic), so the choice is made ONCE
+# here -- IC_createsetup calls set_lattice() before sim.create() and both entry
+# points below honour it, leaving every IC_setup_*.py untouched.
+_lattice_kind = None            # None = the setup's own choice; 'closed'|'cubic'
+
+
+def set_lattice(kind):
+    """Force every lattice placement to 'closed' (FCC) or 'cubic'.
+
+    None restores the per-setup choice (what a direct call to setcubicdist /
+    setcloseddist would do)."""
+    global _lattice_kind
+    if kind not in (None, 'closed', 'cubic'):
+        raise ValueError("unknown lattice kind %r (closed|cubic|None)" % (kind,))
+    _lattice_kind = kind
+
+
+def setcubicdist(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *,
+                 force_odd=False):
+    """Simple-cubic lattice, or the FCC one when set_lattice('closed') is on."""
+    if _lattice_kind == 'closed':
+        return _closed_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta)
+    return _cubic_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta,
+                          force_odd=force_odd)
+
+
+def setcloseddist(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *,
+                  clip_to_rmax=True, periodic=True):
+    """Close-packed (FCC) lattice, or the cubic one when set_lattice('cubic').
+
+    The spherical pre-clip carries over to the cubic fill: without it the cubic
+    filler would sweep the whole (much larger) domain and reject nearly every
+    site of a sphere-shaped setup."""
+    if _lattice_kind == 'cubic':
+        return _cubic_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta,
+                              clip_to_rmax=clip_to_rmax)
+    return _closed_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta,
+                           clip_to_rmax=clip_to_rmax, periodic=periodic)
+
+
 def setcubicdist_old(D,xmin,xmax,ymin,ymax,zmin,zmax,delta):
         dxbound = xmax - xmin
         dybound = ymax - ymin
@@ -58,7 +101,17 @@ def setcubicdist_old(D,xmin,xmax,ymin,ymax,zmin,zmax,delta):
                      pass
         return(D)
 
-def setcubicdist(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *, force_odd=False):
+def _cubic_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *,
+                   force_odd=False, clip_to_rmax=False):
+    # same spherical pre-clip as the close-packed filler (off by default,
+    # on when this call stands in for a setcloseddist one)
+    if clip_to_rmax and xmax**2 > D.rmax2:
+        xmax = np.sqrt(1.01 * D.rmax2); xmin = -xmax
+    if clip_to_rmax and ymax**2 > D.rmax2:
+        ymax = np.sqrt(1.01 * D.rmax2); ymin = -ymax
+    if clip_to_rmax and zmax**2 > D.rmax2:
+        zmax = np.sqrt(1.01 * D.rmax2); zmin = -zmax
+
     def fit_axis(a_min, a_max, delta):
         L = float(a_max - a_min)
         # choose integer number of cells closest to request
@@ -178,7 +231,8 @@ def setcloseddist2(D, xmin, xmax, ymin, ymax, zmin, zmax, delta):
     print('npart =', len(D.x))
     return D
 
-def setcloseddist(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *, clip_to_rmax=True, periodic=True):
+def _closed_lattice(D, xmin, xmax, ymin, ymax, zmin, zmax, delta, *,
+                    clip_to_rmax=True, periodic=True):
     # Optional spherical clipping like your version
     if clip_to_rmax and xmax**2 > D.rmax2:
         xmax = np.sqrt(1.01 * D.rmax2); xmin = -xmax

@@ -41,6 +41,7 @@ import readtipsy as tip
 from IC_analysis_framework import (
     Param, standalone_cli,
     RenderSpec, render_panels, aux_divB_error, magnetic_pressure,
+    emit_warning,
 )
 from IC_analysis_general import (
     find_files, read_vector_aux, read_tufac, read_log_series,
@@ -57,8 +58,9 @@ REG_NPTS = 101                 # points on the regression time grid
 #  parity; the analysis normalises the energy by E_mag(0).
 # --------------------------------------------------------------------------- #
 PARAM_SPEC = [
-    Param("a", "B0", 1.0e-3, float, "uniform seed magnetic field (Bz)"),
-    Param("b", "amp", 1.0, float, "ABC flow amplitude (A=B=C)"),
+    Param("a", "B0", 1.0e-3, float,
+          "uniform seed magnetic field (Bz)", "B"),
+    Param("b", "amp", 1.0, float, "ABC flow amplitude (A=B=C)", "amp"),
 ]
 
 
@@ -310,6 +312,12 @@ def reference_table(inp):
 
 def _plot(inputs, labels, params, args):
     print(f"[abcflow] B0={params['B0']:g}  amp={params['amp']:g}")
+    emit_warning(
+        "ABC kinematic build required",
+        "A quantitative Teyssier-et-al. growth comparison requires a "
+        "Gasoline executable that freezes the prescribed ABC velocity and "
+        "applies explicit eta_mag=1e-3; the suite's ordinary gasolinemhd "
+        "evolves full MHD, so its fitted growth is qualitative.")
     runs = [series(inp) for inp in inputs]
     if all(s is None for s in runs):
         print("abcflow: no data to plot; exiting.", file=sys.stderr)

@@ -1,6 +1,6 @@
 """glassgen: numba-accelerated glass-relaxation IC generator.
 
-Python reimplementation of the gasoline.gdicgen algorithm (see PLAN.md).
+Python reimplementation of the gasoline.gdicgen algorithm.
 """
 from .density import CallableDensity, DensityField, TableDensity
 from .relax import RelaxResult, relax

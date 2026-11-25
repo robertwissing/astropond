@@ -44,9 +44,8 @@ def test_default_levels_coarse_skip():
 
 def test_single_level_honours_momentum():
     # A single full-res level IS the final relax, so an explicit momentum=
-    # must reach it (2026-07-22 fix: it was silently dropped, so envelope
-    # builds - cascade merge factor 1 - could never receive momentum from
-    # any caller). Default stays 0 and coarse_kw still wins.
+    # must reach it (envelope builds are cascade merge factor 1). Default
+    # stays 0 and coarse_kw still wins.
     for maker in (lambda **kw: default_levels(nx_full=8, nx_coarse=16, **kw),
                   lambda **kw: cascade_levels(factor=1, **kw)):
         lv = maker()

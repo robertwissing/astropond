@@ -1,5 +1,4 @@
-"""gasoline/tipsy code units -> SI, for the POLARIS export (M2 of
-POLARIS_EXPORT_PLAN.md).
+"""gasoline/tipsy code units -> SI, for the POLARIS export.
 
 POLARIS applies the command file's `conv_dens`/`conv_len`/`conv_mag`/`conv_vel`
 to whatever is in the grid file -- and `conv_dens` multiplies the gas density,
@@ -206,7 +205,7 @@ def polaris_units(dMsolUnit=None, dKpcUnit=None, mu=None, gamma=None,
         otherwise they are read from `snap`'s sibling `.param`, then the run
         `.log`. There is no default -- nothing on disk records them for the
         shipped isolated_galaxy snapshot, and guessing would silently rescale
-        every map (POLARIS_EXPORT_PLAN.md Q1).
+        every map.
     mu    : dMeanMolWeight, used only for mass density -> number density.
         Defaults to the `.param` value, else 1.0 WITH a recorded warning: the
         suite's readers hard-code 1.0 and a different mu silently scales both the
@@ -228,7 +227,7 @@ def polaris_units(dMsolUnit=None, dKpcUnit=None, mu=None, gamma=None,
             "dMsolUnit / dKpcUnit are required and were not found"
             + (f" in {source}" if snap is not None else "")
             + ". Nothing on disk records them for the shipped isolated_galaxy "
-              "snapshot; pass them explicitly (POLARIS_EXPORT_PLAN.md Q1) -- "
+              "snapshot; pass them explicitly -- "
               "every SI factor is a no-op without them.")
     if dMsolUnit is not None and dKpcUnit is not None and snap is None:
         source = "explicit"

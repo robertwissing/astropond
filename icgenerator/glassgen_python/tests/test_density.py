@@ -43,7 +43,7 @@ def test_xdr_roundtrip_2d(tmp_path):
 
 
 def test_npz_roundtrip_1d_carries_mapping(tmp_path):
-    # C6: the .npz is self-describing - the mapping travels in the header
+    # the .npz is self-describing - the mapping travels in the header
     x = np.linspace(0, 2.0, 50)
     tab = TableDensity((x,), 1.0 + np.exp(-x), mapping='r_cyl')
     path = str(tmp_path / 'tab1d.npz')
@@ -66,7 +66,7 @@ def test_npz_roundtrip_2d_carries_mapping_pair(tmp_path):
 
 
 def test_npz_legacy_3d_without_mapping_loads(tmp_path):
-    # pre-C6 3D saves have no mapping key: (x,y,z)-indexed, must keep loading
+    # a 3D save without a mapping key is (x,y,z)-indexed and must load
     x = np.linspace(-1, 1, 8)
     vals = np.random.default_rng(2).random((8, 8, 8))
     path = str(tmp_path / 'tab3d.npz')
@@ -164,7 +164,7 @@ def test_3d_table():
 
 
 # --------------------------------------------------------------------------- #
-#  M4: kernel-matched target readout (KernelMatchedDensity)
+#  kernel-matched target readout (KernelMatchedDensity)
 # --------------------------------------------------------------------------- #
 
 def test_kernel_matched_constant_exact():
@@ -217,7 +217,7 @@ def test_kernel_matched_thin_slab_reads_average_not_point():
 
 
 def test_kernel_matched_target_hmode():
-    # hmode='target' (2026-07-13): the averaging scale comes from the
+    # hmode='target': the averaging scale comes from the
     # target's own density - 2h_t = (3*nsmooth*m/(4pi*rho0))^(1/3) - and
     # the passed h is IGNORED (the applied field is state-independent)
     import pytest
@@ -279,3 +279,42 @@ def test_kernel_matched_stencil_weights():
         lambda p: np.where(np.abs(p[:, 2]) < 0.05, 10.0, 1e-6)))
     v = km.rho0_h(np.zeros((1, 3)), np.array([1.0]))[0]
     assert 0.35 < v < 1.5
+
+
+def _square_param(d=0, prof=2, inner=4.0):
+    return {k: str(v) for k, v in dict(dICdensprofile=prof, dICdensdir=d, dICdensR=0.25, dICdensRsmooth=0.01,
+                                       dICdensinner=inner, dICdensouter=1.0).items()}
+
+
+def test_param_dir_0_is_a_square_not_a_z_slab():
+    from glassgen.params import target_rho0
+    pts = np.array([[0., 0., 0.], [0.2, 0.2, 0.2], [0.4, 0., 0.], [0., 0.4, 0.], [0., 0., 0.4], [0.3, 0.3, 0.]])
+    assert target_rho0(_square_param())(pts).tolist() == [4., 4., 1., 1., 1., 1.]
+
+
+def test_param_dir_0_thin_slab_is_a_2d_square():
+    from glassgen.params import target_rho0
+    pts = np.array([[0.1, 0.1, 0.15], [0.1, 0.1, -0.15], [0.3, 0.1, 0.15], [0.1, 0.3, -0.15]])
+    assert target_rho0(_square_param())(pts).tolist() == [4., 4., 1., 1.]
+
+
+def test_param_dir_0_stencil_matches_the_point_readout():
+    from glassgen.params import ParamDensity
+    den = ParamDensity(_square_param())
+    pos = np.random.default_rng(1).uniform(-0.5, 0.5, (200, 3))
+    offsets, weights = np.zeros((1, 3)), np.ones(1)
+    assert den.rho0_stencil(pos, np.zeros(200), offsets, weights).tolist() == den.rho0(pos).tolist()
+
+
+def test_param_dir_0_has_no_smooth_form():
+    from glassgen.params import ParamDensity
+    with pytest.raises(ValueError, match='profile 2'):
+        ParamDensity(_square_param(prof=3))
+
+
+@pytest.mark.parametrize('d,axis', [(1, 0), (2, 1), (3, 2)])
+def test_param_slab_directions_are_unchanged(d, axis):
+    from glassgen.params import target_rho0
+    pts = np.zeros((2, 3))
+    pts[1, axis] = 0.4
+    assert target_rho0(_square_param(d=d))(pts).tolist() == [4., 1.]

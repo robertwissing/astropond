@@ -18,8 +18,8 @@ exchange (kinetic -> magnetic), exactly as for the Orszag-Tang vortex:
     same baseline as one that dumps the IC,
   * field-map renders (--render) of density rho, magnetic pressure
     Pmag = 1/2 |B|^2 (with 30 Pmag iso-contours over the fixed range [0, 2.642],
-    shared across the panels), the signed field components Bx and By, and the
-    divergence error h|div B|/|B| (fixed log range 1e-3..1.0), in
+    shared across the panels), and the divergence error h|div B|/|B| (fixed log
+    range 1e-3..1.0), in
     HORIZONTAL SLICES through the centre (x-y plane at z=0) at chosen times
     (default t = 0.05, 0.15, 0.25, 0.5; the classic comparison time is 0.15),
   * magnetic-field STREAMLINES (Bx, By) in the x-y plane at the same times
@@ -66,7 +66,8 @@ DEFAULT_RENDER_TIMES = [0.05, 0.15, 0.25, 0.5]   # 0.15 = the standard rotor tim
 
 # runtest.sh setup_mhdrotor(): -a rhodisk (disk density), -b/-c viscosities.
 PARAM_SPEC = [
-    Param("a", "rhodisk", 10.0, float, "rotating-disk density (ambient = 1)"),
+    Param("a", "rhodisk", 10.0, float,
+          "rotating-disk density (ambient = 1)", "rhodiff"),
 ]
 
 
@@ -87,14 +88,15 @@ DIVBERR_CLIM = _fixed_clim(1e-3, 1.0)
 
 
 def render_specs(params):
-    """The five x-y field maps -- density rho, magnetic pressure Pmag, the signed
-    field components Bx, By, and the divergence error |div B| h/|B| -- in
+    """The three x-y field maps -- density rho, magnetic pressure Pmag, and the
+    divergence error |div B| h/|B| -- in
     HORIZONTAL SLICES through the centre (project="slice" at z=0; the box is a
-    thin z-slab so this is the mid-plane). Density spans ambient..disk; Bx/By
-    use a symmetric diverging scale; divBerr is fixed log 1e-3..1.0. The Pmag
-    map carries 30 fixed iso-contours of Pmag itself over [0, 2.642] (the
-    Toth 2000 rotor figure convention, shared by all panels) -- the wound-up
-    spiral and the torsional Alfven front."""
+    thin z-slab so this is the mid-plane). Density spans ambient..disk and
+    divBerr is fixed log 1e-3..1.0. The Pmag map carries 30 fixed iso-contours
+    of Pmag itself over [0, 2.642] (the Toth 2000 rotor figure convention,
+    shared by all panels) -- the wound-up spiral and the torsional Alfven front.
+    Separate Bx/By maps are omitted: field topology is clearer in the streamline
+    figure and the signed components remain available in the horizontal cuts."""
     rhodisk = float(params.get("rhodisk", 10.0))
 
     def rho_clim(p, proj):
@@ -107,8 +109,6 @@ def render_specs(params):
                label=r"$P_{\rm mag}=\frac{1}{2}|B|^2$",
                contour=ContourSpec(magnetic_pressure(), label=r"$P_{\rm mag}$",
                                    levels=np.linspace(0.0, 2.642, 30))),
-        styled("Bx", 1, 2, aux_component("BField", 0), label=r"$B_x$"),
-        styled("By", 1, 2, aux_component("BField", 1), label=r"$B_y$"),
         styled("divBerr", 1, 2, aux_divB_error(),
                label=r"$|\nabla\!\cdot\!B|\,h/|B|$", clim=DIVBERR_CLIM),
     ]
@@ -172,12 +172,12 @@ def _save_extra(args, params):
 
 def do_cut(inputs, labels, args, save):
     """1-D horizontal cuts of rho, Bx, By, div B vs x along y=y0 (default centre;
-    --y0 overrides), at each render time. Delegates to the framework's generic
-    `horizontal_cut`."""
+    --y0 overrides), at each render time. Particle samples and binned curves are
+    written separately; delegates to the framework's generic `horizontal_cut`."""
     times = args.render_times if args.render_times else DEFAULT_RENDER_TIMES
     horizontal_cut(inputs, labels, mhd_field_cut_quants(), times,
                    lambda t: (args.y0 if args.y0 is not None else 0.0), save=save,
-                   title_prefix="MHD rotor ")
+                   title_prefix="MHD rotor ", separate_lines=True)
 
 
 # --------------------------------------------------------------------------- #

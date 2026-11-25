@@ -2,7 +2,7 @@
 
 The bridge between sph_interp (grid build + kernel deposit) and the glassgen
 relaxation (which wants a rho0 target it can evaluate at every particle every
-iteration). See RECONSTRUCT_PLAN.md.
+iteration).
 
     table = capture_density(pos, mass, box=box)          # AMR by default
     res   = relax(pos2, mass2, table, box=box, ...)      # table IS the target
@@ -110,7 +110,7 @@ def particle_density(pos, mass, box=None, nsmooth=64):
 
 
 def _capture_fill_kw(empty, vals, boxarr, pos, floor_frac):
-    """Tail anchors for a capture-time 'decay' fill (C2): the no-floor
+    """Tail anchors for a capture-time 'decay' fill: the no-floor
     profile runs from the nearest occupied value down to the floor_frac
     floor at the domain corner. Other fill modes need nothing."""
     if empty != 'decay':
@@ -152,7 +152,7 @@ def _coincidence_labels(pos, tol):
 
 def dedup_coincident(pos, mass, fields=None, tol=0.0):
     """Merge coincident (or near-coincident) input particles into one
-    representative BEFORE capture (RECONSTRUCT_PLAN Q6).
+    representative BEFORE capture.
 
     Exactly-coincident donors make the capture octree refine forever - the
     points never separate under ``refine_count``, so the tree runs to
@@ -264,14 +264,14 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                 cell volume).
     base_npx  : AMR base cells on the LONGEST axis (scalar: the other axes get
                 proportionally fewer so cells stay ~CUBIC on a non-cubic
-                domain - plan task M3), or an explicit (3,) per-axis tuple.
+                domain), or an explicit (3,) per-axis tuple.
                 Default: ~N^(1/3)/8 rounded to a power of two (>= 8) -
                 coarse; refinement supplies locality.
     max_level : AMR refinement depth cap (leaf = base / 2^level).
     part_per_cell : refine while a cell holds more than this many particles
                 (refine_count). ~8 keeps the table coarser than the particle
                 sampling everywhere - finer would encode particle noise as
-                target structure (see plan, design decision 2).
+                target structure.
     npx       : uniform-grid cells on the longest axis (scalar -> ~cubic
                 cells, as base_npx) or (3,). Default: ~N^(1/3)/2, power of 2.
     empty     : policy for non-positive cells (empty space) - a rho0 of 0
@@ -285,17 +285,14 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     OPEN-box galaxy it wraps the gas in a constant
                     edge-density skirt the sparse escaped/edge particles
                     can never match -> a persistent irreducible relax force
-                    that stalls the step controller (observed on the
-                    isolated-galaxy IC, denserr floor ~0.24).
+                    that stalls the step controller.
                 'decay' (default) - fill each empty cell with the no-floor
-                    profile (the C2-surviving fill, see
-                    :func:`envelope._fill_empty`): a strictly-decreasing
+                    profile (see :func:`envelope._fill_empty`): a
+                    strictly-decreasing
                     ramp from the nearest occupied value down to the
                     floor_frac floor at the domain corner, so a sparse
                     particle one cell out feels a target near its actual
                     density with a home-pointing gradient everywhere.
-                    (The legacy exp taper this mode used pre-2026-07-17
-                    was retired with the taper family, CLEANUP_PLAN C2.)
                 'min'  - floor at the smallest positive cell value (can be
                     a ~1e-12-of-peak kernel tail on a galaxy table: keeps
                     positivity but not the dynamic range).
@@ -304,19 +301,19 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
                     N-aware overlay separately).
     floor_frac : 'decay'/vacuum floor as a fraction of the median occupied
                 density (bounds the dynamic range; keeps rho0 > 0).
-    interp    : AMR readout mode: 'vertex' (default since 2026-07-13, user
-                decision - conforming corner trilinear, continuous across
+    interp    : AMR readout mode: 'vertex' (default - conforming corner
+                trilinear, continuous across
                 level jumps, tracks sub-cell gradients; fused, costs ~
                 linear), 'linear', 'flat' or 'limited' (see AMRTable).
     open_padding : for an open capture, optionally enlarge the raw table using
                 ``full_pad`` (max 2h), ``rho_edge_pad`` (2*h_edge,in), or
                 ``constant_pad`` (0.1 of the longest particle span per side).
                 The input-particle definition is independent of the requested
-                output glass count. None preserves the historical particle
-                bounding box used internally by reconstruct/glassrelax.
+                output glass count. None keeps the particle bounding box
+                used internally by reconstruct/glassrelax.
     dedup     : merge coincident donors before capture (default True; a no-op
                 on clean inputs). ``dedup_tol`` is the coincidence radius (0.0
-                = exact). See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6).
+                = exact). See :func:`dedup_coincident`.
     """
     if dedup:
         pos, mass, _, _dda = dedup_coincident(pos, mass, tol=dedup_tol)
@@ -335,8 +332,8 @@ def capture_density(pos, mass, box=None, grid='amr', nsmooth=64,
         if npx is None:
             npx = _pow2(max(n, 64) ** (1.0 / 3.0) / 2.0, lo=4)
         if np.isscalar(npx):
-            # ~cubic cells on a non-cubic domain (plan task M3, as in the AMR
-            # path): the requested count applies to the longest axis.
+            # ~cubic cells on a non-cubic domain (as in the AMR path): the
+            # requested count applies to the longest axis.
             span = (boxarr if boxarr is not None else
                     (domain_hi - domain_lo if domain_lo is not None else
                      np.asarray(pos.max(0) - pos.min(0), dtype=np.float64)))
@@ -430,7 +427,7 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
     """Build the AMR grid and deposit the per-leaf density BEFORE any
     empty-cell fill. Returns (AMRGrid, vals_raw) - vals_raw is the raw
     deposited cell density (0 in empty cells); the N-aware envelope
-    (envelope.build_table_envelope) derives its own rho_edge/rho_floor from it.
+    (envelope.build_table_envelope) derives its own rho_edge/rho_frame from it.
 
     Refinement is CRITERION-driven: refine_count(part_per_cell) splits any cell
     with > part_per_cell (8) particles, so leaves hold <= 8 particles and the
@@ -444,7 +441,7 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
     (16 -> box/16/2**16 ~ 1e6 cells/axis) and is essentially never reached on
     real data.
 
-    contour : optional (rho_lo, rho_hi, m_out, beta) - plan task M10: also
+    contour : optional (rho_lo, rho_hi, m_out, beta): also
     refine occupied cells whose mean density straddles the classification
     band [rho_lo, rho_hi] while larger than the local output sampling scale
     beta*(m_out/rho)**(1/3) (sph_interp.refine_band). Resolves the
@@ -454,27 +451,31 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
     grade : enforce 2:1 balance on the finished leaf set (sph_interp.
     grade_2to1: no leaf touches a leaf more than one level coarser, level
     jumps decay geometrically away from refined regions) and redeposit.
-    Count-driven refinement leaves the razor-thin galaxy disk's max-level
-    cells abutting level-0/1 vacuum cells; any readout across that jump
-    stretches midplane values over the whole coarse width (the 2026-07-12
-    z-staircase: plateaus decades above the SPH truth across |z|<4)."""
+    Count-driven refinement can leave a razor-thin disk's max-level cells
+    abutting level-0/1 vacuum cells; any readout across that jump stretches
+    midplane values over the whole coarse width."""
     if base_npx is None:
         base_npx = _pow2(max(n, 64) ** (1.0 / 3.0) / 8.0, lo=8)
     if np.isscalar(base_npx):
-        # ~CUBIC cells on a non-cubic domain (plan task M3): the requested
+        # ~CUBIC cells on a non-cubic domain: the requested
         # count applies to the LONGEST axis and the others get proportionally
         # fewer cells. A scalar count on all three axes would make the cell
         # aspect track the domain aspect at EVERY octree level (children
-        # inherit it): the isolated galaxy captured 8:1 cells - z oversampled
+        # inherit it): an 8:1 domain gets 8:1 cells - z oversampled
         # ~8x per level (leaf waste, and extra vertical target sharpness the
         # N-particle kernel cannot represent) while x/y stayed marginal, the
         # linear-readout gradients direction-biased, and the envelope decay
         # length (cbrt(vol)) a mix of both scales.
-        span = (np.asarray(domain_hi) - np.asarray(domain_lo)
-                if domain_lo is not None else
-                (np.asarray(parts.box, dtype=np.float64).reshape(3)
-                 if parts.box is not None
-                 else parts.pos.max(0) - parts.pos.min(0)))
+        # The span is that of the domain AMRGrid.build will mesh: an open
+        # capture is padded to the union of the 2h kernel supports, which on a
+        # thin axis can be more than twice the particle extent.
+        if domain_lo is not None:
+            span = np.asarray(domain_hi) - np.asarray(domain_lo)
+        elif parts.box is not None:
+            span = np.asarray(parts.box, dtype=np.float64).reshape(3)
+        else:
+            lo, hi = si.kernel_support_bounds(parts.pos, parts.h)
+            span = hi - lo
         cell = float(span.max()) / int(base_npx)
         base_npx = tuple(max(1, int(round(span[i] / cell))) for i in range(3))
     crit = si.refine_count(part_per_cell)
@@ -488,7 +489,7 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
     res = si.interpolate(parts, amr, method=method, values=['rho'])
     vals_raw = _grid_rho(res, amr.volumes(), method)
     if contour is not None:
-        # correction passes (plan task M10, two-pass design): the in-flight
+        # correction passes: the in-flight
         # band criterion only sees particle-CENTRE mass, but the verdict
         # consumes the DEPOSITED values - kernel-spill cells (nonzero petkova
         # value, zero centres) straddle the band invisibly. Re-flag on the
@@ -530,7 +531,7 @@ def _capture_amr_grid(si, parts, n, method='sph-gather', base_npx=None,
 
 def _refine_regions_criterion(centres, halfs, floors, amr, floor_leaf_vals):
     """Criterion refining every cell that overlaps a flagged leaf box, down
-    to that box's own floor size (M10 correction pass). Overlap on the
+    to that box's own floor size (contour correction pass). Overlap on the
     shared dyadic tiling has only two cases: the cell nests inside a flagged
     leaf (exact point-in-leaf lookup via a flat AMRTable holding the
     per-leaf floors) or flagged boxes nest inside the cell (cKDTree ball
@@ -575,25 +576,23 @@ def capture_amr_raw(pos, mass, box=None, nsmooth=64, method='petkova',
     filled table). `AMRTable.from_grid(amr, vals_raw)` makes it the EXACT
     build target. Returns (AMRGrid, vals_raw).
 
-    contour_n : target OUTPUT particle count -> contour-resolving refinement
-    (plan task M10): estimate rho_edge(N) from the particle field
+    contour_n : target OUTPUT particle count -> contour-resolving refinement:
+    estimate rho_edge(N) from the particle field
     (:func:`rho_edge_particles`) and additionally refine occupied cells in
     the band [rho_edge/contour_band, rho_edge*contour_band] down to
     contour_beta*(m_out/rho)**(1/3) (the local output spacing). None = the
-    pure part_per_cell capture (pre-M10 behaviour).
+    pure part_per_cell capture.
 
     grade : 2:1-balance the finished leaf set + redeposit (see
     :func:`_capture_amr_grid`).
 
-    close_open_mass : an open particle-bounding-box mesh truncates the compact
-    kernels of extremal particles. Preserve the validated raw geometry and
-    envelope interaction, but apply one audited uniform normalisation to the
-    final density leaves so ``sum(rho*V) == sum(mass)``. The factor is normally
-    tiny (``1.000033`` for the M22 galaxy). Set False only for a historical
-    boundary-truncation control.
+    close_open_mass : on an open capture (box None), rescale the final density
+    leaves by one audited uniform factor so ``sum(rho*V) == sum(mass)``. The
+    open mesh covers every particle's 2h kernel support, so the factor is 1 to
+    rounding; False skips it.
 
     dedup : merge coincident donors before capture (default True; a no-op on
-    clean inputs). See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6). The
+    clean inputs). See :func:`dedup_coincident`. The
     audit is stashed on the returned grid as ``amr.dedup_audit``.
     """
     dedup_audit = None
@@ -656,7 +655,7 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
     dedup : merge coincident donors (and their fields) before capture (default
     True; a no-op on clean inputs). Kinetic content is formed per-particle
     BEFORE the merge, so its conserved sum survives the mass-weighted collapse.
-    See :func:`dedup_coincident` (RECONSTRUCT_PLAN Q6).
+    See :func:`dedup_coincident`.
     """
     pos = np.ascontiguousarray(pos, dtype=np.float64)
     mass = np.ascontiguousarray(mass, dtype=np.float64)
@@ -672,7 +671,7 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
                 or lname in ('bx', 'by', 'bz')):
             raise NotImplementedError(
                 f"magnetic field {name!r} cannot use generic AMR vertex "
-                'transfer; M23 magnetic transfer is explicitly deferred')
+                'transfer; magnetic transfer is explicitly deferred')
         a = np.asarray(values, dtype=np.float64)
         if a.ndim not in (1, 2) or a.shape[0] != len(mass):
             raise ValueError(
@@ -688,7 +687,7 @@ def capture_amr_state(pos, mass, fields, box=None, nsmooth=64,
         clean['__kinetic'] = 0.5 * np.sum(clean['vel'] ** 2, axis=1)
         internal_fields.append('__kinetic')
 
-    # Merge coincident donors BEFORE capture (Q6). Kinetic content is already
+    # Merge coincident donors BEFORE capture. Kinetic content is already
     # per-particle above, so it collapses as a conserved intensive scalar
     # (mass-weighted) rather than being recomputed from the merged velocity -
     # the group's sub-position velocity variance is thus retained in the total.
@@ -843,9 +842,7 @@ def _magnetic_transfer_setup(pos_in, mass_in, B_src, box, nsmooth, mode,
     """Prepare the reconstruct magnetic transfer; returns (query, audit).
 
     ``query(final_pos) -> (N,3)`` evaluates the transferred B. Every mode
-    works on the density AMR capture grid (RECONSTRUCT_PLAN /
-    FIELD_RECONSTRUCTION_PLAN, decided 2026-07-22, surface trimmed
-    2026-07-23):
+    works on the density AMR capture grid:
       'none'   conservative volume-carrier cell B, conforming-vertex
                read-back (the validated production default: no projection;
                divergence is a separate mhd_divBclean pass in the consumer's
@@ -960,16 +957,15 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                          km_hmode='particle', km_hscale=1.0,
                          magnetic_projection='none', verbose=False):
     """The `glassresample --op reconstruct` engine - a THIN WRAPPER around
-    the glassgen table builder (decided 2026-07-10): capture the input gas
+    the glassgen table builder: capture the input gas
     density (exact raw AMR table), hand it to
     :func:`glassgen.progressive.build_from_table` (sample `count` positions
     from the table + N-aware envelope + progressive relax + spatial cull /
-    renorm to the input gas mass), then conservatively SCATTER per-survivor
-    fields onto the FINAL positions. ``field_transfer='scatter'`` retains the
-    M22 particle-to-particle control; ``'table'`` captures conservative field
-    contents on the final raw AMR geometry and imprints numerator/rho ratios
-    after the relax (M23). ``'table'`` is the default (flipped 2026-07-24,
-    user); ``'scatter'`` stays as the M22 control/fallback.
+    renorm to the input gas mass), then conservatively transfer per-survivor
+    fields onto the FINAL positions. ``field_transfer='table'`` (default)
+    captures conservative field contents on the final raw AMR geometry and
+    imprints numerator/rho ratios after the relax; ``'scatter'`` is the
+    particle-to-particle control/fallback.
 
       pos_in, mass_in : the INPUT gas.
       count           : target gas particle count (may be < or > the input).
@@ -978,14 +974,12 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
                         is excluded and recomputed from the output particles.
       cascade         : False -> single full-res relax of the placed ensemble
                         (the --no-progressive fallback), same envelope + cull.
-      bg_c, bg_k      : envelope knobs (rho_edge cut count; two-rung ladder
+      bg_c, bg_k      : envelope knobs (rho_edge cut count;
                         rho_frame = rho_edge/k**6). The background is always
-                        sampled backing (mass-contract closure; the lattice
-                        and bg_tail were retired 2026-07-16, CLEANUP_PLAN C1).
+                        sampled backing (mass-contract closure).
       alpha : the cascade resolvability tolerance (auto_coarse_count;
-                        the cubic scaffold that shared it was DELETED
-                        record; alpha = the shared cascade constant, 2.0).
-      contour_refine  : M10 contour-resolving capture (default ON): refine
+                        alpha = the shared cascade constant, 2.0).
+      contour_refine  : contour-resolving capture (default ON): refine
                         cells straddling the rho_edge(count) band so the
                         flat occupancy verdict is not cell-quantized
                         (capture_amr_raw contour_n=count). Ignored when
@@ -1027,21 +1021,18 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     if field_transfer == 'table' and method != 'petkova':
         raise ValueError("field_transfer='table' requires method='petkova'")
     # Magnetic aux never rides the generic transfer (scatter's ungoverned
-    # pass-through and M23's mass-ratio vertex readout are both wrong for B):
+    # pass-through and the table mass-ratio vertex readout are both wrong for B):
     # split it out here and move it by its own path after the build.
     fields, B_src, magnetic_keys = _magnetic_split(dict(fields or {}))
     timings = {}
     density_capture_audit = None
-    # OPEN IC (box is None): capture in WORLD coordinates. Density-only/M22
-    # uses the raw gas bbox; conservative M23 spans every compact kernel. The
-    # periodic frame for the relax is
-    # sized AFTER capture by the envelope (build_table_envelope frame_box:
-    # per-axis margins + the kernel-fits-the-box cap), because its Delta_bg
-    # needs rho_edge(N) from the table (plan task M2). The old order (frame
-    # first at a fixed pad_frac, capture in the padded box) fixed the z
-    # period before Delta_bg was known: the 80k galaxy run's background
-    # kernels wrapped its box_z 2.6x. relax_progressive frames/unframes, so
-    # everything here stays in the IC's own coordinates.
+    # OPEN IC (box is None): capture in WORLD coordinates. Density-only/scatter
+    # uses the raw gas bbox; the conservative table capture spans every
+    # compact kernel. The periodic frame for the relax is sized AFTER capture
+    # by the envelope (build_table_envelope frame_box: per-axis margins + the
+    # kernel-fits-the-box cap), because its Delta_bg needs rho_edge(N) from
+    # the table. relax_progressive frames/unframes, so everything here stays
+    # in the IC's own coordinates.
     t0 = _time.perf_counter()
     state = None
     amr_for_B = None            # raw capture geometry for the magnetic path
@@ -1105,8 +1096,7 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
         if save_state is not None:
             state.save(save_state)
     # target readout: 'linear' (trilinear) OVERSHOOTS across coarse->fine
-    # level jumps (the razor-thin disk vertical-smear defect, 2026-07-12);
-    # 'flat' (PWC cell average) has no overshoot. The shell/occupancy is
+    # level jumps; 'flat' (PWC cell average) has no overshoot. The shell/occupancy is
     # built flat regardless (build_table_envelope); this sets the OCCUPIED
     # BASE readout the relax fills.
     # The low-density split needs rho_edge BEFORE the build, computed in
@@ -1323,23 +1313,11 @@ def reconstruct_resample(pos_in, mass_in, count, fields, box=None, nsmooth=64,
     return pos_f, mass_f, aux_f, is_filler, a
 
 
-# NB the Shepard SPH gather that used to live here (`gather_fields`, the
-# pre-M22 step 5) was REMOVED 2026-07-29 (CONSOLIDATION_PLAN D4): M22 replaced
-# it with the scatter below, M23 replaced that with the table imprint, and by
-# then nothing called it - no caller, no test, no `--field-transfer gather`, not
-# exported from __init__. It survived only as a "comparison control" that there
-# was no longer any way to invoke. Recover from git history or
-# backup_20260729_d4_gatherfields/ if a Shepard-gather control is ever wanted
-# again.
-
-
 def scatter_fields(qpos, m_out, src_pos, src_mass, src_rho, fields,
                    rho_edge=None, box=None, nsmooth=64):
     """Conservative donor-normalized SCATTER of input fields onto the
-    survivors (RECONSTRUCT_PLAN M22, 2026-07-19). Was THE default when it
-    landed, replacing the pre-M22 Shepard gather; M23 then made the table
-    imprint the default (2026-07-24), so this is now the reachable CONTROL /
-    fallback - `--field-transfer scatter`, kept deliberately.
+    survivors: the CONTROL / fallback transfer (`--field-transfer scatter`;
+    the default is the table imprint).
 
     Every INPUT particle in the resolved region (src_rho >= rho_edge)
     donates its conserved content m_i*A_i to the receivers its kernel
@@ -1347,18 +1325,13 @@ def scatter_fields(qpos, m_out, src_pos, src_mass, src_rho, fields,
     sum to 1, nearest-receiver fallback so every donor lands), and each
     receiver takes the MASS-WEIGHTED AVERAGE: A_j = content_j/recv_mass_j.
 
-    Division convention (A/B'd on the galaxy, 2026-07-19, RECONSTRUCT_PLAN
-    M22): dividing by a UNIFORM mass share instead makes the written
-    totals exact but writes A_j = r_j*Abar_j with r = the received/uniform
-    mass ratio (spread [0,3.8] at 20k) - measured KE +31%, coverage noise
-    injected into the dynamics. The average keeps every particle's value
-    the smoothed local input field (a constant field is reproduced
-    EXACTLY, fill included); the written-IC totals then drift by the
-    DELIVERED-GEOMETRY difference (the reconstructed disk is thicker, so
-    equal-mass particles sample more hot off-plane gas: E_th +17% here,
-    +19% under the legacy gather - a representation limit, NOT transfer
-    error; closing it uniformly was measured at x0.85 on every u and
-    rejected). The audit reports TWO tiers: resid_* = the scatter's own
+    Division convention: dividing by a UNIFORM mass share instead would make
+    the written totals exact but writes A_j = r_j*Abar_j with r = the
+    received/uniform mass ratio, injecting coverage noise into the
+    dynamics. The average keeps every particle's value the smoothed local
+    input field (a constant field is reproduced EXACTLY, fill included);
+    the written-IC totals then drift by the DELIVERED-GEOMETRY difference
+    (a representation limit, NOT transfer error). The audit reports TWO tiers: resid_* = the scatter's own
     content conservation (machine zeros - nothing is lost in transfer)
     and drift_*/ke_*/lz_* = written-IC totals vs the interior input
     (geometry diagnostics - watch them like the wing excess). Donors
@@ -1467,7 +1440,7 @@ def _pow2(x, lo=4):
 
 def save_table(table, path):
     """Save a density table (AMRTable, or TableDensity of any dim) as the
-    self-describing .npz (CLEANUP_PLAN C6): AMR keeps its block layout,
+    self-describing .npz: AMR keeps its block layout,
     uniform/mapped tables carry axes + values + mapping in the header.
     Both load back through load_table() without sph_interp."""
     if isinstance(table, AMRTable):
@@ -1530,22 +1503,21 @@ def apply_count_overlay(table, count, c=64, k=None,
     ``floor=rho_edge``): from ``m = M_gas / count``, every cell below
     ``rho_edge`` is emptied and refilled as ONE strictly-decreasing profile
     down to ``rho_frame = rho_edge/k**6`` at the frame edge (frame sized by
-    the same M2 rule the builder uses; steepness from the M20 nl0 solve or
-    a legacy explicit ``tail_reach``); cells above keep their exact values.
+    :func:`envelope.frame_open_box` as in the builder; steepness from the nl0
+    solve or a legacy explicit ``tail_reach``); cells above keep their exact
+    values.
     Different N -> different overlay on the SAME exact table (larger N ->
     lower rho_edge/frame). This is the density target the relax sees at
     that count (the leaf-set view of the builder's PaddedDensity shell;
     the analytic outside-domain tail continuation is not representable in
     the leaf set and is omitted here). The builder's background (sampled
     backing) changes PARTICLES, not the density target, so it has no
-    counterpart here. (The legacy taper family - flat_floor shelf,
-    shell_start, decay_cells/decay_spacing/decay_local - retired
-    2026-07-17, CLEANUP_PLAN C2.)"""
+    counterpart here."""
     centres, sizes, _, vals = table_cells(table)
     vals = np.asarray(vals, dtype=np.float64)
     vols = sizes.prod(1)
     m = float((vals * vols).sum()) / int(count)
-    # M20: k from n_frame unless legacy-explicit (lockstep with
+    # k from n_frame unless legacy-explicit (lockstep with
     # build_table_envelope - same resolve, same solve below)
     k = resolve_bg_k(k, n_frame, nsmooth=c)
     re, delta_bg = edge_floor_spacing(vals, vols, m, c=c, k=k)
@@ -1553,10 +1525,10 @@ def apply_count_overlay(table, count, c=64, k=None,
     fbox = table.box if getattr(table, 'periodic', False) is True \
         or (hasattr(table, 'periodic') and bool(np.ravel(table.periodic)[0])) \
         else None
-    # frame extent for the M6 tail scale, sized as the builder does (M2 rule,
-    # nsmooth ~ c). taper_len retired 2026-07-16 (CLEANUP_PLAN C1a) - it must
-    # stay in lockstep with build_table_envelope or the rendered target and
-    # the relaxed target disagree on tail_scale.
+    # frame extent for the tail scale, sized as the builder does
+    # (frame_open_box, nsmooth ~ c) - it must stay in lockstep with
+    # build_table_envelope or the rendered target and the relaxed target
+    # disagree on tail_scale.
     if fbox is None:
         cell_lo = centres - 0.5 * sizes
         cell_hi = centres + 0.5 * sizes
@@ -1577,8 +1549,8 @@ def apply_count_overlay(table, count, c=64, k=None,
     else:
         frame_extent = np.asarray(fbox, dtype=np.float64).reshape(3)
         active_lo = active_hi = None
-    rho_frame = re / k ** 6               # two-rung ladder: rho_edge -> rho_frame
-    # M20: solve tail_reach from nl0 (or take the legacy explicit value) -
+    rho_frame = re / k ** 6               # vacuum decays rho_edge -> rho_frame
+    # solve tail_reach from nl0 (or take the legacy explicit value) -
     # MUST stay in lockstep with build_table_envelope or the rendered
     # target and the relaxed target disagree on the profile.
     nl0_eff = p_eff = None
@@ -1606,7 +1578,7 @@ def apply_count_overlay(table, count, c=64, k=None,
     if active_lo is not None:
         info['active_lo'], info['active_hi'] = active_lo, active_hi
         info['frame_extent'] = frame_extent
-    if nl0_eff is not None:               # M20: launch N_L + exponent
+    if nl0_eff is not None:               # launch N_L + exponent
         info['nl0'] = nl0_eff
         info['profile_p'] = p_eff
     return _with_values(table, filled), info
@@ -1736,15 +1708,15 @@ def main(argv=None):
                          'constant_pad')
     ap.add_argument('--no-contour-refine', dest='contour_refine',
                     action='store_false',
-                    help='disable the M10 contour-resolving capture (extra '
+                    help='disable the contour-resolving capture (extra '
                          'refinement of cells straddling the rho_edge(count) '
                          'band, so the occupancy verdict is not quantized '
                          'on coarse cells)')
     ap.add_argument('--contour-band', dest='contour_band', type=float,
-                    default=8.0, help='M10 band half-width factor around the '
+                    default=8.0, help='band half-width factor around the '
                                       'rho_edge estimate (default 8)')
     ap.add_argument('--contour-beta', dest='contour_beta', type=float,
-                    default=0.5, help='M10 size floor = beta * local output '
+                    default=0.5, help='size floor = beta * local output '
                                       'spacing (m/rho)^(1/3) (default 0.5)')
     ap.add_argument('--grade', action='store_true', default=True,
                     help='2:1-balance the AMR leaf set (no leaf touches a '
@@ -1754,7 +1726,7 @@ def main(argv=None):
                          'bright values across a huge coarse neighbour '
                          '(DEFAULT since 2026-07-13)')
     ap.add_argument('--no-grade', dest='grade', action='store_false',
-                    help='ungraded capture (pre-M11 leaf set)')
+                    help='ungraded capture')
     ap.add_argument('--nedge', dest='bg_c', type=int, default=0,
                     help='envelope: resolvability contour count (INTEGRAL: '
                          'rho_edge = where the cumulative faint-end mass '
@@ -1762,12 +1734,12 @@ def main(argv=None):
                          'in particle masses, NOT a per-kernel count; 0 = '
                          'use --nsmooth/-s)')
     ap.add_argument('--nframe', dest='n_frame', type=float, default=None,
-                    help='M20: floor backability - expected particles per '
+                    help='floor backability - expected particles per '
                          'edge kernel at the profile floor (rho_frame = '
                          'rho_edge*nframe/nsmooth, k=(nsmooth/nframe)^(1/6); '
                          'default 16 ~ k1.26)')
     ap.add_argument('--nl0', dest='nl0', type=float, default=None,
-                    help='M20: scaffold launch resolvability N_L(0) - the '
+                    help='scaffold launch resolvability N_L(0) - the '
                          'near-gas e-fold length in kernel supports; '
                          'tail_reach is solved per build (default 1.35; '
                          'avoid ~1, the metastable resonance band)')

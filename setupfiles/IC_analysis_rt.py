@@ -34,9 +34,6 @@ Geometry/physics fixed by IC_setup_rt.create():
     IC_createparamfile; these are specific test cases, and changing g is just
     a time rescale t -> t/sqrt(g), so it is deliberately not a parameter). The
     IC hydrostatic pressure profile is integrated with the SAME g = 1.0.
-    (Before 2026-06-09 the profile hardcoded g=0.5 against the param file's
-    1.0 -- only half the run's gravity was supported, which made the whole
-    column free-fall/compress.)
   * MHD (beta > 0, -e): uniform B with strength from the plasma beta at the
     interface, B0 = sqrt(2 p(z_iface)/beta); geometry -f bdir: 1 = x horizontal
     (default), 2 = y, 3 = z vertical.
@@ -64,12 +61,19 @@ from IC_analysis_general import amp_mag
 
 # -a..-f match runtest.sh setup_rt() flag-for-flag with the same defaults.
 PARAM_SPEC = [
-    Param("a", "rhodiff",  2.0, float, "density contrast (rho_heavy/rho_light)"),
-    Param("b", "case",     1,   int,   "1 = symmetric (two interfaces), 2 = single interface"),
-    Param("c", "nlowdens", 2,   float, "number of low-density segments (sets z_iface = 0.25*nlowdens)"),
-    Param("d", "smooth",   0,   float, "smooth (tanh-ramped) interface density"),
-    Param("e", "beta",     0.0, float, "plasma beta at the interface (0 = hydro)"),
-    Param("f", "bdir",     1,   int,   "B direction: 1=x horizontal (default), 2=y, 3=z vertical"),
+    Param("a", "rhodiff", 2.0, float,
+          "density contrast (rho_heavy/rho_light)", "rhodiff"),
+    Param("b", "case", 1, int,
+          "1 = symmetric (two interfaces), 2 = single interface", "c"),
+    Param("c", "nlowdens", 2, float,
+          "number of low-density segments (sets z_iface = 0.25*nlowdens)",
+          "nlow"),
+    Param("d", "smooth", 0, float,
+          "smooth (tanh-ramped) interface density", "smooth"),
+    Param("e", "beta", 0.0, float,
+          "plasma beta at the interface (0 = hydro)", "beta"),
+    Param("f", "bdir", 1, int,
+          "B direction: 1=x horizontal (default), 2=y, 3=z vertical", "bdir"),
 ]
 
 # Plotted quantities returned by analyze().

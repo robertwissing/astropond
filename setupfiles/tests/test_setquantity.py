@@ -1,11 +1,9 @@
 """IC_setQuantity.py: the operation vocabulary, chaining, and the aux twins.
 
-Weighted toward the failure modes the old setQuantity.py actually had (see
-PLAN_SETQUANTITY_GENERALIZE section 1): operations that computed a result and
-then wrote the ORIGINAL array back, an advertised operation with no
-implementation at all, and edits that touched the packed vector aux but not
-its x/y/z twins - all silent, all producing a plausible-looking output file.
-So every test here checks that the OUTPUT changed in the way asked for, and
+Weighted toward silent failure modes that produce a plausible-looking output
+file: an operation that computes a result and then writes the ORIGINAL array
+back, an advertised operation with no implementation, and edits that touch the
+packed vector aux but not its x/y/z twins. So every test here checks that the OUTPUT changed in the way asked for, and
 the vector ops check the twins agree with the packed file.
 """
 import os
@@ -34,9 +32,8 @@ def run_cli(*argv, expect=0):
 def check_twins(path, label='BField'):
     """The packed aux and its x/y/z twins must agree, and be the same length.
 
-    The bug this guards against shipped once already: cleaning wrote a
-    gas-only twin next to a full-length packed file, so a consumer reading
-    components got a short, misaligned field.
+    A gas-only twin next to a full-length packed file would give a consumer
+    reading components a short, misaligned field.
     """
     packed = read_vector_aux(path, label)
     for i, comp in enumerate('xyz'):
@@ -137,7 +134,7 @@ def test_centering_moves_the_centre_of_mass_to_the_origin(disc_snapshot,
 
 
 # ---------------------------------------------------------------------------
-# the bfield op - including the two silent no-ops of the old script
+# the bfield op
 # ---------------------------------------------------------------------------
 
 def test_bfield_scale_actually_writes_the_scaled_field(disc_snapshot,
@@ -156,7 +153,7 @@ def test_bfield_zero_actually_zeroes(disc_snapshot, tmp_path):
 
 
 def test_bfield_over_rho_is_not_a_no_op(disc_snapshot, tmp_path):
-    """Option 11 of the old script computed B/rho and then wrote B."""
+    """over-rho must write B/rho, not B."""
     out = str(tmp_path / 'overrho.00000')
     run_cli(disc_snapshot, '-o', out, 'bfield', '--op', 'over-rho')
     gas, header = read_tipsy_gas(disc_snapshot)
@@ -170,9 +167,8 @@ def test_bfield_over_rho_is_not_a_no_op(disc_snapshot, tmp_path):
 
 def test_bfield_smooth_is_implemented_and_actually_smooths(disc_snapshot,
                                                            tmp_path):
-    """Option 17 was advertised in the old menu with no implementation at all,
-    so selecting it wrote an unmodified copy. It must now reduce the local
-    scatter of a field that starts as pure particle-to-particle noise."""
+    """smooth must reduce the local scatter of a field that starts as pure
+    particle-to-particle noise."""
     out = str(tmp_path / 'sm.00000')
     run_cli(disc_snapshot, '-o', out, 'bfield', '--op', 'smooth',
             '--nsmooth', '32')

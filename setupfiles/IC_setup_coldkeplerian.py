@@ -14,8 +14,14 @@ import IC_fixdens as fixdens
 import IC_smoothlength as smth
 import readtipsy as tip
 
+DEFAULT_HR = 9.5e-7
+SURFACE_DENSITY_POWER = 0.5
+
+
 class setup_coldkeplerian(object):
-    dICdensRsmooth = 0.05
+    # ``hr`` is the thermal coefficient P/rho at R=1.  The Gaussian target
+    # needs a geometric H/R, which scales as sqrt(P/rho) for a cold disk.
+    dICdensRsmooth = np.sqrt(DEFAULT_HR)
     dICdensprofile = 7
     dICdensdir = 5
     dICdensR = 2.0
@@ -30,6 +36,10 @@ class setup_coldkeplerian(object):
     ndim=3
     time=0
     gamma=5./3.
+    # Keep the isothermal evolution (u is frozen) while retaining the physical
+    # gamma used to convert u into pressure and sound speed.  The generic
+    # parameter writer otherwise uses gamma ~= 1 for legacy isothermal tests.
+    isothermal_gamma=gamma
     inflow=0
     periodic=1
     deltastep=0.62831853071  #1/10 of an orbit at r=1
@@ -71,24 +81,29 @@ class setup_coldkeplerian(object):
     rhozero = 1.0
     massdisk= 1E-6     # negligible gas mass -> pure external (sink) Kepler potential
     rdisk = 2.0
-    q = 0.5
-    hr = 0.05          # aspect ratio = 1/Mach -> small = cold
+    q = 0.5             # radial exponent of P/rho; Sigma is fixed at R^-1/2
+    hr = DEFAULT_HR    # P/rho at R=1; M(R=1)=1/sqrt(gamma*hr) ~= 795
+    density_aspect_ratio = np.sqrt(DEFAULT_HR)
     onlyoneBH = 1      # single central sink (added in IC_createsetup.py)
 
     def __init__(self):
         pass
-    def create(self,nx,distri=0,vm=0,entry=' ',hr=0.05,rinner=1.0,rdisk=2.0,q=0.5):
+    def create(self,nx,distri=0,vm=0,entry=' ',hr=DEFAULT_HR,rinner=1.0,rdisk=2.0,q=0.5):
 
          gam1=self.gamma-1
+         hr=float(hr)
+         if not np.isfinite(hr) or hr <= 0.0:
+            raise ValueError("coldkeplerian hr=P/rho must be finite and positive")
          self.onlyoneBH=1
-         self.dICdensRsmooth = hr
+         self.density_aspect_ratio = np.sqrt(hr)
+         self.dICdensRsmooth = self.density_aspect_ratio
          self.dICdensR = rdisk;
          self.hr = hr;
          self.q = q;
          self.rdisk = rdisk;
 
          rinnertemp=rinner
-         p=0.5
+         p=SURFACE_DENSITY_POWER
          if(p < 2.0):
             integral = (rdisk**(2 - p) - rinnertemp**(2 - p)) / (2 - p)
             self.dICdensinner = self.massdisk * (2 - p) / (2 * np.pi * integral)
@@ -115,7 +130,7 @@ class setup_coldkeplerian(object):
             hin = tgdatain[:,9];
             fMass = tgdatain[:,0];
             Hdisk=self.dICdensRsmooth * rcyl;
-            rhocentral = self.dICdensinner*rcyl**(-self.q) /(Hdisk*np.sqrt(2*np.pi));
+            rhocentral = self.dICdensinner*rcyl**(-p) /(Hdisk*np.sqrt(2*np.pi));
             hcentral = (fMass / rhocentral)**(1.0/3.0)
             ttres = Hdisk / hcentral
             hedge = (fMass / rhocentral*np.exp(ttres**2/2.0))**(1.0/3.0)
@@ -149,7 +164,7 @@ class setup_coldkeplerian(object):
              self.Bx.append(0.)
              self.By.append(0.)
              self.Bz.append(0.)
-             self.h.append(hr*0.6)
+             self.h.append(self.density_aspect_ratio*0.6)
 
     def create_star(self,tgdata):
         # single central point mass (sink), small softening -> clean Kepler potential

@@ -1,8 +1,7 @@
 """Truncated hierarchical B-splines (THB) - 1D core.
 
 The bedrock of the hierarchical spline De Rham complex readout on the 2:1
-octree (FIELD_RECONSTRUCTION_PLAN.md, "THB-spline De Rham complex readout",
-rung 3).  This module builds the 1D truncated hierarchical basis; the
+octree.  This module builds the 1D truncated hierarchical basis; the
 tensor-product spaces, the hierarchical exterior derivative, and the global
 L2 projector are layered on top.
 
@@ -221,17 +220,12 @@ if _HAVE_NUMBA:
         - no per-leaf Python dispatch, no Python by_leaf/BW glue.  Reproduces
         :meth:`THB3D.eval_operator_fast` (the per-leaf Python build).
 
-        THREADED over leaves (the descent was 78% of the build and the build is
-        now the dominant cost, the solves having been threaded).  Leaves are
-        independent, so the only obstacle to ``prange`` was that a shared
-        append cursor serialises them.  Removed by laying the output out
-        EXACTLY before emitting: a ``count_only`` descent (same code path, no
-        weight updates, ~1/npatch of the cost) gives each leaf's ``nc``, whose
-        prefix sum over points is each point's slot.  Every thread then writes
-        only inside its own points' slots - no cursor, no atomics, no
-        per-thread buffers to merge, and NO possible overflow (the bound is
-        exact, not an estimate).  As a bonus the buffer is now the tight bound
-        rather than the old ``npts*(npatch+8)`` allowance.
+        THREADED over independent leaves, with the output laid out EXACTLY
+        before emitting: a ``count_only`` descent (same code path, no weight
+        updates, ~1/npatch of the cost) gives each leaf's ``nc``, whose prefix
+        sum over points is each point's slot.  Every thread writes only inside
+        its own points' slots - no shared cursor, no atomics, no per-thread
+        buffers to merge, and NO possible overflow (the bound is exact).
 
         BYTE-IDENTICAL to the serial build: a point's row is computed from its
         own leaf's T_leaf alone, in the same order, and the final CSR is
@@ -307,9 +301,8 @@ if _HAVE_NUMBA:
         cap = pos
         # `vals` is allocated here in the caller's output dtype (carried in by
         # the empty `vtemplate`): accumulation stays float64 either way, and
-        # storing float32 is exactly the cast the caller used to do at the end -
-        # so it halves the biggest transient buffer instead of adding a second
-        # copy of it.
+        # storing in that dtype directly halves the biggest transient buffer
+        # instead of adding a second, cast copy of it.
         cols = np.empty(cap, dtype=np.int32)
         vals = np.empty((K, cap), vtemplate.dtype)
         # --- chunks of leaf runs, balanced by POINT count (the per-point apply
@@ -567,7 +560,7 @@ class THB3D:
     PROTOTYPE scope: each active THB function is materialised as dense
     coefficients on the FINEST uniform level (exact, but memory ~ prod(dims_L))
     - fine for shallow graded test meshes, NOT the deep galaxy octree (that
-    needs the sparse hierarchical operators, a later rung-3 increment)."""
+    needs the sparse hierarchical operators)."""
 
     def __init__(self, base_dims, degrees, refined):
         self.base = tuple(int(b) for b in base_dims)

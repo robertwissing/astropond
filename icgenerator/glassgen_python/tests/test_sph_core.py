@@ -2,6 +2,7 @@ import numpy as np
 
 from glassgen.kernels import W0, dw_wc2, w_wc2
 from glassgen.neighbors import NeighborList
+from glassgen.flavours import FLAVOURS
 from glassgen.sph_core import density_loop, get_force_loop
 
 M_1_PI = 1.0 / np.pi
@@ -88,7 +89,7 @@ def test_force_loop_matches_serial_reference():
     pP = (rho / rho0) ** 2.0
 
     for mode in ('gdforce', 'rho2'):
-        loop = get_force_loop(mode)
+        loop = get_force_loop(FLAVOURS[mode], 'average-sph')  # the C port
         n = len(pos)
         icvel = np.empty((n, 3))
         q1d = np.empty(n)
@@ -108,7 +109,7 @@ def test_q1_partition_of_unity():
     pos -= box * np.rint(pos / box)
     mass, idx, h, indptr, indices, rho = compute_state(pos, box, 64)
     pP = np.ones(len(pos))
-    loop = get_force_loop('gdforce')
+    loop = get_force_loop()
     n = len(pos)
     icvel = np.empty((n, 3))
     q1d = np.empty(n)
@@ -130,14 +131,14 @@ def test_force_points_from_overdense_to_underdense():
     pos -= box * np.rint(pos / box)
     mass, idx, h, indptr, indices, rho = compute_state(pos, box, 32)
     pP = (rho / 1.0) ** 2.0
-    loop = get_force_loop('gdforce')
+    loop = get_force_loop()
     n = len(pos)
     icvel = np.empty((n, 3))
     loop(pos, mass, h, rho, pP, idx, indptr, indices,
          box, True, icvel, np.empty(n), np.empty((n, 3)), False)
-    # overdense region around x=0.25: particles on its left edge pushed -x,
-    # on its right edge +x => correlation between icvel_x and (x - 0.25)
-    # (within the squeezed half, away from periodic images)
-    inner = sel & (np.abs(pos[:, 0] - 0.25) < 0.15)
-    corr = np.corrcoef(pos[inner, 0] - 0.25, icvel[inner, 0])[0, 1]
-    assert corr > 0.5
+    # overdense slab around x=0.25: its left edge plane is pushed -x, its
+    # right edge plane +x (the uniform-pP interior carries only the operator's
+    # discreteness residual, whose sign depends on the gradient form)
+    xs = pos[sel, 0]
+    assert icvel[sel & np.isclose(pos[:, 0], xs.min()), 0].mean() < 0.0
+    assert icvel[sel & np.isclose(pos[:, 0], xs.max()), 0].mean() > 0.0

@@ -4,6 +4,11 @@ import random
 import IC_distribute as distribute
 import IC_fixdens as fixdens
 import IC_smoothlength as smth
+# The pancake is Einstein-de Sitter, so it shares setup_cosmowave's Friedmann
+# solution rather than carrying a second copy of it.
+from IC_setup_cosmowave import eds_time
+
+
 class setup_zeldovich(object):
     dICdensRsmooth = 0.1
     dICdensprofile = 1
@@ -19,6 +24,11 @@ class setup_zeldovich(object):
     ndim=3
     time=0
     cosmo=1
+    # Cosmology stated explicitly, as setup_cosmowave does, instead of leaning
+    # on IC_createparamfile's getattr defaults.
+    H0=2.894405
+    omega0=1.0
+    omegaLambda=0.0
     gamma=1.666666667
     #molweight=1.0
     molweight=1.0
@@ -28,6 +38,11 @@ class setup_zeldovich(object):
     grav=1
     deltastep=0.002
     nsteps=400
+    # nsteps/freqout = 100 step-based dumps, the same output count as the
+    # 100-entry redshift list IC_createsetup writes and as setup_cosmowave.
+    freqout=4
+    ns=64
+    inflow=0
     dmsolunit=1.0
     dkpcunit=1000.0
     adi=1
@@ -65,9 +80,18 @@ class setup_zeldovich(object):
     stratified=0
     def __init__(self):
         pass
-    def create(self,nx,Lboxinkpc,zi,distri=0,vm=0,entry='datafiles/alfvenwave128_preglass.00000'):
+    # Lboxinkpc/zi carry runtest.sh's -a/-b defaults so an extras-less call
+    # behaves like every other setup instead of binding inspect._empty.
+    def create(self,nx,Lboxinkpc=1000.0,zi=100,distri=0,vm=0,entry='datafiles/alfvenwave128_preglass.00000'):
          self.dkpcunit=Lboxinkpc
          ascale=1./(1.+zi)
+         # IC_createsetup stamps the tipsy time with sim.a and builds the
+         # redshift output list from it (a_i -> 1); a cosmological setup that
+         # never assigns it cannot be written out at all.
+         self.a=ascale
+         # Gasoline writes both dDelta and nSteps, so choose dDelta explicitly
+         # from the EdS solution to land on a=1 (z=0) after nsteps.
+         self.deltastep=(eds_time(1.,self.H0)-eds_time(ascale,self.H0))/self.nsteps
          #--setup parameters
          self.rhozero = 1.0
 
@@ -90,7 +114,7 @@ class setup_zeldovich(object):
          zmin=xmin
          self.k=2*np.pi/L
          cs=np.sqrt(self.gamma)
-         H0=2.894405
+         H0=self.H0
          B0=np.sqrt(2.0*przero/beta)
          uzero=przero/(gam1*self.rhozero)
          print("pressure ",przero, "beta ",beta ,'B0 ',B0,'uzero',uzero)
@@ -109,8 +133,10 @@ class setup_zeldovich(object):
          totmass = self.rhozero*self.dxbound*self.dybound*self.dzbound
          self.mass = [totmass/self.npart]*self.npart
          print('npart = ',self.npart, 'mass = ', self.mass[1])
-         #self.h=smth.getsmooth(self,64)
-         self.h=0.01
+         # Per-particle initial h, the 200-neighbour guess every other setup
+         # (setup_cosmowave included) uses.  The scalar that stood here is not a
+         # per-particle array, so the tipsy column_stack could never be built.
+         self.h=smth.getsmooth(self,200)
          print(self.h/deltax)
          for i in range(self.npart):
                      self.Bx.append(0.)

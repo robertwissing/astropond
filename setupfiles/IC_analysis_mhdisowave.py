@@ -70,7 +70,8 @@ CS_DEFAULT = float(np.sqrt(PRZERO / RHOZERO))
 # runtest.sh setup_mhdisowave() carries only `beta` (sets B0); the analysis is
 # independent of B0 (the longitudinal sound wave does not involve B).
 PARAM_SPEC = [
-    Param("a", "beta", 0.1, float, "plasma beta (sets B0=sqrt(2 P/beta))"),
+    Param("a", "beta", 0.1, float,
+          "plasma beta (sets B0=sqrt(2 P/beta))", "beta"),
 ]
 
 

@@ -27,10 +27,10 @@ neighbour count, so it is carried through unscaled.
 
 --op reconstruct (GAS only, IC-grade): rebuild the gas at an ARBITRARY
 --count N, decoupled from the input count. A thin wrapper around the
-glassgen table builder (RECONSTRUCT_PLAN.md, decided 2026-07-10): capture
+glassgen table builder: capture
 the input gas density on a raw AMR table (sph_interp), sample + envelope +
 progressive relax in glassgen (build_from_table), then transfer fields
-(vel/u/...) either by the M22 particle-scatter control or an opt-in M23
+(vel/u/...) either by particle scatter or by a
 conservative raw-AMR state plus vertex imprint - the output has no history
 to inherit. Positions are rebuilt from scratch, so this is for
 ICs / quasi-equilibrium snapshots, not mid-run states with strong coherent
@@ -231,13 +231,13 @@ def main(argv=None):
     rec.add_argument('--field-transfer', choices=('scatter', 'table'),
                      default='table',
                      help='field transfer after reconstruction: table '
-                          '(default, M23) captures conservative rho*A channels '
+                          '(default) captures conservative rho*A channels '
                           'on the raw AMR grid and imprints A=vertex(rho*A)/'
-                          'vertex(rho) after relaxation; scatter is the M22 '
+                          'vertex(rho) after relaxation; scatter is the '
                           'particle-to-particle control/fallback')
     rec.add_argument('--field-interp',
                      choices=('vertex', 'limited', 'flat'), default='vertex',
-                     help='M23 table field readout at final particle '
+                     help='table field readout at final particle '
                           'positions (default: vertex). Numerator and rho '
                           'use the same operator before division')
     rec.add_argument('--magnetic-projection',
@@ -256,23 +256,23 @@ def main(argv=None):
                           'the vertex A interpolant (open boxes only)')
     rec.add_argument('--energy-mode', choices=('internal', 'total'),
                      default='internal',
-                     help='M23 table transfer: internal preserves deposited '
+                     help='table transfer: internal preserves deposited '
                           'u (default); total also deposits kinetic energy '
                           'and converts unresolved within-cell velocity '
                           'variance to heat. Requires --field-transfer table')
     rec.add_argument('--momentum-closure', choices=('boost', 'none'),
                      default=None,
-                     help='M23 table transfer: apply the minimum-change '
+                     help='table transfer: apply the minimum-change '
                           'uniform velocity boost that matches full raw-table '
                           'linear momentum (default for table), or none for '
                           'an uncorrected A/B')
     state_io = rec.add_mutually_exclusive_group()
     state_io.add_argument('--state-table', default=None, metavar='FILE.npz',
-                          help='M23: reuse a previously captured raw AMR '
+                          help='reuse a previously captured raw AMR '
                                'state table (still reads the input snapshot '
                                'for gas mass and non-gas families)')
     state_io.add_argument('--save-state', default=None, metavar='FILE.npz',
-                          help='M23: save the captured raw AMR state before '
+                          help='save the captured raw AMR state before '
                                'starting relaxation')
     rec.add_argument('--icr0-stop', dest='icr0_stop', type=float,
                      default=None, metavar='X',
@@ -291,11 +291,11 @@ def main(argv=None):
                           'rho_edge = where the cumulative faint-end mass '
                           'first exceeds nedge*m; 0 = use --nsmooth/-s)')
     rec.add_argument('--nframe', dest='n_frame', type=float, default=None,
-                     help='M20: floor backability - expected particles per '
+                     help='floor backability - expected particles per '
                           'edge kernel at the profile floor (rho_frame = '
                           'rho_edge*nframe/nsmooth; default 16 ~ k1.26)')
     rec.add_argument('--nl0', dest='nl0', type=float, default=None,
-                     help='M20: scaffold launch resolvability N_L(0) in '
+                     help='scaffold launch resolvability N_L(0) in '
                           'kernel supports; tail_reach solved per build '
                           '(default 1.35; avoid ~1, the resonance band)')
     rec.add_argument('--alpha', type=float, default=None,
@@ -490,10 +490,9 @@ def main(argv=None):
             field_payload = aux
             tu_fac = 1.0
             if args.field_transfer == 'table':
-                # BField aux no longer needs rejecting here: reconstruct
-                # splits magnetic components out of the generic transfer and
-                # moves them by --magnetic-projection (2026-07-23).
-                # Recomputed/resolution fields are not hydrodynamic state
+                # BField aux stays in: reconstruct splits magnetic components
+                # out of the generic transfer and moves them by
+                # --magnetic-projection. Recomputed/resolution fields are not hydrodynamic state
                 # channels. eps is restored below then scaled to output mass;
                 # phi is intentionally reset for the target gravity solve.
                 field_payload = {k: v for k, v in aux.items()

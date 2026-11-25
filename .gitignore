@@ -1,5 +1,19 @@
-# Local working notes (kept on disk, not in the repo)
-setupfiles/ANALYSIS_FRAMEWORK_PLAN.md
+# Local working notes and agent hand-off plans (kept on disk, not in the repo)
+*_PLAN.md
+PLAN_*.md
+PLAN.md
+WORKPLAN.md
+/runtest_ddstest.sh
+
+# Pre-edit copies of changed files (backup_YYYYMMDD_<name>/, at any level)
+backup_*/
+
+# Test setups received as an archive (not part of the suite)
+/Two_new_FDM_test_setups.zip
+
+# ChaNGa's CI workflows (they live in the ChaNGa repositories)
+/ci/changa-regression.yml
+/ci/gitlab-ci.yml
 
 # Python bytecode
 *.pyc
@@ -11,11 +25,17 @@ __pycache__/
 
 # Build products (icgenerator/gasoline)
 *.o
+/codes/gasoline/builds/
+/codes/changa/builds/
 
 # Third-party source trees fetched by the get_*.sh scripts (not vendored)
 /icgenerator/music/MUSIC/
 /utilities/polaris/POLARIS/
 /codes/arepo/AREPO/
+/codes/gizmo/gizmo/
+
+# Local patches to public GIZMO (the FDM port); not part of the suite
+/codes/gizmo/patches/
 
 # Third-party build products
 /codes/arepo/Arepo*

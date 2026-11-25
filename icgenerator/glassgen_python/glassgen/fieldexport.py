@@ -7,8 +7,7 @@ through the generic vertex transfer, is captured separately through the
 open-AMR *face* pipeline and written twice -- the RAW field the interpolation
 lands on the grid (``_Bprehodge``) and the divergence-projected field after the
 Hodge solve (``_Bposthodge``).  The gap between them is exactly the magnetic
-energy the divergence cleaning removes (see FIELD_RECONSTRUCTION_PLAN.md,
-"Pre- vs post-Hodge energy decomposition").
+energy the divergence cleaning removes.
 
 Every output is a gas-only tipsy snapshot with ONE gas particle per leaf cell
 (pos = cell centre, mass = rho*V, rho col = density, temp col = AMR level,

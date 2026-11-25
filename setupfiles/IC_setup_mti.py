@@ -9,7 +9,7 @@ Created on Fri Apr 27 14:57:12 2018
 ## Setup for ORZAG-TANG
 import numpy as np
 # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
-# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+# NOT a global `np.trapz = ...` monkeypatch.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import IC_distribute as distribute
 import IC_fixdens as fixdens
@@ -108,6 +108,10 @@ class setup_mti(object):
             fixdens.set_density_profile(self,-dz,dz,rhotab=self.getrho_vec(zgrid),xtab=zgrid,icoord=2)
         elif self.distri==1:
             distribute.setrandomdist(self,-dx,dx,-dy,dy,-dz,dz,deltax)
+            if not self.preglass:
+                # stratify a standalone rand IC exactly as the lattice one is;
+                # the pre-glass seed is left uniform for the relaxation
+                fixdens.set_density_profile(self,-dz,dz,rhotab=self.getrho_vec(zgrid),xtab=zgrid,icoord=2)
         else:
             tgdata,tddata,tsdata,data_header,time=tip.readtipsy(entry);
             self.x=tgdata[:,1]

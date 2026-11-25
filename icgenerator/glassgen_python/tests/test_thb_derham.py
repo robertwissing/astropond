@@ -1,6 +1,6 @@
 """Hierarchical (THB) spline De Rham readout, variant 1 (A-projection):
 project an analytic A into S1, curl it, recover the analytic B; exactly
-div-free on a graded mesh.  FIELD_RECONSTRUCTION_PLAN rung 3."""
+div-free on a graded mesh."""
 
 import numpy as np
 import pytest

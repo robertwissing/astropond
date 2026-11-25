@@ -1,4 +1,4 @@
-IC_analysis_sedov.py #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Analysis for the Sedov-Taylor blast wave test (IC_setup_sedov).
 
@@ -37,7 +37,7 @@ import sys
 
 import numpy as np
 # numpy>=2.0 renamed trapz -> trapezoid (removed in 2.4). Local alias,
-# NOT a global `np.trapz = ...` monkeypatch (CONSOLIDATION_PLAN D5).
+# NOT a global `np.trapz = ...` monkeypatch.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import readtipsy as tip
 from scipy.integrate import solve_ivp
@@ -66,12 +66,15 @@ ENT_RMIN = 0.1                  # inner radius for the entropy comparison: A=p/r
 # and `betain` change the analysis (magnetic vs hydro); the rest are carried for
 # CLI/label parity with runtest.
 PARAM_SPEC = [
-    Param("a", "select", 1, int, "energy-injection mode (0 Pin/Rin, 1 point, 2 kernel)"),
-    Param("b", "betain", 0.0, float, "blast plasma-beta (0 -> no B, analytic valid)"),
-    Param("c", "ublast", 10.0, float, "blast energy (select 1/2)"),
-    Param("d", "Rin", 0.125, float, "inner blast radius (select 0)"),
-    Param("e", "Pin", 100.0, float, "inner pressure (select 0)"),
-    Param("f", "Pout", 1.0, float, "ambient pressure (select 0)"),
+    Param("a", "select", 1, int,
+          "energy-injection mode (0 Pin/Rin, 1 point, 2 kernel)", "select"),
+    Param("b", "betain", 0.0, float,
+          "blast plasma-beta (0 -> no B, analytic valid)", "beta"),
+    Param("c", "ublast", 10.0, float,
+          "blast energy (select 1/2)", "ublast"),
+    Param("d", "Rin", 0.125, float, "inner blast radius (select 0)", "Rin"),
+    Param("e", "Pin", 100.0, float, "inner pressure (select 0)", "Pin"),
+    Param("f", "Pout", 1.0, float, "ambient pressure (select 0)", "Pout"),
 ]
 
 

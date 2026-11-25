@@ -21,8 +21,7 @@ resolution ``m = M_gas / N_final``,
 
 The shell target DECAYS from rho_edge at the gas boundary to rho_frame outward
 (a density -> pressure gradient the relax works the background into), and the
-background is a jittered lattice whose number density tracks that decay. See
-RECONSTRUCT_PLAN.md.
+background is a jittered lattice whose number density tracks that decay.
 
 Nothing here needs sph_interp: the density field / occupancy / shell targets are
 passed in as any object exposing ``rho0(pos)`` (an ``AMRTable``, a
@@ -38,11 +37,10 @@ from .density import CallableDensity, DensityField, TableDensity
 
 NSMOOTH_DEFAULT = 64        # matches the glassgen relax default nsmooth
 ALPHA_DEFAULT = 2.0         # resolvability constant: local spacing must obey
+MAPPED_NGRID_DEFAULT = 128  # Cartesian volume quadrature for open mapped targets
 #                             Delta(rho) <= alpha * rho/|grad rho| - the SAME
 #                             alpha as progressive.auto_coarse_count (cascade
 #                             coarse-level bound, calibrated on mhdcollapse).
-#                             (Its marginal solution, the cubic scaffold, was
-#                             falsified in M14 and DELETED 2026-07-17, C3.)
 
 
 def _eval(fn, pos):
@@ -82,9 +80,8 @@ def rho_edge(vals, vols, m, c=NSMOOTH_DEFAULT):
 
 def edge_floor_spacing(vals, vols, m, c=NSMOOTH_DEFAULT, k=2.0):
     """Convenience: (rho_edge, Delta_bg) from the density field and (m, c, k).
-    ``Delta_bg = k*(m/rho_edge)**1/3``. Two-rung ladder (2026-07-14): the vacuum
-    field decays rho_edge -> rho_frame = rho_edge/k**6; rho_floor retired (it was
-    the redundant fill trigger + shelf bottom).
+    ``Delta_bg = k*(m/rho_edge)**1/3``. The vacuum field decays
+    rho_edge -> rho_frame = rho_edge/k**6.
     """
     re = rho_edge(vals, vols, m, c=c)
     delta_bg = k * (m / re) ** (1.0 / 3.0)
@@ -101,22 +98,21 @@ def kernel_support(spacing, nsmooth=NSMOOTH_DEFAULT):
     return (3.0 * nsmooth / (4.0 * np.pi)) ** (1.0 / 3.0) * spacing
 
 
-#: M20 defaults (RECONSTRUCT_PLAN): floor backability count and scaffold
-#: launch resolvability - the measured k1.25-tr12 anchor cell.
+#: Default floor backability count and scaffold launch resolvability
+#: (the measured k1.25-tr12 anchor).
 NFRAME_DEFAULT = 16.0
 NL0_DEFAULT = 1.35
 
 
 def resolve_bg_k(k=None, n_frame=None, nsmooth=NSMOOTH_DEFAULT):
-    """M20: background coarseness from the floor-BACKABILITY count.
+    """Background coarseness from the floor-BACKABILITY count.
 
     ``n_frame`` = expected particles of mass m per EDGE-KERNEL volume
     (V_e = nsmooth*m/rho_edge, so n(rho) = nsmooth*rho/rho_edge) at the
     profile floor: rho_frame = rho_edge*(n_frame/nsmooth), i.e.
-    k = (nsmooth/n_frame)**(1/6). n_frame=1 <=> the old k=2 default (the
-    floor AT the unbackable density - a structurally thin buffer);
-    n_frame=16 (default) <=> k~1.26, the fat backed buffer of the M19
-    grid's most reproducible cell. Legacy escape: pass ``k`` explicitly
+    k = (nsmooth/n_frame)**(1/6). n_frame=1 <=> k=2 (the floor AT the
+    unbackable density - a structurally thin buffer); n_frame=16 (default)
+    <=> k~1.26, a fat backed buffer. Legacy escape: pass ``k`` explicitly
     (mutually exclusive with n_frame)."""
     if k is not None:
         if n_frame is not None:
@@ -130,13 +126,13 @@ def resolve_bg_k(k=None, n_frame=None, nsmooth=NSMOOTH_DEFAULT):
 
 def solve_tail_reach(tail_scale, spacing_edge, nl0, k,
                      nsmooth=NSMOOTH_DEFAULT):
-    """M20: tail_reach (TR) that LAUNCHES the no-floor profile at ``nl0``
+    """tail_reach (TR) that LAUNCHES the no-floor profile at ``nl0``
     kernel supports.
 
     The profile rho(d) = rho_edge*(1+d/rs)**(-p) (rs = tail_scale/TR,
     p = 6*ln(k)/ln(1+TR)) has near-gas e-fold length L(0) = rs/p; solve
     L(0) = nl0 * 2h_e with 2h_e = kernel_support(spacing_edge). N_L ~ 1
-    is the measured metastable RESONANCE (the M19 valley); pinning the
+    is the measured metastable RESONANCE; pinning the
     launch in kernel units keeps a config off it at every N (2h_e grows
     with N, so the solved TR shrinks). L(0) is strictly decreasing in TR
     -> unique root (geometric bisection). If nl0 exceeds the TR->0 limit
@@ -164,11 +160,10 @@ def solve_tail_reach(tail_scale, spacing_edge, nl0, k,
 def check_scaffold_resolvability(tail_scale, spacing_edge, tail_reach, k,
                                  nsmooth=NSMOOTH_DEFAULT,
                                  band=(0.85, 1.15), n_backed=4.0):
-    """M20 guard on the scaffold's resolvability curve
+    """Guard on the scaffold's resolvability curve
     N_L(d) = nl0*(1+d/rs)**(1-p/3).
 
-    Warns on the measured failure geometries (the M19 grid, decoded in
-    kernel units): (a) p >= 3 - N_L flat or DESCENDING, so the profile
+    Warns on the measured failure geometries (in kernel units): (a) p >= 3 - N_L flat or DESCENDING, so the profile
     lingers in/returns to the resonance band far out where backing is
     thin (the k2.0-tr3 cell: p = 3 exactly, the whole vacuum resonant);
     (b) the LAUNCH sits in the band while the floor backing is thin
@@ -188,14 +183,14 @@ def check_scaffold_resolvability(tail_scale, spacing_edge, tail_reach, k,
         warnings.warn(
             f'scaffold N_L(d) is {"flat" if p == 3.0 else "DESCENDING"} '
             f'(p={p:.2f} >= 3): the profile re-enters low N_L far out where '
-            'backing is thin (the M19 k2-tr3 pathology) - raise n_frame or '
+            'backing is thin (the k2-tr3 pathology) - raise n_frame or '
             'nl0')
         return nl0, p
     if band[0] <= nl0 <= band[1] and n_frame_eff < 10.0:
         warnings.warn(
             f'scaffold LAUNCHES in the N_L resonance band (nl0={nl0:.2f}) '
             f'on a thin floor buffer (n_frame_eff={n_frame_eff:.1f} < 10): '
-            'the M19 valley geometry (k1.5-tr6) - move nl0 off ~1 or '
+            'the valley geometry (k1.5-tr6) - move nl0 off ~1 or '
             'raise n_frame')
         return nl0, p
     expo = 1.0 - p / 3.0
@@ -220,11 +215,10 @@ def check_scaffold_resolvability(tail_scale, spacing_edge, tail_reach, k,
 
 def frame_open_box(span_lo, span_hi, delta_bg, nsmooth=NSMOOTH_DEFAULT,
                    pad_frac=0.1, k=2.0, cap_delta=None):
-    """Size the periodic frame for an OPEN (free-surface) build - plan task M2
-    (2026-07-10): per-axis margins AND a global kernel-fits-the-box cap, so no
-    kernel is ever larger than any box axis (a period shorter than a kernel
-    support DIAMETER lets the kernel wrap onto its own image: the 80k galaxy
-    run had box_z = 22.4 against background supports of ~30).
+    """Size the periodic frame for an OPEN (free-surface) build: per-axis
+    margins AND a global kernel-fits-the-box cap, so no kernel is ever larger
+    than any box axis (a period shorter than a kernel support DIAMETER lets
+    the kernel wrap onto its own image).
 
       margin_i = max(pad_frac*span_i, H_edge)   (H_edge = support
                  of an edge-gas kernel, Delta_edge = Delta_bg/k)
@@ -237,12 +231,9 @@ def frame_open_box(span_lo, span_hi, delta_bg, nsmooth=NSMOOTH_DEFAULT,
     ``-centre`` to enter the centred periodic frame.
 
     cap_delta : spacing of the SPARSEST kernels the frame must contain
-    (defaults to ``delta_bg``). No caller overrides it since the backed-tail
-    experiment was retired (2026-07-16, CLEANUP_PLAN C1); kept because the
-    sampled backing's faintest fillers can in principle sit at spacing up to
-    ``k*delta_bg`` (toward ``rho_frame``) - if a small/thin domain ever shows
-    kernel wrap, pass ``cap_delta=k*delta_bg`` (see the plan's RECHECK
-    section, caveat 2)."""
+    (defaults to ``delta_bg``). The sampled backing's faintest fillers can
+    sit at spacing up to ``k*delta_bg`` (toward ``rho_frame``); pass
+    ``cap_delta=k*delta_bg`` if a small/thin domain shows kernel wrap."""
     span_lo = np.asarray(span_lo, dtype=np.float64).reshape(3)
     span_hi = np.asarray(span_hi, dtype=np.float64).reshape(3)
     span = span_hi - span_lo
@@ -266,8 +257,7 @@ class PaddedDensity(DensityField):
     ``base``/``occupancy``/``shell`` are any objects exposing ``rho0`` (an
     ``AMRTable``/``TableDensity``) or plain callables.
 
-    cap : clamp on the VACUUM side, normally ``rho_edge`` (2026-07-10 seam
-        fix). The shell is only ever read below the occupancy contour, where
+    cap : clamp on the VACUUM side, normally ``rho_edge``. The shell is only ever read below the occupancy contour, where
         the target is <= rho_edge by definition; without the clamp, trilinear
         bleed from dense gas cells into the first vacuum cells makes the
         shell read O(gas density) right outside the contour while the base
@@ -296,12 +286,12 @@ class PaddedDensity(DensityField):
 
 
 class _TailedShell(DensityField):
-    """Continue the shell's vacuum decay OUTSIDE the table domain (task M6).
+    """Continue the shell's vacuum decay OUTSIDE the table domain.
 
     The shell is a cell table over the capture domain; beyond its bbox the
     AMR/grid readout clamps to the boundary cell, so the frame's outer vacuum
-    (which M2's kernel-fits-the-box rule can make much larger than the
-    domain, e.g. the galaxy's box_z ~59 vs domain ~19) reads FLAT - no
+    (which :func:`frame_open_box`'s kernel-fits-the-box rule can make much
+    larger than the domain) reads FLAT - no
     home-pointing gradient for a kicked stray out there. This wrapper clamps
     the query into the domain, reads the shell value ``v`` there, and decays
     it with the excess distance ``d`` (query -> domain bbox) as
@@ -343,12 +333,11 @@ def _padded_point(x, y, z, lo, box, periodic, dims, offsets, keys,
                   rho_edge_val, cap, tail_floor, r_scale, inv_span):
     """Padded-target value at ONE point on an AMR leaf pair (base + shell
     vals on the SAME cell geometry): base lookup -> occupancy cut (the
-    containing cell's FLAT average >= rho_edge AND inside the domain;
-    2026-07-11 - the linear readout inside a truly-empty coarse cell ramps
-    toward a dense neighbour and would classify fabricated density as
-    occupied gas: the galaxy z-sheet) -> occupied returns the LINEAR base
-    value -> else shell lookup at the domain-clamped point + the M6
-    outside-domain tail + the rho_edge cap. Semantically identical to
+    containing cell's FLAT average >= rho_edge AND inside the domain; a
+    linear readout inside a truly-empty coarse cell ramps toward a dense
+    neighbour and would classify fabricated density as occupied gas) ->
+    occupied returns the LINEAR base value -> else shell lookup at the
+    domain-clamped point + the outside-domain tail + the rho_edge cap. Semantically identical to
     PaddedDensity(base, occ_flat, _TailedShell(shell)).
     Returns (value, ok); ok=False = AMR miss."""
     d = 0.0
@@ -393,7 +382,7 @@ def _padded_point(x, y, z, lo, box, periodic, dims, offsets, keys,
         if lv < 0:
             return -1.0, False
     if d > 0.0:
-        if inv_span > 0.0:                  # M6 tail beyond the domain
+        if inv_span > 0.0:                  # decay tail beyond the domain
             r = sv / tail_floor
             if r > 1.0:
                 sv = sv * (1.0 + d / r_scale) ** (-np.log(r) * inv_span)
@@ -411,9 +400,8 @@ def _padded_amr_query(pos, lo, box, periodic, dims, offsets, keys,
                       rho_edge_val, cap, tail_floor, r_scale, inv_span,
                       out):
     """One-pass padded-target readout (:func:`_padded_point` per point) with
-    no numpy temporaries/subset indexing - the generic composition measured
-    ~9x the raw table query on the 2026-07-10 galaxy timing probe (pP was
-    94% of the relax iteration). Returns the number of misses."""
+    no numpy temporaries/subset indexing (the generic composition costs ~9x
+    the raw table query). Returns the number of misses."""
     n = pos.shape[0]
     nmiss = 0
     for p in prange(n):
@@ -470,7 +458,7 @@ def _padded_amr_stencil(pos, sup, offs, wts, lo, box, periodic, dims,
 class PaddedTableDensity(PaddedDensity):
     """Fused fast path of :class:`PaddedDensity` for an AMRTable target:
     the shell shares the base table's cell geometry (``_with_values``), so
-    the whole padded readout (occupancy cut, shell + M6 tail, cap) runs as
+    the whole padded readout (occupancy cut, shell + tail, cap) runs as
     ONE numba kernel (:func:`_padded_amr_query`) with zero numpy
     temporaries. ``base``/``occupancy``/``shell`` keep the same objects the
     generic composition would use (introspection, cull, tests); only
@@ -478,10 +466,9 @@ class PaddedTableDensity(PaddedDensity):
     the domain, as the generic path without a _TailedShell.
 
     occ_edge : the occupancy threshold (always ``rho_edge``).
-    cap : vacuum-side clamp. Default (the sentinel) = ``occ_edge`` (the
-        2026-07-10 seam fix, right for an edge-capped shell); pass None
-        for the local-start shell (the production fill since M12/C2),
-        whose values legitimately exceed ``rho_edge`` next to bright
+    cap : vacuum-side clamp. Default (the sentinel) = ``occ_edge`` (right
+        for an edge-capped shell); pass None for the local-start shell (the
+        production fill), whose values legitimately exceed ``rho_edge`` next to bright
         surfaces."""
 
     _CAP_EDGE = object()                 # sentinel: cap = occ_edge
@@ -558,25 +545,28 @@ class PaddedTableDensity(PaddedDensity):
 
 
 def place_background(occupancy, shell, rho_edge_val, rho_cut, m,
-                     region_lo, region_hi, jitter=0.3, seed=0, rho_min=None):
-    """Jittered cubic background lattice in the SHELL (task 9, N-aware form).
+                     region_lo, region_hi, jitter=0.3, seed=0, rho_min=None,
+                     n_extra=0):
+    """Jittered cubic background lattice in the SHELL (N-aware form).
 
     Lattice spacing = the finest shell spacing ``(m/rho_edge)**(1/3)`` over
     ``[region_lo, region_hi]`` (the gas bbox + a shell margin). A site is KEPT
     iff it is vacuum (``occupancy < 0.5``) AND above the cutoff
-    (``shell(site) > rho_min``, default ``rho_floor`` - the taper only), then
+    (``shell(site) > rho_min``, default ``rho_cut``), then
     THINNED by ``shell(site)/rho_edge`` so the surviving number density tracks
     the decaying shell target (grades from ~the finest spacing at the gas edge
     out to ``Delta_bg`` where the taper meets the floor). Deep vacuum
     (``shell <= rho_min``) gets no particle; gas cells get none (occupied).
-    All background particles carry mass ``m``. Returns ``(pos (n,3), mass (n,))``.
+    ``n_extra`` adds independently sampled particles with the same shell
+    density law.  It is the analytic-envelope counterpart of the table
+    builder's ``bg_over`` top-up and leaves the target field unchanged.
+    All background particles carry mass ``m``. Returns
+    ``(pos (n,3), mass (n,))``.
 
-    NB the table/reconstruct path no longer uses the lattice (retired
-    2026-07-16, CLEANUP_PLAN C1 - sampled backing via the mass-contract
-    closure is unconditional there); this survives as the natural background
-    of :func:`build_uniform_envelope`, the analytic/uniform build path.
-    ``rho_min`` lowers the vacuum cutoff below ``rho_cut`` (the retired
-    backed-tail experiment was its only caller; kept for generality).
+    NB the table/reconstruct path uses sampled backing via the mass-contract
+    closure instead; this lattice is the background of
+    :func:`build_uniform_envelope`, the analytic/uniform build path.
+    ``rho_min`` lowers the vacuum cutoff below ``rho_cut``.
     """
     rng = np.random.default_rng(seed)
     region_lo = np.asarray(region_lo, dtype=np.float64).reshape(3)
@@ -597,12 +587,47 @@ def place_background(occupancy, shell, rho_edge_val, rho_cut, m,
     prob = np.clip(rho / rho_edge_val, 0.0, 1.0)
     keep &= rng.random(len(grid)) < prob
     pos = np.ascontiguousarray(grid[keep])
+
+    # The lattice above is the analytic-envelope mass closure.  A relaxed
+    # free surface retains a one-kernel skin outside the sharp cull contour,
+    # so an exact closure can deliver fewer than n_final survivors.  Sample
+    # an explicit oversubscription from the SAME vacuum-shell density; this
+    # supplies the skin without widening or densifying the physical gas
+    # buffer.  The default zero returns the lattice alone.
+    n_extra = int(n_extra)
+    if n_extra < 0:
+        raise ValueError("n_extra must be non-negative")
+    if n_extra:
+        extra_chunks = []
+        remaining = n_extra
+        attempted = 0
+        span = region_hi - region_lo
+        attempt_limit = max(1_000_000, 10_000 * n_extra)
+        while remaining:
+            ntrial = max(4096, 8 * remaining)
+            trial = region_lo + rng.random((ntrial, 3)) * span
+            trial_rho = _eval(shell, trial)
+            accept = ((_eval(occupancy, trial) < 0.5) &
+                      (trial_rho > rho_min * (1.0 + 1e-9)))
+            accept &= (rng.random(ntrial) <
+                       np.clip(trial_rho / rho_edge_val, 0.0, 1.0))
+            accepted = trial[accept]
+            if len(accepted):
+                take = min(remaining, len(accepted))
+                extra_chunks.append(accepted[:take])
+                remaining -= take
+            attempted += ntrial
+            if attempted >= attempt_limit and remaining:
+                raise ValueError("could not sample the requested analytic "
+                                 "envelope background top-up")
+        pos = np.ascontiguousarray(
+            np.concatenate([pos, *extra_chunks], axis=0))
     mass = np.full(len(pos), m)
     return pos, mass
 
 
 def cull_vacuum(pos, mass, aux, occupancy, total_mass):
-    """Spatial vacuum cull + mass renormalisation (task 9f/g).
+    """Spatial vacuum cull + mass renormalisation.
 
     Keep every particle whose FINAL position is resolved gas
     (``occupancy(pos) >= 0.5``) - a background particle that meshed into the gas
@@ -693,14 +718,14 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
                          c=NSMOOTH_DEFAULT, k=None,
                          seed=0, nsmooth=NSMOOTH_DEFAULT,
                          pad_frac=0.1, tail_reach=None,
-                         n_frame=None, nl0=None, bg_over=0.0):
+                         n_frame=None, nl0=None, bg_over=0.0,
+                         base_density=None):
     """Envelope dict for a TABLE target (AMRTable or 3D TableDensity) - the
     table-native analog of :func:`build_uniform_envelope`, driven by the
     glassgen table builder (:func:`glassgen.progressive.build_from_table`).
 
     From ``m = gas_mass/n_final``: ``rho_edge`` (cumulative faint-tail cut at
-    ``c*m`` on the cell values). Two-rung ladder (2026-07-14): rho_floor is
-    RETIRED as a separate rung - the vacuum decays ``rho_edge -> rho_frame =
+    ``c*m`` on the cell values); the vacuum decays ``rho_edge -> rho_frame =
     rho_edge/k**6``. Occupancy is analytic and sharp on the table
     (``table.rho0(pos) >= rho_edge``); the shell is the same cell set with the
     sub-``rho_edge`` cells emptied (the fill trigger is ``floor=rho_edge``) and
@@ -708,19 +733,15 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     local edge value down to ``rho_frame`` at the frame corner (in the cells
     inside the domain, analytically outside it via :class:`_TailedShell`) -
     no plateau anywhere, so a re-anneal-kicked stray always feels a
-    home-pointing gradient. (The legacy taper family - flat_floor shelf,
-    shell_start, decay_cells/decay_spacing/decay_local - was retired
-    2026-07-17, CLEANUP_PLAN C2, after the M20 ladder validated the
-    no-floor default at every N.) Steepness comes from the M20 launch knob
-    ``nl0`` (tail_reach solved per build) or a legacy explicit
-    ``tail_reach``.
-    The background is SAMPLED backing (lattice retired 2026-07-16, CLEANUP_PLAN
-    C1): the mass-contract closure is the sole sampler - ``n_bg = (M_target -
-    gas_mass)/m`` fillers drawn from the vacuum cells w.p. ``shell*V`` at
-    particle mass m, so backing number density tracks the target right up to
-    bright surfaces (the k15/ladder cusp lever, no ``delta_bg`` quantization;
-    ``delta_bg`` survives as a diagnostic and the frame-sizing kernel scale).
-    ``bg_over`` (M21) OVERSUBSCRIBES the closure by ``bg_over*n_final`` extra
+    home-pointing gradient. Steepness comes from the launch knob ``nl0``
+    (tail_reach solved per build) or a legacy explicit ``tail_reach``.
+    The background is SAMPLED backing: the mass-contract closure is the sole
+    sampler - ``n_bg = (M_target - gas_mass)/m`` fillers drawn from the
+    vacuum cells w.p. ``shell*V`` at particle mass m, so backing number
+    density tracks the target right up to bright surfaces (no ``delta_bg``
+    quantization; ``delta_bg`` serves as a diagnostic and the frame-sizing
+    kernel scale).
+    ``bg_over`` OVERSUBSCRIBES the closure by ``bg_over*n_final`` extra
     fillers (same shell-mass sampling) to cancel the systematic post-cull
     count undershoot (renorm f > 1); set it ~ the observed f-1 (0 = exact
     contract, the default).
@@ -730,41 +751,40 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
 
     For an OPEN build (``box is None``) the dict also carries ``frame_box``/
     ``frame_centre`` - the periodic frame sized by :func:`frame_open_box`
-    (task M2: per-axis margins + the kernel-fits-the-box cap from
+    (per-axis margins + the kernel-fits-the-box cap from
     ``Delta_bg``); ``nsmooth``/``pad_frac`` feed that rule. Returns the
     ``envelope=`` dict for :func:`glassgen.progressive.relax_progressive`.
 
     The fill always LAUNCHES from the nearest occupied cell's own value
-    (the M12 'local' scheme - continuous at the surface by construction;
-    the pre-M12 'edge' cap and the whole shell_start knob retired with the
-    taper family, C2).
+    (continuous at the surface by construction).
 
-    (bg_mode/bg_tail RETIRED 2026-07-16, CLEANUP_PLAN C1: the jittered
-    lattice and the backed-tail experiment are gone - sampled backing via
-    the mass-contract closure is the sole, unconditional mechanism. The
-    ladder verdict: the lattice's cusp decays with N (delta_bg grows
-    relatively sparser), the sampled backing's is ~N-invariant.)"""
+    ``base_density`` is an optional exact gas-side evaluator for a table that
+    exists only as a Cartesian volume quadrature (for example a 3-D sampling
+    of a mapped ``(R, |z|)`` target).  Cell values/volumes still determine the
+    edge, shell mass, and sampled backing, while occupancy and the padded
+    target read ``base_density`` inside the table domain.  The default keeps
+    the physical table as both quadrature and gas target."""
     centres, sizes, _, vals = table_cells(table)
     vals = np.asarray(vals, dtype=np.float64)
     vols = sizes.prod(1)
+    base = table if base_density is None else base_density
     m = float(gas_mass) / int(n_final)
-    # M20: k from the floor-backability count n_frame unless legacy-explicit
+    # k from the floor-backability count n_frame unless legacy-explicit
     k = resolve_bg_k(k, n_frame, nsmooth=nsmooth)
     re, delta_bg = edge_floor_spacing(vals, vols, m, c=c, k=k)
-    shell_cap = None                    # local-start launch (M12; C2 fixed)
+    shell_cap = None                    # local-start launch
     occ_cells = vals >= re
     # occupancy is DOMAIN-AWARE: outside the table's bbox the AMR/grid readout
     # clamps to the boundary cell, so a stray beyond the domain could read
-    # >= rho_edge and dodge the vacuum cull (seen when the capture stopped
-    # covering the whole periodic frame - task M2's capture-first order).
-    # It is also FLAT (cell averages, 2026-07-11): the linear readout inside
-    # a truly-empty coarse cell ramps toward a dense neighbour's average and
-    # marks fabricated density as occupied gas (the galaxy z-sheet: 15% of
-    # the survivors parked in cells whose true average is zero).
+    # >= rho_edge and dodge the vacuum cull.
+    # It is also FLAT (cell averages): the linear readout inside a
+    # truly-empty coarse cell ramps toward a dense neighbour's average and
+    # marks fabricated density as occupied gas.
     dom_lo = (centres - 0.5 * sizes).min(0)
     dom_hi = (centres + 0.5 * sizes).max(0)
-    occ_view = table
-    if isinstance(table, AMRTable) and table.interp != 'flat':
+    occ_view = base
+    if base_density is None and isinstance(table, AMRTable) \
+            and table.interp != 'flat':
         occ_view = AMRTable(table.lo, table.box, table.dims, table.offsets,
                             table.keys, table.vals, table.order,
                             table.periodic, interp='flat')
@@ -775,18 +795,6 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
         return ((_eval(t, p) >= e) & inside).astype(np.float64)
 
     occupancy = CallableDensity(_occ)
-    # taper_len RETIRED (2026-07-16, CLEANUP_PLAN C1a). It was the reach of
-    # the old exponential skirt and did two jobs, both dead: (a) it inflated
-    # region_lo/hi, the LATTICE placement region - but the lattice is legacy
-    # (sampled backing places from the shell's own mass distribution), and
-    # (b) it was a floor in frame_open_box's margin - where H_edge always
-    # wins at every setting in use (7.2 vs 11.2 on the 20k galaxy). Its only
-    # surviving effect was to fatten the frame by 2*taper_len per axis, which
-    # inflated tail_scale = 0.5*max(frame) and so STRETCHED the vacuum
-    # profile's length scale rs = tail_scale/tail_reach (the exponent p is
-    # independent of tail_scale). Removing it tightens the frame to what
-    # kernel-safety + padding require and compresses the vacuum profile, so
-    # the scaffold drains faster - the direction M18 wants.
     # A raw capture may deliberately extend well beyond the physical object
     # (full compact-support, input-rho-edge, or constant padding).  Those
     # sub-rho_edge leaves are scaffold storage, not part of the resolved gas
@@ -809,8 +817,8 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
         # Backward compatibility: an older/external table has no way to tell
         # us which part of its domain was deliberate capture padding.
         region_lo, region_hi = dom_lo, dom_hi
-    # frame BEFORE the fill (M6 needs its extent): open build -> M2 rule;
-    # explicit periodic box -> the box IS the frame.
+    # frame BEFORE the fill (the tail needs its extent): open build ->
+    # frame_open_box; explicit periodic box -> the box IS the frame.
     frame_box_ = frame_centre = None
     if box is None:
         frame_box_, frame_centre = frame_open_box(
@@ -829,13 +837,12 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
     overlap_size = np.maximum(
         np.minimum(cell_hi, frame_hi) - np.maximum(cell_lo, frame_lo), 0.0)
     frame_cell_vols = overlap_size.prod(1)
-    # M6 whole-frame vacuum tail: past the exponential taper the shell keeps
-    # decaying as a power law, reaching rho_frame (= rho_floor/k**3) only at
-    # the frame edge - a kicked stray anywhere in the frame feels a
-    # home-pointing gradient instead of the flat rho_floor.
-    rho_frame = re / k ** 6               # two-rung ladder: rho_edge -> rho_frame
+    # whole-frame vacuum tail: the shell decays as a power law, reaching
+    # rho_frame only at the frame edge - a kicked stray anywhere in the
+    # frame feels a home-pointing gradient.
+    rho_frame = re / k ** 6               # vacuum decays rho_edge -> rho_frame
     tail_scale = 0.5 * float(np.max(frame_extent))
-    # M20: the profile steepness comes from the launch-resolvability knob
+    # the profile steepness comes from the launch-resolvability knob
     # nl0 (tail_reach solved per build, so the launch N_L is pinned at
     # every N) unless a legacy explicit tail_reach bypasses the solve;
     # either way the resonance-band guard runs on the resulting profile.
@@ -869,33 +876,30 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
             r_scale = max(float(np.linalg.norm(dom_half)), 1e-12)
             padded_shell = _TailedShell(shell, dom_lo, dom_hi, r_scale,
                                         d_out, rho_frame)
-    if isinstance(table, AMRTable):
+    if base_density is None and isinstance(table, AMRTable):
         # fused one-kernel readout (same values as the generic composition;
         # the relax evaluates this every particle every iteration). All
-        # four interps run fused - 'vertex' passes the two corner tables
-        # (2026-07-13 port: the 80k vertex arm spent 75% of the loop on
-        # the generic path, 1651 vs 522s).
+        # four interps run fused - 'vertex' passes the two corner tables.
         padded = PaddedTableDensity(table, occupancy, padded_shell, re,
                                     shell, tail_floor=rho_frame,
                                     r_scale=r_scale, d_max=d_out,
                                     cap=shell_cap)
     else:
-        padded = PaddedDensity(table, occupancy, padded_shell,
+        padded = PaddedDensity(base, occupancy, padded_shell,
                                cap=shell_cap)
-    # MASS-CONTRACT CLOSURE (2026-07-13, user; the SOLE background sampler
-    # since the lattice retirement 2026-07-16, CLEANUP_PLAN C1): the ensemble
+    # MASS-CONTRACT CLOSURE (the sole background sampler): the ensemble
     # must carry the target's WHOLE mass integral - occupied base + in-domain
     # shell + the analytic outside-domain tail - as particles inside the
-    # EXISTING frame (no box growth; that was bg_tail's kernel-wrap trap).
+    # EXISTING frame (no box growth, which would risk kernel wrap).
     # Exact placement does not matter (the relax redistributes); what matters
     # is that no mass has to be borrowed from the gas: n_bg = (M_target -
     # M_gas)/m fillers are sampled from the shell's own mass distribution
     # (vacuum cells w.p. shell*V, uniform inside the cell - the dense skirt
     # gets most of them, the far tail's mass representatives just sit closer
     # in). Backing number density tracks the target right up to the bright
-    # surfaces a fixed lattice spacing could never represent - the
-    # k15/ladder cusp lever, with no delta_bg quantization.
-    # bg_over (M21, 2026-07-18): OVERSUBSCRIBE the closure by bg_over*N extra
+    # surfaces a fixed lattice spacing could never represent, with no
+    # delta_bg quantization.
+    # bg_over: OVERSUBSCRIBE the closure by bg_over*N extra
     # fillers beyond the exact contract. The exact closure systematically
     # undershoots the delivered count (renorm f 1.02-1.05): at stop time the
     # scaffold holds the contract mass PLUS the strays/skin layer, so the
@@ -926,29 +930,166 @@ def build_table_envelope(table, gas_mass, n_final, box=None,
         if len(vac) == 0 or float(w.sum()) <= 0.0:
             raise ValueError('envelope frame has scaffold mass but no '
                              'in-table vacuum cells to sample')
-        pick = rng.choice(len(vac), size=n_bg_want, p=w / w.sum())
-        cells = vac[pick]
-        sample_lo = np.maximum(cell_lo[cells], frame_lo)
-        sample_hi = np.minimum(cell_hi[cells], frame_hi)
-        bg_pos = (sample_lo
-                  + rng.random((len(cells), 3)) * (sample_hi - sample_lo))
+
+        def _draw_from_vacuum_cells(n_draw):
+            pick = rng.choice(len(vac), size=int(n_draw), p=w / w.sum())
+            cells = vac[pick]
+            sample_lo = np.maximum(cell_lo[cells], frame_lo)
+            sample_hi = np.minimum(cell_hi[cells], frame_hi)
+            return (sample_lo
+                    + rng.random((len(cells), 3)) * (sample_hi - sample_lo))
+
+        if base_density is None:
+            # Preserve the established table path's deterministic draw exactly.
+            # Its flat cell occupancy makes every point in ``vac`` vacuum.
+            bg_pos = _draw_from_vacuum_cells(n_bg_want)
+        else:
+            # A quadrature cell is classified by its centre, but the exact
+            # mapped contour can cross it.  Reject sub-cell draws that land on
+            # the gas side so every scaffold seed obeys the exact occupancy
+            # contract used by the final cull.
+            chunks = []
+            remaining = n_bg_want
+            attempted = 0
+            attempt_limit = max(1_000_000, 1000 * n_bg_want)
+            while remaining:
+                ntrial = max(1024, 2 * remaining)
+                trial = _draw_from_vacuum_cells(ntrial)
+                accepted = trial[_eval(occupancy, trial) < 0.5]
+                if len(accepted):
+                    take = min(remaining, len(accepted))
+                    chunks.append(accepted[:take])
+                    remaining -= take
+                attempted += ntrial
+                if attempted >= attempt_limit and remaining:
+                    raise ValueError('could not sample mapped-envelope backing '
+                                     'outside the exact occupancy contour')
+            bg_pos = np.ascontiguousarray(np.concatenate(chunks, axis=0))
         bg_mass = np.full(len(bg_pos), m)
     env = dict(density=padded, occupancy=occupancy, bg_pos=bg_pos,
                bg_mass=bg_mass, gas_mass=float(gas_mass),
                rho_edge=re, rho_frame=rho_frame,
                delta_bg=delta_bg, m=m)
     env['M_target'] = M_target
-    env['n_bg_topup'] = len(bg_pos)
+    requested_topup = int(round(float(bg_over) * int(n_final)))
+    env['n_bg_topup'] = min(requested_topup, len(bg_pos))
+    env['n_bg_contract'] = len(bg_pos) - env['n_bg_topup']
     env['bg_over'] = float(bg_over)
     env['bg_k'] = k
     env['tail_reach'] = tail_reach
     env['active_lo'], env['active_hi'] = region_lo, region_hi
     env['capture_padded'] = bool(capture_padded)
-    if nl0_eff is not None:                      # M20: launch N_L + exponent
+    if nl0_eff is not None:                      # launch N_L + exponent
         env['nl0'] = nl0_eff
         env['profile_p'] = p_eff
-    if frame_box_ is not None:                   # open build: the M2 frame
+    if frame_box_ is not None:                   # open build: periodic frame
         env['frame_box'], env['frame_centre'] = frame_box_, frame_centre
+    return env
+
+
+def density_quadrature_table(density, pos, gas_mass, n_final, ngrid=None,
+                             nsmooth=NSMOOTH_DEFAULT, box=None):
+    """Sample an evaluator into volume-correct Cartesian cells.
+
+    This is the representation adapter needed by the proven table-envelope
+    backend when the physical target is analytic or a mapped 1-D/2-D table and
+    therefore has no Cartesian cell volumes.  The returned ``TableDensity`` is
+    a quadrature/seed object only; :func:`build_open_density_envelope` retains
+    ``density`` itself as the exact gas-side target and occupancy readout.
+
+    The domain matches :func:`build_uniform_envelope`: the realised input bbox
+    plus one typical kernel support and one ``2*N**(1/3)``-grid cell.  The
+    domain margin is independent of ``ngrid`` so convergence scans change only
+    the quadrature, not the physical integration region.  Axes are true CELL
+    CENTRES, making :func:`table_cells` recover the intended domain and exact
+    ``dx*dy*dz`` volumes.
+
+    ``box`` is the periodic relaxation frame, when there is one.  Particles
+    wrap inside it, so the quadrature domain is grown to contain it: every
+    reachable point must have a cell volume and a scaffold value.
+    """
+    pos = np.ascontiguousarray(pos, dtype=np.float64)
+    if pos.ndim != 2 or pos.shape[1] != 3 or len(pos) == 0:
+        raise ValueError('density quadrature needs non-empty (N,3) positions')
+    n_final = int(n_final)
+    if n_final <= 0:
+        raise ValueError('n_final must be positive')
+    gas_mass = float(gas_mass)
+    if not np.isfinite(gas_mass) or gas_mass <= 0.0:
+        raise ValueError('gas_mass must be finite and positive')
+    if ngrid is None:
+        ngrid = MAPPED_NGRID_DEFAULT
+    ngrid = int(ngrid)
+    if ngrid < 8:
+        raise ValueError('ngrid must be at least 8 cells per axis')
+
+    m = gas_mass / n_final
+    particle_lo = pos.min(0)
+    particle_hi = pos.max(0)
+    span = particle_hi - particle_lo
+    # Physical margin from a 2*N**(1/3) grid, independent of the quadrature
+    # ngrid.
+    margin_grid = int(np.clip(round(2.0 * n_final ** (1.0 / 3.0)), 24, 128))
+    margin_cell = float(np.max(span)) / margin_grid
+    rho_typ = max(float(np.median(_eval(density, pos))), 1e-300)
+    margin = margin_cell + kernel_support((m / rho_typ) ** (1.0 / 3.0),
+                                          nsmooth)
+    region_lo = particle_lo - margin
+    region_hi = particle_hi + margin
+    if box is not None:
+        half_box = 0.5 * np.asarray(box, dtype=np.float64).reshape(3)
+        region_lo = np.minimum(region_lo, -half_box)
+        region_hi = np.maximum(region_hi, half_box)
+    widths = (region_hi - region_lo) / ngrid
+    axes = tuple(region_lo[d] + (np.arange(ngrid) + 0.5) * widths[d]
+                 for d in range(3))
+    gx, gy, gz = np.meshgrid(*axes, indexing='ij')
+    centres = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+    vals = _eval(density, centres).reshape((ngrid, ngrid, ngrid))
+    table = TableDensity(axes, vals, mapping=None)
+    # build_table_envelope uses these to size the active frame from all source
+    # particle centres while excluding the deliberate quadrature padding.
+    table.capture_particle_lo = particle_lo.copy()
+    table.capture_particle_hi = particle_hi.copy()
+    table.capture_padding_mode = 'mapped-cartesian-quadrature'
+    table.quadrature_region_lo = region_lo.copy()
+    table.quadrature_region_hi = region_hi.copy()
+    table.quadrature_ngrid = ngrid
+    return table
+
+
+def build_open_density_envelope(density, pos, gas_mass, n_final,
+                                c=NSMOOTH_DEFAULT, ngrid=None, seed=0,
+                                nsmooth=NSMOOTH_DEFAULT, pad_frac=0.1,
+                                n_frame=None, nl0=None, bg_over=0.0,
+                                box=None):
+    """Free-surface envelope adapter for an analytic or mapped evaluator.
+
+    Construct only the Cartesian volume representation missing from such a
+    target, then delegate the complete scaffold and sampled mass closure to
+    :func:`build_table_envelope`.  The exact evaluator remains the gas target
+    and final cull predicate.  ``seed_table`` in the returned dict is the table
+    from which an open ``-I`` CLI run draws a fresh ``N=len(-I)`` seed.
+
+    ``box=None`` is the open build: :func:`build_table_envelope` sizes its own
+    periodic frame.  Passing a ``box`` instead keeps a target's free surfaces
+    inside a frame the caller already fixed - the mixed-boundary case, where
+    one axis is genuinely periodic (a slab's ``z`` wrap) and the surfaces sit
+    in the interior.  The frame is then the box, and the background is sampled
+    only inside it.
+    """
+    quadrature = density_quadrature_table(
+        density, pos, gas_mass, n_final, ngrid=ngrid, nsmooth=nsmooth,
+        box=box)
+    env = build_table_envelope(
+        quadrature, gas_mass, n_final, box=box, c=c, seed=seed,
+        nsmooth=nsmooth, pad_frac=pad_frac, n_frame=n_frame, nl0=nl0,
+        bg_over=bg_over, base_density=density)
+    env['seed_table'] = quadrature
+    env['quadrature_ngrid'] = quadrature.quadrature_ngrid
+    env['quadrature_mass'] = table_mass(quadrature)
+    env['quadrature_region_lo'] = quadrature.quadrature_region_lo
+    env['quadrature_region_hi'] = quadrature.quadrature_region_hi
     return env
 
 
@@ -956,7 +1097,7 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
                            c=NSMOOTH_DEFAULT, k=2.0, ngrid=None,
                            jitter=0.3, seed=0,
                            nsmooth=NSMOOTH_DEFAULT, pad_frac=0.1,
-                           tail_reach=6.0):
+                           tail_reach=6.0, bg_over=0.0):
     """Assemble the envelope dict for ``./glassgen`` (glassgen-native, no
     sph_interp) from the analytic/table target ``density`` and the gas pre-IC.
 
@@ -967,9 +1108,7 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
       samples ``vals = density.rho0(centres)``.
     - ``rho_edge``/``rho_frame``/``Delta_bg`` come from ``m = gas_mass/n_final``
       (:func:`edge_floor_spacing`). The vacuum fill is the no-floor profile
-      (the legacy taper family retired 2026-07-17, CLEANUP_PLAN C2; this
-      path keeps a LITERAL ``tail_reach`` default of 6.0 - it is not part
-      of the M20 solve).
+      with a LITERAL ``tail_reach`` (default 6.0; no ``nl0`` solve here).
     - **occupancy** is analytic and sharp: ``density.rho0(pos) >= rho_edge``
       (no grid-graining; assumes the target tapers below ``rho_edge`` outside the
       gas - true for free-surface tables, NOT for a table that clamps to a
@@ -978,10 +1117,16 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
       cells refilled by the no-floor profile (:func:`_fill_empty` 'decay').
     - **background** is placed by :func:`place_background` over the same region.
 
+    ``bg_over`` oversubscribes the background by ``bg_over*n_final`` sampled
+    shell particles, matching :func:`build_table_envelope`.  This compensates
+    a measured post-relaxation surface skin without changing the occupancy
+    contour or physical target.
+
     Returns the ``envelope=`` dict consumed by
     :func:`glassgen.progressive.relax_progressive`: keys ``density`` (a
     :class:`PaddedDensity`), ``occupancy``, ``bg_pos``, ``bg_mass``, ``gas_mass``
-    (plus ``rho_edge``/``rho_floor``/``delta_bg`` for reporting). ``bg_pos`` may
+    (plus ``rho_edge``/``rho_frame``/``delta_bg``/``m``, ``frame_box``/
+    ``frame_centre`` and ``bg_over``/``n_bg_topup`` for reporting). ``bg_pos`` may
     be empty if the target has no sub-``rho_edge`` cells (a filled box) - then the
     caller can treat the build as envelope-off."""
     pos = np.ascontiguousarray(pos, dtype=np.float64)
@@ -993,8 +1138,7 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
         ngrid = int(round(2.0 * n_final ** (1.0 / 3.0)))
     ngrid = int(np.clip(ngrid, 24, 128))
     # shell margin: one kernel support at the gas's typical output spacing,
-    # plus a cell (the retired taper-reach formula sized this pre-C2;
-    # kernel support is the physically motivated clearance scale)
+    # plus a cell (kernel support is the physically motivated clearance scale)
     cell0 = float(np.max(span)) / ngrid
     rho_typ = max(float(np.median(_eval(density, pos))), 1e-300)
     margin = cell0 + kernel_support((m / rho_typ) ** (1.0 / 3.0), nsmooth)
@@ -1011,17 +1155,15 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
     # analytic sharp occupancy (world coords)
     occupancy = CallableDensity(
         lambda p, d=density, e=re: (_eval(d, p) >= e).astype(np.float64))
-    # M2 frame: the region already includes the taper margin, so only the
-    # pad_frac/H_edge margins + the kernel-fits-the-box cap apply on top
-    # (this path keeps its OWN region_lo/hi margin - see above; it never used
-    # the retired taper_len knob, it passed 0.0)
+    # periodic frame: the region already includes the shell margin, so only
+    # the pad_frac/H_edge margins + the kernel-fits-the-box cap apply on top
     frame_box_, frame_centre = frame_open_box(
         region_lo, region_hi, delta_bg, nsmooth=nsmooth,
         pad_frac=pad_frac, k=k)
     # shell = grid with sub-rho_edge cells refilled by the no-floor profile,
-    # launched from the local edge value (M12 'local'; C2 fixed)
+    # launched from the local edge value
     shell_cap = None
-    rho_frame = re / k ** 6               # two-rung ladder: rho_edge -> rho_frame
+    rho_frame = re / k ** 6               # vacuum decays rho_edge -> rho_frame
     tail_scale = 0.5 * float(np.max(frame_box_))
     shell_vals = _fill_empty(
         vals.copy(), 'decay', centres, box=None,
@@ -1040,19 +1182,26 @@ def build_uniform_envelope(density, pos, gas_mass, n_final,
         padded_shell = _TailedShell(shell, region_lo, region_hi, r_scale,
                                     d_out, rho_frame)
     padded = PaddedDensity(density, occupancy, padded_shell, cap=shell_cap)
+    bg_over = float(bg_over)
+    if not np.isfinite(bg_over) or bg_over < 0.0:
+        raise ValueError("bg_over must be finite and non-negative")
+    n_bg_topup = int(round(bg_over * int(n_final)))
     bg_pos, bg_mass = place_background(occupancy, shell, re, rho_frame,
                                        m, region_lo, region_hi,
-                                       jitter=jitter, seed=seed)
+                                       jitter=jitter, seed=seed,
+                                       n_extra=n_bg_topup)
     env = dict(density=padded, occupancy=occupancy, bg_pos=bg_pos,
                bg_mass=bg_mass, gas_mass=float(gas_mass),
                rho_edge=re, rho_frame=rho_frame,
                delta_bg=delta_bg, m=m,
                frame_box=frame_box_, frame_centre=frame_centre)
+    env['bg_over'] = bg_over
+    env['n_bg_topup'] = n_bg_topup
     return env
 
 
 # --------------------------------------------------------------------------- #
-#  Moved from reconstruct.py (re-exported there for back-compat)
+#  Table fill helpers (re-exported by reconstruct.py)
 # --------------------------------------------------------------------------- #
 
 def _fill_empty(vals, empty, centres, box, floor_frac=1e-3, floor=None,
@@ -1062,9 +1211,8 @@ def _fill_empty(vals, empty, centres, box, floor_frac=1e-3, floor=None,
     sub-floor cells qualify. (A petkova capture never yields exact zeros: its
     vacuum cells carry tiny-but-positive densities, so a ``<=0`` test would miss
     them entirely and leave the vacuum unfilled - hence the floor test.)
-      'decay' - the no-floor vacuum profile (the M18 champion; the ONLY
-          production fill since the legacy taper family was retired,
-          CLEANUP_PLAN C2 2026-07-17): ONE strictly-decreasing profile from
+      'decay' - the no-floor vacuum profile (the production fill): ONE
+          strictly-decreasing profile from
           the (capped) nearest-occupied value down to ``tail_floor``
           (rho_frame) at the frame corner ``d = tail_scale``, mirroring
           :meth:`_TailedShell.rho0` so the in-domain fill and the
@@ -1072,7 +1220,7 @@ def _fill_empty(vals, empty, centres, box, floor_frac=1e-3, floor=None,
           domain face: ``rho(d) = edge * (1 + d/r_scale)**-p`` with the
           per-cell exponent ``p`` solved so ``rho(tail_scale) = tail_floor``
           exactly. No plateau anywhere => the mid-field always drains (a
-          flat rho0 region is a parking lot - the retired rho_floor shelf).
+          flat rho0 region is a parking lot).
           The residual flat is only at ``tail_floor`` beyond the frame
           corner (benign - culled).
       'edge'  - constant nearest-occupied fill (no taper; diagnostics only).
@@ -1082,13 +1230,13 @@ def _fill_empty(vals, empty, centres, box, floor_frac=1e-3, floor=None,
         are emptied and refilled. When None it is ``floor_frac *
         median(positive density)`` (relative fallback).
     cap : clamp on the fill's START value (the nearest-occupied density).
-        None = launch from the local value (the M12 local-start champion);
-        ``cap=rho_edge`` reproduces the pre-M12 'edge' scheme.
+        None = launch from the local value; ``cap=rho_edge`` clamps the
+        launch at the edge density.
     tail_scale, tail_floor : the frame-corner distance and rho_frame - the
         profile's far anchor. REQUIRED for 'decay'.
     tail_reach : steepness: ``r_scale = tail_scale/tail_reach`` (larger =>
         steeper near the gas, shallower far out). Solved per build from the
-        launch-resolvability knob nl0 upstream (M20); explicit values are
+        launch-resolvability knob nl0 upstream; explicit values are
         the legacy override."""
     vals = np.array(vals, dtype=np.float64)
     if empty == 'zero':
@@ -1144,8 +1292,7 @@ def _pad_periodic_box(pos, pad_frac=0.1):
     origin, [-L/2, L/2]) enclosing `pos` with a `pad_frac` vacuum margin per
     side, for relaxing an OPEN-domain IC. The glassgen relax MUST be periodic:
     an open boundary cannot contain the pseudo-pressure forces, so near-
-    isolated particles (huge h) run away to infinity (verified on the isolated
-    galaxy - 1% escaped past R=60). A padded periodic box contains them (an
+    isolated particles (huge h) run away to infinity. A padded periodic box contains them (an
     escapee wraps into vacuum and is culled), while the margin - larger than
     the edge kernel reach - keeps the gas from feeling its periodic images.
     Returns (box (3,), centre (3,)): shift pos -= centre to enter the frame,

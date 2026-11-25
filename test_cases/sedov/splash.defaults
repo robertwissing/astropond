@@ -12,12 +12,12 @@
  IPLOTLINE=F,
  LINESTYLE=1          ,
  LINECOLOUR=1          ,
- IMARKTYPE=1          ,4          ,17         ,1          ,3          ,
+ IMARKTYPE=17         ,4          ,17         ,1          ,3          ,
   7*1          ,
  IPLOTPARTOFTYPE=T, 11*F,
  PLOTONRENDERINGS= 12*F,
  IEXACT=4          ,
- ICOORDSNEW=1          ,
+ ICOORDSNEW=3          ,
  IFASTPARTICLEPLOT=T,
  IDEFAULTCOLOURTYPE= 12*-1         ,
  ITYPEORDER=1          ,2          ,3          ,4          ,5          ,
@@ -26,7 +26,7 @@
  USETYPEINCONTOURS=T, 11*F,
  IPLOTERRBARS=F,
  ILOCERRBARS= 512*0          ,
- HFACMARKERS=  1.00000000    ,
+ HFACMARKERS= 0.100000001    ,
  ERRORBARTYPE=0          ,
  ISMOOTH_PARTICLE_PLOTS=0          ,
  RREF=  1.00000000    ,
@@ -39,26 +39,26 @@
  INTERACTIVE=T,
  IADAPT=F,
  IADAPTCOORDS=F,
- NSTEPSPERPAGE=1          ,
+ NSTEPSPERPAGE=3          ,
  ICOLOUREACHSTEP=T,
  ICHANGESTYLES=F,
  TILE=T,
- IPAPERSIZE=0          ,
- PAPERSIZEX=  0.00000000    ,
- ASPECTRATIO=  0.00000000    ,
+ IPAPERSIZE=3          ,
+ PAPERSIZEX=  8.00000000    ,
+ ASPECTRATIO=  1.00000000    ,
  IPLOTLEGEND=T,
  IPLOTSTEPLEGEND=F,
- HPOSLEGEND= 0.949999988    ,
- VPOSLEGEND=  2.00000000    ,
+ HPOSLEGEND=  1.08566594    ,
+ VPOSLEGEND=-0.676189303    ,
  IPLOTTITLES=F,
  HPOSTITLE= 0.500000000    ,
  VPOSTITLE=  1.00000000    ,
  FJUSTTITLE= 0.500000000    ,
  LEGENDTEXT='t=                                                                              ',
  IPAGECOLOURS=0          ,
- CHARHEIGHT=  1.00000000    ,
+ CHARHEIGHT=  3.00000000    ,
  LINEWIDTH=0          ,
- FJUSTLEGEND=  1.00000000    ,
+ FJUSTLEGEND=  0.00000000    ,
  IPLOTLEGENDONLYONPANEL=0          ,
  IPLOTSCALE=F,
  DXSCALE=  1.00000000    ,
@@ -88,7 +88,7 @@
  /
 &RENDEROPTS
  NPIX=0          ,
- ICOLOURS=2          ,
+ ICOLOURS=40         ,
  NCONTOURS=30         ,
  IPLOTCONT_NOMULTI=F,
  ICOLOUR_PARTICLES=F,
@@ -132,7 +132,7 @@
  IVECLEGENDONPANEL=0          ,
  /
 &XSECROTOPTS
- XSEC_NOMULTI=F,
+ XSEC_NOMULTI=T,
  XSECPOS_NOMULTI=  0.00000000    ,
  FLYTHRU=F,
  XSECLINEX1=  0.00000000    ,
@@ -756,8 +756,10 @@
  SHAPE(32)%TEXT='                                                                                                                                                                                                                                                ',
  /
 &CALCOPTS
- CALCSTRING='sqrt((x-x0)**2 + (y-y0)**2 + (z-z0)**2)                                         ','sqrt(vx**2 + vy**2 + vz**2)                                                     ', 33*'                                                                                ',
- CALCLABEL='r                                                                               ','|v|                                                                             ', 33*'                                                                                ',
+ CALCSTRING='sqrt((x-x0)**2 + (y-y0)**2 + (z-z0)**2)                                         ','sqrt(vx**2 + vy**2 + vz**2)                                                     ','sqrt(BFieldx**2 + BFieldy**2 + BFieldz**2)                                      ','0.5*(BFieldx**2 + BFieldy**2 + BFieldz**2)                                      ','(BFieldx*(x-x0) + BFieldy*(y-y0))/sqrt((x-x0)^2 + (y-y0)^2)                     ',
+ '(BFieldy*(x-x0) - BFieldx*(y-y0))/sqrt((x-x0)^2 + (y-y0)^2)                     ','h*abs(DivB)/sqrt((BFieldx^2 + BFieldy^2 + BFieldz^2))                           ', 28*'                                                                                ',
+ CALCLABEL='r                                                                               ','|v|                                                                             ','|BField|                                                                        ','P_{mag}                                                                         ','B_R                                                                             ',
+ 'B_{\phi}                                                                        ','h|div B|/|B|                                                                    ', 28*'                                                                                ',
  CALCUNITSLABEL= 35*'                                        ',
  /
 &ANIMOPTS
@@ -780,13 +782,5 @@
  XMAXCOLEND=  0.00000000    ,
  XSECPOS_NOMULTI_END=  0.00000000    ,
  /
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00020
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00040
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00060
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00080
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00100
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00120
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00140
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00160
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00180
-sedov64_N64glassselect1beta0ublast10REGGASOLINE/sedov64_N64glassselect1beta0ublast10REGGASOLINE.00200
+sedov256_N64glassselect1beta0ublast10facQ075dtGASOLINE-BE/sedov256_N64glassselect1beta0ublast10facQ075dtGASOLINE-BE.00100
+sedov256_N64glassselect1beta0ublast10facQ075dtNOSGASOLINE-BF/sedov256_N64glassselect1beta0ublast10facQ075dtNOSGASOLINE-BF.00100

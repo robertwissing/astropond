@@ -1,15 +1,14 @@
-"""Generators vs the declared domain (SPH_INTERP_PLAN open task 4).
+"""Generators vs the declared domain.
 
 A PERIODIC axis has a canonical position for every coordinate, and
-`from_points` has wrapped onto it for a while. A NON-PERIODIC axis does not:
+`from_points` wraps onto it. A NON-PERIODIC axis does not:
 a generator outside [lo, hi] there is simply outside the domain and the mesher
 has no cell for it.
 
 voro++ does fail on that - but with "number of cells found was not equal to
 the number of particles", which is the SAME message it emits for coincident
-generators. Two unrelated causes behind one opaque string, and only the other
-one was handled (the tol_dup floor). These tests pin the pre-check that tells
-them apart.
+generators (handled by the tol_dup floor). These tests pin the pre-check that
+tells the two causes apart.
 """
 import importlib.util
 

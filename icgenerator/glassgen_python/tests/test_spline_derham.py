@@ -1,5 +1,5 @@
 """Periodic uniform B-spline De Rham complex: structure (div curl == 0) +
-analytic B recovery.  FIELD_RECONSTRUCTION_PLAN, THB-spline readout, rung 1."""
+analytic B recovery."""
 
 import numpy as np
 import pytest

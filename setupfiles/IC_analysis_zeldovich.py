@@ -61,8 +61,11 @@ DEFAULT_TIME = 0.3             # scale factor a of a well-developed, pre-caustic
 # analytic (k and z_c are fixed). Lboxinkpc is the length unit; zi sets the
 # initial scale factor a_i = 1/(1+zi) (carried for context / the velocity).
 PARAM_SPEC = [
-    Param("a", "Lboxinkpc", 1000.0, float, "box size in kpc (length unit; density analytic is in code units)"),
-    Param("b", "zi",        100.0,  float, "initial redshift (a_i = 1/(1+zi); must exceed z_c=2)"),
+    Param("a", "Lboxinkpc", 1000.0, float,
+          "box size in kpc (length unit; density analytic is in code units)",
+          "L"),
+    Param("b", "zi", 100.0, float,
+          "initial redshift (a_i = 1/(1+zi); must exceed z_c=2)", "zi"),
 ]
 
 

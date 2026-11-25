@@ -99,6 +99,11 @@ class setup_mhddivtest(object):
          if square==1:
              dz=2*np.sqrt(6)*deltax
          self.dICdensR = dx*0.5 #offset density contrast
+         # Sharp-edge (smooth=0) interface position used by getrho: the same
+         # |x| = dICdensR that rampfunc rounds off when smooth=1, that the three
+         # slabs below are laid out around, and that the dICdensprofile=2 glass
+         # target steps at.
+         self.boundary = self.dICdensR
          print(self.dICdensR,dx,-dx)
          distribute.setbound(self,-dx,dx,-dy,dy,-dz,dz)
          if distri==0:

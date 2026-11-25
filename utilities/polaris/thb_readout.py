@@ -1,5 +1,4 @@
-"""THB De Rham curl-fit readout of a cell-centred magnetic field -- M3b of
-POLARIS_EXPORT_PLAN.md.
+"""THB De Rham curl-fit readout of a cell-centred magnetic field.
 
 One entry point, `thb_curl_readout`, which takes an `AMRGrid` plus the per-leaf
 B from an ordinary deposit and returns a **pointwise divergence-free** B at
@@ -8,24 +7,20 @@ arbitrary positions, by fitting a THB-spline vector potential A so that
 asked. `div B = 0` then holds exactly and pointwise, not just in a discrete
 sense, because the C2 spline basis makes it an identity.
 
-This wraps the VARIANT 2 (`bfit_matfree`) path validated in
-`icgenerator/glassgen_python/recon_m8/magnetic_galaxy_amr_thb.py`; the plumbing
-here is the leaf-order bookkeeping that script keeps privately, lifted so both
-the POLARIS export and the generic grid CLI can call one implementation.
+This wraps `THBDeRham.bfit_matfree` plus the AMR <-> THB leaf-order
+bookkeeping, so the POLARIS export and the generic grid CLI share one
+implementation.
 
 Two things worth knowing:
 
 * **`Bbar` is handled automatically for the curl-fit.** `curl A` is mean-free,
   so the ordered mean field is L2-orthogonal to the fit and must be restored
   analytically -- `bfit_matfree` does that itself from the quadrature-weighted
-  mean when `Bbar=None`. (The plan's "`Bbar` must be passed" warning is about
-  the A-PROJECTION variant, which cannot recover it; that run had
-  `aproj_bbar = none` and lost the ordered field. Curl-fit is safe by
-  construction, and this module only ever uses curl-fit.)
+  mean when `Bbar=None`. (Only the A-PROJECTION variant, which this module
+  does not use, cannot recover it and needs `Bbar` passed.)
 * **A divergence-free field is not optional for POLARIS.** With `div B != 0` the
-  polarized-RT solver stalls -- 312 "too many steps" escalations, 73 skipped
-  cells, no FITS after 10 minutes on a grid that takes 23 s with a projected
-  field. See the plan's §8b.
+  polarized-RT solver stalls ("too many steps" escalations, skipped cells, no
+  FITS output).
 
 Memory is the real constraint: the sparse operators are (Q x nnz) and peaked at
 ~15 GB on the 405k-leaf full-resolution galaxy. `op_dtype=float32` halves that
@@ -142,11 +137,10 @@ def thb_curl_readout(amr, B_leaf, positions=None, degree=3, nq=2,
     if audit:
         # NOTE THE BASELINE. Everything here is measured against the DEPOSITED
         # leaf field, i.e. it isolates what the readout does. It is NOT
-        # comparable to the plan's `rel_l2_B` / `energy_over_source`, which are
-        # measured against the SPH PARTICLE field and therefore also carry the
-        # capture/volume-filling loss of the deposit itself. Mixing the two would
-        # make the readout look ~10x better than it is. Hence the `_vs_deposit`
-        # suffix on every key.
+        # comparable to metrics measured against the SPH PARTICLE field, which
+        # also carry the capture/volume-filling loss of the deposit itself.
+        # Mixing the two would make the readout look ~10x better than it is.
+        # Hence the `_vs_deposit` suffix on every key.
         vol = np.asarray(amr.volumes(), dtype=np.float64)
         src = B_leaf.T
         if positions.shape[0] == amr.ncell:

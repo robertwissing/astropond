@@ -5,10 +5,9 @@
 #   native RAMSES output. Run get_ramses.sh first.
 #   MPI: if an mpif90 wrapper is on PATH (must wrap gfortran — COMPILER=GNU;
 #   the Intel oneAPI mpif90 does), *_mpi twins of both binaries are built too
-#   (MPI=1 MPIF90=mpif90). runtest.sh selects them via RAMSESNP>1. Serial
-#   binaries remain the default runtime (RAMSESNP unset/1); MPI is needed for
-#   the 128^3+ MHD convergence runs (~16x the 64^3 cost, see
-#   MHD_OT_ENERGY_PLAN.md).
+#   (MPI=1 MPIF90=mpif90). runtest.sh selects them via RAMSESNP>1; RAMSESNP=1
+#   runs the serial binary. MPI is needed for the 128^3+ MHD convergence runs
+#   (~16x the 64^3 cost).
 #
 # RAMSES is configured per-build via make variables (NDIM, SOLVER, PATCH, EXEC).
 # Three artifacts:

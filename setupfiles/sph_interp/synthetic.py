@@ -44,8 +44,8 @@ Ten families, each `make_<name>(n, seed=...) -> Particles`:
             control: no dynamic range, no structure.
   lattice   cubic lattice, periodic. Every h identical and every particle
             commensurate with a power-of-two grid -- the petkova stress case
-            (see PLAN_PETKOVA_FIX: a biased near-field integral shows up as
-            stripes here and nowhere else).
+            (a biased near-field integral shows up as stripes here and nowhere
+            else).
   closepacked  ABC/hcp lattice, periodic -- the geometry `IC_distribute`'s
             `setcloseddist` produces, and what the shocktube and Orszag-Tang
             setups actually use by default.
@@ -53,9 +53,8 @@ Ten families, each `make_<name>(n, seed=...) -> Particles`:
             but with no symmetry to cancel errors; the production IC style.
   slab1d    128:12:12 box with an 8:1 density jump -- the shocktube geometry.
   slab2d    128:128:12 box, uniform -- the Orszag-Tang geometry. Thin boxes
-            have the worst history here (the AREPO per-axis LONG_Y/Z work and
-            the +340% petkova error both came from them), so they are their
-            own families rather than a variant.
+            stress per-axis periodic meshing (AREPO LONG_Y/Z) and petkova, so
+            they are their own families rather than a variant.
   disk      bulge + exponential disk + sech^2 vertical profile + a sparse
             diffuse halo, OPEN boundary in a box much larger than the disk.
             Models the isolated galaxy: a thin slab in a nearly empty box.
@@ -403,12 +402,9 @@ def make_slab1d(n, seed=42, rho_ratio=8.0, distribution="closepacked",
     rho_ratio^(1/3); Sod's 8:1 in density is 2:1 in spacing), so the
     DISCONTINUITY IS IN THE PARTICLE DISTRIBUTION, not painted on afterwards.
 
-    This is the geometry with the worst history in this package: the AREPO
-    Voronoi backend's per-axis LONG_Y/LONG_Z handling exists because a thin box
-    meshed through the isotropic ghost path gave a +340% petkova error, and the
-    mixed-periodicity ghost bug (plan task 3) reached ~10^4x in volume on
-    exactly a thin slab. A scaling bench that only ever sees cubes would miss
-    the entire class.
+    A thin box exercises the AREPO Voronoi backend's per-axis LONG_Y/LONG_Z
+    handling and the mixed-periodicity ghost padding, which a cube-only bench
+    never reaches.
     """
     aspect = np.asarray(aspect, dtype=np.float64)
     box = aspect / aspect[0]                       # normalise: x extent = 1
@@ -748,6 +744,6 @@ def describe(p, npx=64):
         "rho_max": float(rho.max()), "rho_dyn": float(rho.max() / rho.min()),
         "occupancy_64": occupancy(p, npx),
         # sum (4h / cell)^3 at a nominal 64^3 grid: the pair-count proxy that
-        # petkova's run time tracks linearly (plan task 14).
+        # petkova's run time tracks linearly.
         "pair_proxy_64": float(np.sum((4.0 * h / (box.min() / 64.0)) ** 3)),
     }

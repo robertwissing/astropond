@@ -5,7 +5,7 @@ Coordinate mappings follow the C direction codes in pkdUpdateDensity
 A 1D table/callable is evaluated at the mapped coordinate; a 2D table at a
 pair of mapped coordinates; a 3D table at (x, y, z) directly.
 
-THE table format is .npz and SELF-DESCRIBING (CLEANUP_PLAN C6, 2026-07-17):
+THE table format is .npz and SELF-DESCRIBING:
 a TableDensity saves as axes + values + its coordinate mapping in the
 header, so a loaded table knows its own dimensionality, extent and
 coordinate system - no --direction flag at the point of use. AMR tables
@@ -21,6 +21,9 @@ dim/n/R, then XDR float arrays, each prefixed by a u32 length) is LEGACY:
 
 (numpy big-endian dtypes rather than xdrlib, removed in Python 3.13).
 """
+import math
+import warnings
+
 import numpy as np
 from numba import njit, prange
 
@@ -43,78 +46,146 @@ def map_coord(pos, mapping):
     raise ValueError(f"unknown mapping '{mapping}', expected one of {MAPPINGS}")
 
 
+_MAP_CODE = {m: i for i, m in enumerate(MAPPINGS)}
+
+
+@njit(cache=True, inline='always')
+def _map_point(x, y, z, code):
+    """map_coord at one point (code = MAPPINGS index), for the fused stencils."""
+    if code == 0:
+        return abs(x)
+    if code == 1:
+        return abs(y)
+    if code == 2:
+        return abs(z)
+    if code == 3:
+        return math.sqrt(x * x + y * y + z * z)
+    if code == 4:
+        return math.sqrt(x * x + y * y)
+    return x
+
+
+@njit(cache=True, inline='always')
+def _lerp1(axis, values, x):
+    n = axis.shape[0]
+    t = (x - axis[0]) / (axis[1] - axis[0])
+    if t <= 0.0:
+        return values[0]
+    if t >= n - 1:
+        return values[n - 1]
+    j = int(t)
+    f = t - j
+    return values[j] * (1.0 - f) + values[j + 1] * f
+
+
+@njit(cache=True, inline='always')
+def _lerp2(ax0, ax1, values, x, y):
+    n0 = ax0.shape[0]
+    n1 = ax1.shape[0]
+    t0 = (x - ax0[0]) / (ax0[1] - ax0[0])
+    t1 = (y - ax1[0]) / (ax1[1] - ax1[0])
+    if t0 < 0.0:
+        t0 = 0.0
+    elif t0 > n0 - 1:
+        t0 = n0 - 1.0
+    if t1 < 0.0:
+        t1 = 0.0
+    elif t1 > n1 - 1:
+        t1 = n1 - 1.0
+    j0 = min(int(t0), n0 - 2)
+    j1 = min(int(t1), n1 - 2)
+    f0 = t0 - j0
+    f1 = t1 - j1
+    return (values[j0, j1] * (1 - f0) * (1 - f1)
+            + values[j0, j1 + 1] * (1 - f0) * f1
+            + values[j0 + 1, j1] * f0 * (1 - f1)
+            + values[j0 + 1, j1 + 1] * f0 * f1)
+
+
+@njit(cache=True, inline='always')
+def _lerp3(ax0, ax1, ax2, values, x, y, z):
+    n0, n1, n2 = ax0.shape[0], ax1.shape[0], ax2.shape[0]
+    t0 = (x - ax0[0]) / (ax0[1] - ax0[0])
+    t1 = (y - ax1[0]) / (ax1[1] - ax1[0])
+    t2 = (z - ax2[0]) / (ax2[1] - ax2[0])
+    if t0 < 0.0:
+        t0 = 0.0
+    elif t0 > n0 - 1:
+        t0 = n0 - 1.0
+    if t1 < 0.0:
+        t1 = 0.0
+    elif t1 > n1 - 1:
+        t1 = n1 - 1.0
+    if t2 < 0.0:
+        t2 = 0.0
+    elif t2 > n2 - 1:
+        t2 = n2 - 1.0
+    j0 = min(int(t0), n0 - 2)
+    j1 = min(int(t1), n1 - 2)
+    j2 = min(int(t2), n2 - 2)
+    f0, f1, f2 = t0 - j0, t1 - j1, t2 - j2
+    c00 = values[j0, j1, j2] * (1 - f2) + values[j0, j1, j2 + 1] * f2
+    c01 = values[j0, j1 + 1, j2] * (1 - f2) + values[j0, j1 + 1, j2 + 1] * f2
+    c10 = values[j0 + 1, j1, j2] * (1 - f2) + values[j0 + 1, j1, j2 + 1] * f2
+    c11 = values[j0 + 1, j1 + 1, j2] * (1 - f2) + values[j0 + 1, j1 + 1, j2 + 1] * f2
+    c0 = c00 * (1 - f1) + c01 * f1
+    c1 = c10 * (1 - f1) + c11 * f1
+    return c0 * (1 - f0) + c1 * f0
+
+
 @njit(cache=True, parallel=True)
 def _interp1d(axis, values, x, out):
-    n = axis.shape[0]
-    x0 = axis[0]
-    dx = axis[1] - axis[0]
     for i in prange(x.shape[0]):
-        t = (x[i] - x0) / dx
-        if t <= 0.0:
-            out[i] = values[0]
-        elif t >= n - 1:
-            out[i] = values[n - 1]
-        else:
-            j = int(t)
-            f = t - j
-            out[i] = values[j] * (1.0 - f) + values[j + 1] * f
+        out[i] = _lerp1(axis, values, x[i])
 
 
 @njit(cache=True, parallel=True)
 def _interp2d(ax0, ax1, values, x, y, out):
-    n0 = ax0.shape[0]
-    n1 = ax1.shape[0]
     for i in prange(x.shape[0]):
-        t0 = (x[i] - ax0[0]) / (ax0[1] - ax0[0])
-        t1 = (y[i] - ax1[0]) / (ax1[1] - ax1[0])
-        if t0 < 0.0:
-            t0 = 0.0
-        elif t0 > n0 - 1:
-            t0 = n0 - 1.0
-        if t1 < 0.0:
-            t1 = 0.0
-        elif t1 > n1 - 1:
-            t1 = n1 - 1.0
-        j0 = min(int(t0), n0 - 2)
-        j1 = min(int(t1), n1 - 2)
-        f0 = t0 - j0
-        f1 = t1 - j1
-        out[i] = (values[j0, j1] * (1 - f0) * (1 - f1)
-                  + values[j0, j1 + 1] * (1 - f0) * f1
-                  + values[j0 + 1, j1] * f0 * (1 - f1)
-                  + values[j0 + 1, j1 + 1] * f0 * f1)
+        out[i] = _lerp2(ax0, ax1, values, x[i], y[i])
 
 
 @njit(cache=True, parallel=True)
 def _interp3d(ax0, ax1, ax2, values, pos, out):
-    n0, n1, n2 = ax0.shape[0], ax1.shape[0], ax2.shape[0]
     for i in prange(pos.shape[0]):
-        t0 = (pos[i, 0] - ax0[0]) / (ax0[1] - ax0[0])
-        t1 = (pos[i, 1] - ax1[0]) / (ax1[1] - ax1[0])
-        t2 = (pos[i, 2] - ax2[0]) / (ax2[1] - ax2[0])
-        if t0 < 0.0:
-            t0 = 0.0
-        elif t0 > n0 - 1:
-            t0 = n0 - 1.0
-        if t1 < 0.0:
-            t1 = 0.0
-        elif t1 > n1 - 1:
-            t1 = n1 - 1.0
-        if t2 < 0.0:
-            t2 = 0.0
-        elif t2 > n2 - 1:
-            t2 = n2 - 1.0
-        j0 = min(int(t0), n0 - 2)
-        j1 = min(int(t1), n1 - 2)
-        j2 = min(int(t2), n2 - 2)
-        f0, f1, f2 = t0 - j0, t1 - j1, t2 - j2
-        c00 = values[j0, j1, j2] * (1 - f2) + values[j0, j1, j2 + 1] * f2
-        c01 = values[j0, j1 + 1, j2] * (1 - f2) + values[j0, j1 + 1, j2 + 1] * f2
-        c10 = values[j0 + 1, j1, j2] * (1 - f2) + values[j0 + 1, j1, j2 + 1] * f2
-        c11 = values[j0 + 1, j1 + 1, j2] * (1 - f2) + values[j0 + 1, j1 + 1, j2 + 1] * f2
-        c0 = c00 * (1 - f1) + c01 * f1
-        c1 = c10 * (1 - f1) + c11 * f1
-        out[i] = c0 * (1 - f0) + c1 * f0
+        out[i] = _lerp3(ax0, ax1, ax2, values, pos[i, 0], pos[i, 1], pos[i, 2])
+
+
+# fused kernel-matched readouts: out_i = sum_q w_q table(x_i + s_i u_q)
+@njit(cache=True, parallel=True)
+def _stencil1d(axis, values, m0, pos, sup, offs, wts, out):
+    for i in prange(pos.shape[0]):
+        acc = 0.0
+        for q in range(offs.shape[0]):
+            acc += wts[q] * _lerp1(axis, values, _map_point(
+                pos[i, 0] + sup[i] * offs[q, 0], pos[i, 1] + sup[i] * offs[q, 1],
+                pos[i, 2] + sup[i] * offs[q, 2], m0))
+        out[i] = acc
+
+
+@njit(cache=True, parallel=True)
+def _stencil2d(ax0, ax1, values, m0, m1, pos, sup, offs, wts, out):
+    for i in prange(pos.shape[0]):
+        acc = 0.0
+        for q in range(offs.shape[0]):
+            x = pos[i, 0] + sup[i] * offs[q, 0]
+            y = pos[i, 1] + sup[i] * offs[q, 1]
+            z = pos[i, 2] + sup[i] * offs[q, 2]
+            acc += wts[q] * _lerp2(ax0, ax1, values, _map_point(x, y, z, m0),
+                                   _map_point(x, y, z, m1))
+        out[i] = acc
+
+
+@njit(cache=True, parallel=True)
+def _stencil3d(ax0, ax1, ax2, values, pos, sup, offs, wts, out):
+    for i in prange(pos.shape[0]):
+        acc = 0.0
+        for q in range(offs.shape[0]):
+            acc += wts[q] * _lerp3(ax0, ax1, ax2, values,
+                                   pos[i, 0] + sup[i] * offs[q, 0],
+                                   pos[i, 1] + sup[i] * offs[q, 1],
+                                   pos[i, 2] + sup[i] * offs[q, 2])
+        out[i] = acc
 
 
 class DensityField:
@@ -130,6 +201,27 @@ class DensityField:
         :class:`KernelMatchedDensity` with the kernel average. The relax
         evaluates the pseudo-pressure target through this."""
         return self.rho0(pos)
+
+    def rho0_stencil(self, pos, support, offsets, weights, chunk=4_000_000):
+        """Kernel-matched readout ``sum_q w_q rho0(pos_i + support_i u_q)``
+        (:class:`KernelMatchedDensity`). Generic route for any ``rho0``,
+        Python callables included: point-reads blocks of ~``chunk`` offset
+        positions, ~100x slower than the fused numba overrides of the
+        table/profile fields."""
+        pos = np.ascontiguousarray(pos, dtype=np.float64)
+        n, k = len(pos), len(offsets)
+        if n >= 100_000:
+            warnings.warn(f'{type(self).__name__} has no fused rho0_stencil: '
+                          'the kernel-matched readout takes the slow generic '
+                          'route', stacklevel=2)
+        out = np.empty(n)
+        rows = max(1, int(chunk) // k)
+        for i0 in range(0, n, rows):
+            sl = slice(i0, min(i0 + rows, n))
+            block = pos[sl, None, :] + support[sl, None, None] * offsets[None]
+            out[sl] = np.asarray(self.rho0(block.reshape(-1, 3)),
+                                 dtype=np.float64).reshape(-1, k) @ weights
+        return out
 
 
 class TableDensity(DensityField):
@@ -238,6 +330,24 @@ class TableDensity(DensityField):
                       np.ascontiguousarray(pos), out)
         return out
 
+    def rho0_stencil(self, pos, support, offsets, weights):
+        """Fused kernel-matched readout (mapping + interpolation per stencil
+        point inside one parallel numba pass)."""
+        pos = np.ascontiguousarray(pos, dtype=np.float64)
+        sup = np.ascontiguousarray(support, dtype=np.float64)
+        out = np.empty(len(pos))
+        if self.dim == 1:
+            _stencil1d(self.axes[0], self.values, _MAP_CODE[self.mapping],
+                       pos, sup, offsets, weights, out)
+        elif self.dim == 2:
+            _stencil2d(self.axes[0], self.axes[1], self.values,
+                       _MAP_CODE[self.mapping[0]], _MAP_CODE[self.mapping[1]],
+                       pos, sup, offsets, weights, out)
+        else:
+            _stencil3d(self.axes[0], self.axes[1], self.axes[2], self.values,
+                       pos, sup, offsets, weights, out)
+        return out
+
 
 class CallableDensity(DensityField):
     """Wrap a callable. With a mapping, fn receives the (N,) mapped
@@ -255,7 +365,7 @@ class CallableDensity(DensityField):
         return np.asarray(rho, dtype=np.float64)
 
 
-def _km_stencil(nshell, ndir=26):
+def _km_stencil(nshell, ndir=26, kernel='wendlandc2', nsmooth=64):
     """Fixed kernel-average quadrature stencil in UNIT-SUPPORT coordinates
     (u = r / (2h), |u| <= 1): ``nshell`` radial midpoints x ``ndir``
     SYMMETRIZED-FIBONACCI directions (a golden-angle spiral on the upper
@@ -265,9 +375,11 @@ def _km_stencil(nshell, ndir=26):
     galaxy disk) reads ~8/26 of its peak instead of its true kernel fraction;
     antipodal symmetry keeps a LINEAR field exact at the centre). Successive
     shells are rotated about z by the golden angle to decorrelate. Radial
-    weights follow the kernel-volume measure u^2 * w_wc2(q=2u), normalised to
+    weights follow the kernel-volume measure u^2 * w(q=2u) of the relax kernel
+    (kernels.KERNELS), normalised to
     sum 1 (a CONSTANT field is exact). Returns (offsets (K,3), weights (K,))."""
-    from .kernels import w_wc2
+    from .kernels import kernel_spec, w_k
+    kid, kp, _, _ = kernel_spec(kernel, nsmooth)
     nhalf = max(ndir // 2, 3)
     ga = np.pi * (3.0 - np.sqrt(5.0))                 # golden angle
     i = np.arange(nhalf)
@@ -277,7 +389,7 @@ def _km_stencil(nshell, ndir=26):
     half = np.stack([s * np.cos(phi), s * np.sin(phi), z], axis=1)
     dirs = np.concatenate([half, -half], axis=0)
     u = (np.arange(nshell) + 0.5) / nshell            # radial midpoints
-    wr = u * u * np.array([w_wc2(float(4.0 * uu * uu)) for uu in u])
+    wr = u * u * np.array([w_k(kid, kp, float(4.0 * uu * uu)) for uu in u])
     offsets = np.empty((nshell * len(dirs), 3))
     for si, uu in enumerate(u):                       # golden-rotate per shell
         rot = si * ga
@@ -289,7 +401,7 @@ def _km_stencil(nshell, ndir=26):
 
 
 class KernelMatchedDensity(DensityField):
-    """Kernel-matched target readout (RECONSTRUCT_PLAN.md task M4).
+    """Kernel-matched target readout.
 
     ``rho0_h(pos, h)`` returns the ``base`` field averaged over each
     particle's OWN Wendland-C2 kernel (support radius 2h_i, the glassgen
@@ -304,14 +416,14 @@ class KernelMatchedDensity(DensityField):
     by stencil symmetry, quadratic bias ~ the SPH estimator's own); where the
     base is SHARPER than the kernel (the razor-thin galaxy disk in z) the
     ratio -> 1 and the relax converges to the best N-particle representation
-    instead of blowing the feature open (the 2026-07-10 hole). Cost: K
+    instead of blowing the feature open. Cost: K
     (= 26*nshell) extra table lookups per particle-iteration.
 
     ``rho0(pos)`` stays the base point read - occupancy cuts, sampling and
     coarse-count criteria keep their sharp view of the target.
 
-    hmode ('particle' default | 'target', 2026-07-13 user proposal): where
-    the averaging scale comes from.
+    hmode ('particle' default | 'target' | 'hybrid'): where the averaging
+    scale comes from.
       'particle' - the h the relax passes (each particle's own, from its
         realized neighbours). State-DEPENDENT: a drained region's h grows,
         the target peak smooths further, the drained state self-sustains.
@@ -322,21 +434,20 @@ class KernelMatchedDensity(DensityField):
         equilibrium ensemble): a drained cusp keeps facing the full sharp
         demand (restoring), and the scale is self-regularizing (h_t grows
         where the target is faint, so off-plane stragglers still read a
-        ball average ~ their own SPH estimate - no M4-hole asymmetry).
+        ball average ~ their own SPH estimate - no hole-forming asymmetry).
         The h argument of rho0_h is ignored. Needs ``m`` (= M_gas/N;
         coarse cascade stages with heavier particles still read the
         final-N scale - envelope builds run uncascaded on sharp fields).
-      'hybrid' (the M17 verdict arm) - target-h ONLY where the point read
-        is resolved signal (>= rho_edge, the occupied disk - where the
-        drained-state feedback bites), particle-h in the scaffold (where
-        the pure target-h arm firmed up the smear-band demand and piled
-        31% of the mass into the wings; the state-dependent ball average
-        is what keeps strays soft out there). Needs m and rho_edge."""
+      'hybrid' - target-h ONLY where the point read is resolved signal
+        (>= rho_edge, where the drained-state feedback bites), particle-h
+        in the scaffold (pure target-h firms up the smear-band demand there
+        and piles mass into the wings; the state-dependent ball average
+        keeps strays soft). Needs m and rho_edge."""
 
     smooth_readout = True
 
     def __init__(self, base, nshell=2, hmode='particle', m=None, nsmooth=64,
-                 rho_edge=None, h_scale=1.0):
+                 rho_edge=None, h_scale=1.0, kernel='wendlandc2'):
         if hmode not in ('particle', 'target', 'hybrid'):
             raise ValueError(f"unknown hmode {hmode!r} "
                              "(use 'particle', 'target' or 'hybrid')")
@@ -347,68 +458,44 @@ class KernelMatchedDensity(DensityField):
         if hmode == 'hybrid' and rho_edge is None:
             raise ValueError("hmode='hybrid' needs rho_edge (the "
                              "signal/scaffold gate)")
+        if not hasattr(base, 'rho0_stencil'):          # plain callable
+            base = CallableDensity(getattr(base, 'rho0', base))
         self.base = base
         self.hmode = hmode
         self.m = None if m is None else float(m)
         self.nsmooth = int(nsmooth)
         self.rho_edge = None if rho_edge is None else float(rho_edge)
-        # h_scale (2026-07-13 user experiment): read the target at a
+        # h_scale: read the target at a
         # FRACTION of the particle's h - sharper demand than the full
         # kernel average (less drained-state softening) without the
         # state-independent target-h's off-plane shelf. Applies to the
         # 'particle' scale (and the hybrid's particle side).
         self.h_scale = float(h_scale)
-        self.offsets, self.weights = _km_stencil(int(nshell))
+        self.offsets, self.weights = _km_stencil(int(nshell), kernel=kernel,
+                                                 nsmooth=int(nsmooth))
 
     def rho0(self, pos):
         base = self.base
         return base.rho0(pos) if hasattr(base, 'rho0') else \
             np.asarray(base(pos), dtype=np.float64)
 
-    def rho0_h(self, pos, h, chunk=4_000_000):
-        # BATCHED stencil evaluation: one read of K*rows points per block
-        # instead of K separate reads of len(pos) points. The readout chain
-        # (occupancy + base/shell table queries, numba-parallel) is launch-
-        # dominated on per-offset calls - the 2026-07-10 galaxy timing probe
-        # measured this loop at 94% of the whole relax iteration; batching
-        # cuts the K numba launches (and the numpy temp churn around them)
-        # to ~1 per chunk. `chunk` bounds the block to ~chunk points
-        # (memory ~3*8*chunk bytes for the offset positions).
+    def rho0_h(self, pos, h):
         pos = np.ascontiguousarray(pos, dtype=np.float64)
         if self.hmode in ('target', 'hybrid'):
             # equilibrium-h readout: derive the scale from the target's own
             # pointwise value; the passed h (the particle's current state)
             # is ignored ('target') or kept in the scaffold ('hybrid')
             v = np.maximum(self.rho0(pos), np.finfo(np.float64).tiny)
-            support = ((3.0 * self.nsmooth * self.m / (4.0 * np.pi * v))
-                       ** (1.0 / 3.0))[:, None]
+            support = (3.0 * self.nsmooth * self.m / (4.0 * np.pi * v)) \
+                ** (1.0 / 3.0)
             if self.hmode == 'hybrid':
-                hp = np.asarray(h, dtype=np.float64)[:, None] \
-                    * (2.0 * self.h_scale)
-                support = np.where(v[:, None] >= self.rho_edge,
-                                   support, hp)
+                hp = np.asarray(h, dtype=np.float64) * (2.0 * self.h_scale)
+                support = np.where(v >= self.rho_edge, support, hp)
         else:
-            support = np.asarray(h, dtype=np.float64)[:, None] \
-                * (2.0 * self.h_scale)
-        base = self.base
-        if hasattr(base, 'rho0_stencil'):
-            # fully-fused fast path (envelope.PaddedTableDensity): the
-            # weighted stencil sum runs inside one numba kernel
-            return base.rho0_stencil(pos, support[:, 0], self.offsets,
-                                     self.weights)
-        read = base.rho0 if hasattr(base, 'rho0') else base
-        n = len(pos)
-        k = len(self.offsets)
-        out = np.empty(n)
-        rows = max(1, int(chunk) // k)
-        for i0 in range(0, n, rows):
-            sl = slice(i0, min(i0 + rows, n))
-            block = (pos[sl, None, :]
-                     + support[sl, :, None] * self.offsets[None, :, :])
-            v = np.asarray(read(block.reshape(-1, 3)),
-                           dtype=np.float64).reshape(-1, k)
-            out[sl] = v @ self.weights
-        return out
+            support = np.asarray(h, dtype=np.float64) * (2.0 * self.h_scale)
+        # fused per field class; the DensityField default is the generic route
+        return self.base.rho0_stencil(pos, support, self.offsets,
+                                      self.weights)
 
 
 def main(argv=None):
@@ -417,8 +504,8 @@ def main(argv=None):
         python -m glassgen.density densitytable_xdr table.npz --direction r_sph
 
     The coordinate mapping is baked into the .npz header (this is the ONLY
-    place --direction still exists); the tools then take --table table.npz
-    with no direction flag (CLEANUP_PLAN C6)."""
+    place --direction exists); the tools then take --table table.npz
+    with no direction flag."""
     import argparse
     import sys
     ap = argparse.ArgumentParser(

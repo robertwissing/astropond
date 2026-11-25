@@ -1,4 +1,4 @@
-"""Hierarchical (THB) spline De Rham readout - projector + curl (rung 3).
+"""Hierarchical (THB) spline De Rham readout - projector + curl.
 
 Builds on `thb.THB3D` (the truncated hierarchical basis) and the uniform
 De Rham operators in `spline_derham` (exact curl on the finest level).  The
@@ -6,17 +6,15 @@ vector potential A is L2-projected into the hierarchical H(curl) space S1
 (three degree-dropped THB components), then read back as ``B = curl A`` -
 smooth and exactly divergence-free on the graded mesh.
 
-Two objectives share this core (FIELD_RECONSTRUCTION_PLAN, "TWO OBJECTIVES,
-SAME CORE"):
-  - OBJ-A (this module): project A into S1, then curl.  Optimal for A.
-  - OBJ-B (curl-fit, follow-up): fit A so ``curl A`` matches a target B
-    directly (the smooth Hodge projection of B) - reuses the S2 mass matrix
-    and the curl incidence.
+Two objectives share this core:
+  - ``project_A*``: project A into S1, then curl.  Optimal for A.
+  - ``bfit*`` (curl-fit): fit A so ``curl A`` matches a target B directly (the
+    smooth Hodge projection of B) - reuses the S2 mass matrix and the curl.
 
 PROTOTYPE scope: the readout expands each THB function onto the finest uniform
 level (exact but ~prod(dims_L) memory) and applies the uniform circulant
 curl there.  Correct and fully validating on shallow graded meshes; the deep
-galaxy octree needs the sparse hierarchical incidence (a later increment).
+galaxy octree needs the sparse hierarchical incidence.
 
 Coordinates are LEVEL-0 CELL UNITS throughout: the domain is [0, base_a] per
 axis with unit level-0 spacing, so the finest spacing is ``2**-L`` and the
@@ -90,7 +88,7 @@ class THBDeRham:
     base   : (3,) level-0 cell counts.
     degree : top (S0) degree p (cubic default).
     refined: THB refinement (list of boolean 3D arrays, see THB3D); [] = the
-             uniform space (reproduces the rung-1 complex).
+             uniform space (reproduces the `spline_derham` complex).
     nq     : Gauss points per finest cell per axis (>= p+1 for exact mass).
     sparse : use the scalable THBSparse space + per-leaf quadrature (no dense
              per-level arrays / finest grid).  Only the *_local / *_matfree
@@ -364,10 +362,8 @@ class THBDeRham:
         # two derivative operators whose contributions land in DIFFERENT output
         # components, so the diagonal has no cross terms:
         #     diag(K)_jj = sum_q w_q [ (Ga)_qj^2 + (Gb)_qj^2 ].
-        # It costs one pass over the operators (~0.5s at 48k leaves) and cut
-        # that solve from 593 to 145 iterations - 170s -> 42s, MEASURED.  A
-        # preconditioner changes the iterate path, not the system: both runs
-        # converge to the same rtol and agreed to 3.5e-5 on B (at rtol 1e-6).
+        # One pass over the operators; cuts the CG iterations ~4x and changes
+        # the iterate path, not the system.
         diag = np.concatenate([
             _weighted_col_sq(self._Gop[c, (c + 1) % 3], self.qw)
             + _weighted_col_sq(self._Gop[c, (c + 2) % 3], self.qw)

@@ -152,7 +152,8 @@ def _consistency(iflav, pos, mass, h, rho, indptr, indices, tindptr, tindices,
 
 
 def residual_force(pos, mass, h, rho, rho0, box, rhopow=2.0, nsmooth=64,
-                   flavour='gdforce', nsmoothmin=32, uniform_pP=False):
+                   sigma_f=1.0, gradient='onesided-isph', nsmoothmin=32,
+                   uniform_pP=False, kernel='wendlandc2'):
     """Per-particle magnitude of the actual residual pseudo-pressure force on
     the glass - the descent force the relaxation moves along and whose RMS
     (frms) drives the force-equilibrium convergence / stop. This is the SAME
@@ -169,7 +170,6 @@ def residual_force(pos, mass, h, rho, rho0, box, rhopow=2.0, nsmooth=64,
     never fall below the RMS of this, since at the converged glass rho->rho0 so
     pP->1 and the actual force reduces to exactly this floor."""
     from .ball import BallNeighborList
-    from .flavours import FLAVOURS
     from .sph_core import get_force_loop_csr
     if nsmoothmin >= nsmooth:        # keep the floor below nsmooth (see relax)
         nsmoothmin = nsmooth - 1
@@ -190,10 +190,38 @@ def residual_force(pos, mass, h, rho, rho0, box, rhopow=2.0, nsmooth=64,
         pP = (rho / np.asarray(rho0, dtype=np.float64)) ** rhopow
     icvel = np.empty((n, 3))
     dummy = np.empty((1, 1))
-    fl = get_force_loop_csr(flavour, one_sided=False)
+    fl = get_force_loop_csr(sigma_f, gradient, one_sided=False, kernel=kernel,
+                            nsmooth=nsmooth)
     fl(pos, mass, h, rho, pP, bn.indptr, bn.indices, bn.tip, bn.tii, boxarr,
        periodic, icvel, dummy[0], dummy, False)
     return np.sqrt((icvel * icvel).sum(1))
+
+
+def smoothed_pP(pos, mass, h, rho, pP, box, nsmooth=64, nsmoothmin=32,
+                kernel='wendlandc2'):
+    """pP kernel-averaged over each particle's neighbours (Shepard:
+    sum m/rho pP W / sum m/rho W): the pressure bump the glass holds at a sharp
+    density feature, without the per-particle noise. pos wrapped as for
+    residual_force."""
+    from .ball import BallNeighborList
+    from .kernels import kernel_spec
+    from .sph_core import density_loop_csr
+    if nsmoothmin >= nsmooth:
+        nsmoothmin = nsmooth - 1
+    periodic = box is not None
+    boxarr = np.asarray(box if periodic else (1e30, 1e30, 1e30), dtype=np.float64)
+    pos = np.ascontiguousarray(pos, dtype=np.float64)
+    h = np.ascontiguousarray(h, dtype=np.float64)
+    bn = BallNeighborList(boxarr, nsmoothmin=nsmoothmin, skin=0.0,
+                          build_transpose=False)
+    bn._build(pos, h)
+    kid, kp, w0self, _ = kernel_spec(kernel, nsmooth)
+    vol = np.asarray(mass, dtype=np.float64) / np.asarray(rho, dtype=np.float64)
+    num, den = np.empty(len(pos)), np.empty(len(pos))
+    for w, out in ((vol * np.asarray(pP, dtype=np.float64), num), (vol, den)):
+        density_loop_csr(pos, np.ascontiguousarray(w), h, bn.indptr, bn.indices,
+                         boxarr, periodic, out, w0self, kid, kp)
+    return num / den
 
 
 def operator_consistency(pos, mass, h, rho, box, nsmooth=64, flavour='gdforce',
@@ -219,7 +247,7 @@ def operator_consistency(pos, mass, h, rho, box, nsmooth=64, flavour='gdforce',
     return q0, q1, e0, e1
 
 
-def plot_history(history, path, title=None, stop_reason=None):
+def plot_history(history, path, title=None, stop_reason=None, levels=None):
     """Plot the relaxation convergence trajectory recorded in
     ``RelaxResult.history`` - the errors over iterations.
 
@@ -231,22 +259,36 @@ def plot_history(history, path, title=None, stop_reason=None):
         carries ``icr0`` (the step size). The polish-entry iteration is marked
         (dashed), and the final iteration / stop_reason annotated - so one can
         read where the errors flatten vs where the icr0_stop finish fires.
+    levels : RelaxResult.level_history, [(name, history), ...]; when it holds
+        more than one level the whole cascade is drawn on one cumulative
+        iteration axis, each level boundary marked and named (history is then
+        ignored).
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    h = np.asarray(history, dtype=float)
-    if h.size == 0:
+    segs = levels if levels and len(levels) > 1 else [(None, history)]
+    rows, starts, offset = [], [], 0.0
+    for name, hist in segs:
+        hh = np.array(hist, dtype=float)
+        if hh.size == 0:
+            continue
+        hh[:, 0] += offset
+        starts.append((offset, name, hh[hh[:, 5] > 0, 0][:1]))
+        rows.append(hh)
+        offset = hh[-1, 0]
+    if not rows:
         return
-    it, frms, denserr, icr0, polish = h[:, 0], h[:, 1], h[:, 2], h[:, 3], h[:, 5]
-    polish_start = it[polish > 0][0] if np.any(polish > 0) else None
+    h = np.concatenate(rows)
+    it, frms, denserr, icr0 = h[:, 0], h[:, 1], h[:, 2], h[:, 3]
 
     fig, axL = plt.subplots(figsize=(9, 5.5))
     axL.semilogy(it, frms, color='C3', lw=1.2, label='frms (residual force)')
     axL.semilogy(it, denserr, color='C0', lw=1.2,
                  label='denserr  <|1-rho/rho0|>')
-    axL.set_xlabel('iteration')
+    axL.set_xlabel('iteration' + (' (cumulative over levels)'
+                                   if len(starts) > 1 else ''))
     axL.set_ylabel('error (log)')
     axL.grid(True, which='both', alpha=0.25)
 
@@ -255,22 +297,30 @@ def plot_history(history, path, title=None, stop_reason=None):
     axR.set_ylabel('icr0', color='C2')
     axR.tick_params(axis='y', labelcolor='C2')
 
-    if polish_start is not None:
-        axL.axvline(polish_start, color='0.5', ls='--', lw=1.0)
-        axL.annotate(f'polish @ {int(polish_start)}',
-                     xy=(polish_start, axL.get_ylim()[1]),
-                     xytext=(3, -10), textcoords='offset points',
-                     fontsize=8, color='0.4', rotation=90, va='top')
+    for k, (start, name, polish_start) in enumerate(starts):
+        if name is not None:
+            if k:
+                axL.axvline(start, color='0.2', ls='-', lw=0.8)
+            axL.annotate(name, xy=(start, axL.get_ylim()[0]), xytext=(2, 4),
+                         textcoords='offset points', fontsize=8, va='bottom',
+                         rotation=90, fontweight='bold')
+        if len(polish_start):
+            ps = polish_start[0]
+            axL.axvline(ps, color='0.5', ls='--', lw=1.0)
+            axL.annotate(f'polish @ {int(ps - start)}',
+                         xy=(ps, axL.get_ylim()[1]),
+                         xytext=(3, -16), textcoords='offset points',
+                         fontsize=8, color='0.4', rotation=90, va='top')
     stop_it = int(it[-1])
     axL.axvline(stop_it, color='k', ls=':', lw=1.0)
-    lbl = f'stop @ {stop_it}' + (f'  ({stop_reason})' if stop_reason else '')
+    lbl = f'stop @ {int(it[-1] - starts[-1][0])}' + (f'  ({stop_reason})' if stop_reason else '')
     axL.annotate(lbl, xy=(stop_it, axL.get_ylim()[0]),
                  xytext=(-3, 10), textcoords='offset points',
                  fontsize=8, ha='right')
 
     lines = axL.get_lines() + axR.get_lines()
-    axL.legend(lines, [l.get_label() for l in lines], loc='upper right',
-               fontsize=8)
+    axL.legend(lines, [l.get_label() for l in lines], loc='upper center',
+               bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=8, frameon=False)
     if title:
         axL.set_title(title, fontsize=10)
     fig.tight_layout()

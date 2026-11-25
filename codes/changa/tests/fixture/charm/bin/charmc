@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+case "${1:-}" in
+    -V)
+        printf '%s\n' 'Charm++ Version 80001'
+        ;;
+    --version)
+        printf '%s\n' 'fixture charmc 1.0'
+        ;;
+    -show)
+        printf '%s\n' 'cc'
+        ;;
+    *)
+        exec cc "$@"
+        ;;
+esac

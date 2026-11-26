@@ -338,7 +338,7 @@ case "$GLASS_START_P" in uniform) ICSTARTTAG="" ;; pseudo) ICSTARTTAG=pP ;;
 #EXTRACONDALL=" -facQ 1.0 -fch 1.0 -psidecfac 1.0 -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -nInitCorrIter 50 -smin 32 -smax 40000 "
 #EXTRACONDALL=" -bDivBClean 1 -thermaldiff 0.1 -alpha 2.0 -beta 8.0 -fch 1.0 -nInitCorrIter 50 -smin 32 -smax 40000 "
 #EXTRACONDALL=" -thermaldiff 0.1 -alpha 0.5 -beta 8.0 "
-EXTRACONDALL=" +bFDMSoftH -iFDMHMode 2 "
+EXTRACONDALL=""
 #Extra runtime conditions and output fields specific to SPH-EXA (code=2)
 
 
